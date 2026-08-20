@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::error::{Error, Result};
 
@@ -31,7 +31,6 @@ pub fn shallow_clone(url: &str, dest: &Path) -> Result<String> {
 /// fetch 远端并 hard reset（分支 ref + 索引 + 工作区）到 origin/<当前分支>。
 /// HEAD 有新 commit 返回 Some(hash)，否则 None。
 pub fn fetch_and_reset(path: &Path) -> Result<Option<String>> {
-    let before = head_commit(path)?;
     let repo = gix::open(path).map_err(gerr)?;
     let remote = repo
         .find_default_remote(gix::remote::Direction::Fetch)
@@ -67,19 +66,13 @@ pub fn fetch_and_reset(path: &Path) -> Result<Option<String>> {
         .map_err(gerr)?
         .id()
         .detach();
-    if oid.to_string() == before {
+    let old_oid = repo.head_id().map_err(gerr)?.detach();
+    if oid == old_oid {
         return Ok(None);
     }
 
-    // 先检出成功再移动分支指针，失败时仓库保持原状
-    checkout_tree(&repo, oid)?;
-    repo.reference(
-        branch.as_str(),
-        oid,
-        gix::refs::transaction::PreviousValue::Any,
-        "skills update",
-    )
-    .map_err(gerr)?;
+    // 工作区、index 和分支 ref 在同一个事务中切换，任一阶段失败都会恢复旧状态。
+    checkout_tree_with_ref(&repo, branch.as_str(), old_oid, oid)?;
     Ok(Some(oid.to_string()))
 }
 
@@ -89,22 +82,59 @@ pub fn head_commit(path: &Path) -> Result<String> {
     Ok(repo.head_id().map_err(gerr)?.to_string())
 }
 
-/// 把 `oid` 的树检出到工作区并重建索引。先在临时目录完成所有
-/// 可能失败的 tree/index/checkout 操作，成功后再替换工作区内容。
-fn checkout_tree(repo: &gix::Repository, oid: gix::ObjectId) -> Result<()> {
+static NEXT_TRANSACTION_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum FailurePoint {
+    AfterIndexInstall,
+    AfterRefUpdate,
+}
+
+struct PreparedCheckout {
+    staging: std::path::PathBuf,
+    staged_workdir: std::path::PathBuf,
+    staged_index: std::path::PathBuf,
+    workdir: std::path::PathBuf,
+    index: std::path::PathBuf,
+}
+
+struct CheckoutTransaction {
+    prepared: PreparedCheckout,
+    backup_workdir: std::path::PathBuf,
+    old_index: std::path::PathBuf,
+    worktree_started: bool,
+    index_backup_created: bool,
+    index_installed: bool,
+    ref_update_attempted: bool,
+    backed_up_entries: Vec<std::ffi::OsString>,
+    installed_entries: Vec<std::ffi::OsString>,
+}
+
+/// 先在临时目录中准备目标 tree、工作区和 index，不触碰真实仓库。
+fn prepare_checkout(repo: &gix::Repository, oid: gix::ObjectId) -> Result<PreparedCheckout> {
     let workdir = repo
         .work_dir()
         .ok_or_else(|| Error::Git("bare 仓库无工作区".into()))?
         .to_path_buf();
-    let staging = workdir
-        .parent()
-        .unwrap_or(&workdir)
-        .join(format!(".skills-checkout-{}", oid));
-    std::fs::create_dir(&staging)?;
-    let staged_workdir = staging.join("worktree");
-    std::fs::create_dir(&staged_workdir)?;
-
+    let parent = workdir.parent().unwrap_or(&workdir);
+    let staging = loop {
+        let serial = NEXT_TRANSACTION_ID.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".skills-checkout-{oid}-{}-{serial}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => break path,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    };
     let result = (|| {
+        let staged_workdir = staging.join("worktree");
+        let backup_workdir = staging.join("backup");
+        std::fs::create_dir(&staged_workdir)?;
+        std::fs::create_dir(&backup_workdir)?;
         let tree_id = repo
             .find_commit(oid)
             .map_err(gerr)?
@@ -114,8 +144,8 @@ fn checkout_tree(repo: &gix::Repository, oid: gix::ObjectId) -> Result<()> {
         let state =
             gix::index::State::from_tree(&tree_id, repo.objects.clone(), Default::default())
                 .map_err(gerr)?;
-        let staged_index_path = staging.join("index");
-        let mut index = gix::index::File::from_state(state, staged_index_path.clone());
+        let staged_index = staging.join("index");
+        let mut index = gix::index::File::from_state(state, staged_index.clone());
         let opts = gix_worktree_state::checkout::Options {
             fs: gix::fs::Capabilities::probe(repo.git_dir()),
             validate: Default::default(),
@@ -144,31 +174,219 @@ fn checkout_tree(repo: &gix::Repository, oid: gix::ObjectId) -> Result<()> {
         )
         .map_err(gerr)?;
         index.write(Default::default()).map_err(gerr)?;
-
-        for entry in std::fs::read_dir(&workdir)? {
-            let entry = entry?;
-            if entry.file_name() == ".git" {
-                continue;
-            }
-            if entry.file_type()?.is_dir() {
-                std::fs::remove_dir_all(entry.path())?;
-            } else {
-                std::fs::remove_file(entry.path())?;
-            }
-        }
-        for entry in std::fs::read_dir(&staged_workdir)? {
-            let entry = entry?;
-            std::fs::rename(entry.path(), workdir.join(entry.file_name()))?;
-        }
-        std::fs::rename(staged_index_path, repo.index_path()).map_err(gerr)?;
-        Ok(())
+        Ok(PreparedCheckout {
+            staging: staging.clone(),
+            staged_workdir,
+            staged_index,
+            workdir,
+            index: repo.index_path().to_path_buf(),
+        })
     })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    result
+}
 
-    let cleanup = std::fs::remove_dir_all(&staging);
-    match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(gerr(err)),
+impl CheckoutTransaction {
+    fn prepare(repo: &gix::Repository, oid: gix::ObjectId) -> Result<Self> {
+        let prepared = prepare_checkout(repo, oid)?;
+        let backup_workdir = prepared.staging.join("backup");
+        let old_index = prepared.staging.join("old-index");
+        Ok(Self {
+            prepared,
+            backup_workdir,
+            old_index,
+            worktree_started: false,
+            index_backup_created: false,
+            index_installed: false,
+            ref_update_attempted: false,
+            backed_up_entries: Vec::new(),
+            installed_entries: Vec::new(),
+        })
+    }
+
+    fn install(
+        &mut self,
+        repo: &gix::Repository,
+        branch: Option<(&str, gix::ObjectId, gix::ObjectId)>,
+        failure: Option<FailurePoint>,
+    ) -> Result<()> {
+        self.worktree_started = true;
+        for entry in std::fs::read_dir(&self.prepared.workdir)? {
+            let entry = entry?;
+            if entry.file_name() != ".git" {
+                let name = entry.file_name();
+                std::fs::rename(entry.path(), self.backup_workdir.join(&name))?;
+                self.backed_up_entries.push(name);
+            }
+        }
+        for entry in std::fs::read_dir(&self.prepared.staged_workdir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            std::fs::rename(entry.path(), self.prepared.workdir.join(&name))?;
+            self.installed_entries.push(name);
+        }
+
+        if self.prepared.index.exists() {
+            std::fs::rename(&self.prepared.index, &self.old_index)?;
+            self.index_backup_created = true;
+        }
+        std::fs::rename(&self.prepared.staged_index, &self.prepared.index)?;
+        self.index_installed = true;
+        if matches!(failure, Some(FailurePoint::AfterIndexInstall)) {
+            return Err(Error::Git("注入：index 切换后失败".into()));
+        }
+
+        if let Some((branch, old_oid, new_oid)) = branch {
+            self.ref_update_attempted = true;
+            repo.reference(
+                branch,
+                new_oid,
+                gix::refs::transaction::PreviousValue::Any,
+                "skills update",
+            )
+            .map_err(gerr)?;
+            if matches!(failure, Some(FailurePoint::AfterRefUpdate)) {
+                // 让测试覆盖“ref 已切换但后续阶段失败”的完整回滚。
+                let _ = old_oid;
+                return Err(Error::Git("注入：ref 切换后失败".into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback(
+        &self,
+        repo: &gix::Repository,
+        branch: Option<(&str, gix::ObjectId)>,
+    ) -> Result<()> {
+        let mut failures = Vec::new();
+        if self.ref_update_attempted {
+            if let Some((branch, old_oid)) = branch {
+                if let Err(err) = repo.reference(
+                    branch,
+                    old_oid,
+                    gix::refs::transaction::PreviousValue::Any,
+                    "skills rollback",
+                ) {
+                    failures.push(format!("恢复 ref 失败: {err}"));
+                }
+            }
+        }
+        if self.index_installed {
+            if let Err(err) = std::fs::remove_file(&self.prepared.index) {
+                failures.push(format!("移除新 index 失败: {err}"));
+            }
+        }
+        if self.index_backup_created {
+            if let Err(err) = std::fs::rename(&self.old_index, &self.prepared.index) {
+                failures.push(format!("恢复旧 index 失败: {err}"));
+            }
+        }
+        if self.worktree_started {
+            if let Err(err) =
+                remove_worktree_entries(&self.prepared.workdir, &self.installed_entries)
+            {
+                failures.push(format!("清理新工作区失败: {err}"));
+            }
+            if let Err(err) = restore_worktree_entries(
+                &self.backup_workdir,
+                &self.prepared.workdir,
+                &self.backed_up_entries,
+            ) {
+                failures.push(format!("恢复旧工作区失败: {err}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Git(failures.join("; ")))
+        }
+    }
+
+    fn finish(self) {
+        let _ = std::fs::remove_dir_all(&self.prepared.staging);
+    }
+}
+
+fn remove_worktree_entries(
+    workdir: &std::path::Path,
+    names: &[std::ffi::OsString],
+) -> std::io::Result<()> {
+    for name in names {
+        let path = workdir.join(name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        if metadata.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        } else {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_worktree_entries(
+    backup: &std::path::Path,
+    workdir: &std::path::Path,
+    names: &[std::ffi::OsString],
+) -> std::io::Result<()> {
+    for name in names {
+        std::fs::rename(backup.join(name), workdir.join(name))?;
+    }
+    Ok(())
+}
+
+fn checkout_tree(repo: &gix::Repository, oid: gix::ObjectId) -> Result<()> {
+    checkout_transaction(repo, oid, None, None)
+}
+
+fn checkout_tree_with_ref(
+    repo: &gix::Repository,
+    branch: &str,
+    old_oid: gix::ObjectId,
+    new_oid: gix::ObjectId,
+) -> Result<()> {
+    checkout_transaction(repo, new_oid, Some((branch, old_oid, new_oid)), None)
+}
+
+#[cfg(test)]
+fn checkout_tree_with_failure(
+    repo: &gix::Repository,
+    branch: &str,
+    old_oid: gix::ObjectId,
+    new_oid: gix::ObjectId,
+    failure: FailurePoint,
+) -> Result<()> {
+    checkout_transaction(
+        repo,
+        new_oid,
+        Some((branch, old_oid, new_oid)),
+        Some(failure),
+    )
+}
+
+fn checkout_transaction(
+    repo: &gix::Repository,
+    oid: gix::ObjectId,
+    branch: Option<(&str, gix::ObjectId, gix::ObjectId)>,
+    failure: Option<FailurePoint>,
+) -> Result<()> {
+    let old_ref = branch.map(|(name, old_oid, _)| (name, old_oid));
+    let mut transaction = CheckoutTransaction::prepare(repo, oid)?;
+    match transaction.install(repo, branch, failure) {
+        Ok(()) => {
+            transaction.finish();
+            Ok(())
+        }
+        Err(err) => match transaction.rollback(repo, old_ref) {
+            Ok(()) => Err(err),
+            Err(rollback_err) => Err(Error::Git(format!("{err}; {rollback_err}"))),
+        },
     }
 }
 
@@ -345,6 +563,78 @@ mod tests {
 
         assert!(checkout_tree(&repo, gix::ObjectId::null(gix::hash::Kind::Sha1)).is_err());
         assert_eq!(std::fs::read_to_string(existing).unwrap(), "stale\n");
+    }
+
+    #[test]
+    fn checkout_transaction_rolls_back_after_switch_failures() {
+        let (tmp, work, bare) = make_bare_repo();
+        let dest = tmp.path().join("clone");
+        let c1 = shallow_clone(&format!("file://{}", bare.display()), &dest).unwrap();
+        let old_index = std::fs::read(dest.join(".git/index")).unwrap();
+
+        std::fs::write(work.join("skills/alpha/SKILL.md"), "v2\n").unwrap();
+        std::fs::remove_file(work.join("stale.txt")).unwrap();
+        std::fs::write(work.join("new.txt"), "new\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "c2",
+            ],
+        );
+        git(&work, &["push", bare.to_str().unwrap(), "main"]);
+        git(&dest, &["fetch", "origin", "main"]);
+        let c2 = git_out(&bare, &["rev-parse", "main"]);
+        let old_oid = gix::ObjectId::from_hex(c1.as_bytes()).unwrap();
+        let new_oid = gix::ObjectId::from_hex(c2.as_bytes()).unwrap();
+        let branch = "refs/heads/main";
+
+        let assert_old_state = || {
+            assert_eq!(
+                std::fs::read_to_string(dest.join("skills/alpha/SKILL.md")).unwrap(),
+                "v1\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dest.join("stale.txt")).unwrap(),
+                "stale\n"
+            );
+            assert!(!dest.join("new.txt").exists());
+            assert_eq!(std::fs::read(dest.join(".git/index")).unwrap(), old_index);
+            assert_eq!(git_out(&dest, &["rev-parse", "refs/heads/main"]), c1);
+            assert_eq!(head_commit(&dest).unwrap(), c1);
+        };
+
+        let repo = gix::open(&dest).unwrap();
+        assert!(
+            checkout_tree_with_failure(
+                &repo,
+                branch,
+                old_oid,
+                new_oid,
+                FailurePoint::AfterIndexInstall,
+            )
+            .is_err()
+        );
+        assert_old_state();
+
+        let repo = gix::open(&dest).unwrap();
+        assert!(
+            checkout_tree_with_failure(
+                &repo,
+                branch,
+                old_oid,
+                new_oid,
+                FailurePoint::AfterRefUpdate,
+            )
+            .is_err()
+        );
+        assert_old_state();
     }
 
     #[test]
