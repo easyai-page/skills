@@ -120,18 +120,81 @@ fn ensure_destination_absent(dest: &Path) -> Result<()> {
 }
 
 fn copy_install(src: &Path, dest_root: &Path, dest: &Path) -> Result<()> {
-    let stage = create_staging_dir(dest_root, dest.file_name().unwrap_or_default())?;
-    let result = (|| {
-        copy_dir(src, &stage)?;
-        write_copy_manifest(&stage)?;
-        ensure_destination_absent(dest)?;
-        commit_staging_dir(&stage, dest)
-    })();
+    let stage = stage_copy(src, dest_root, dest.file_name().unwrap_or_default())?;
+    let result = ensure_destination_absent(dest).and_then(|()| commit_staging_dir(&stage, dest));
 
     if result.is_err() {
         let _ = remove_install_path(&stage);
     }
     result
+}
+
+/// 把 src 复制到 dest_root 下的暂存目录并写入所有权标识，返回暂存路径；失败清理暂存。
+/// install 与 update 共用同一份 staging+manifest 流程，避免两套复制逻辑漂移。
+pub(crate) fn stage_copy(src: &Path, dest_root: &Path, name: &std::ffi::OsStr) -> Result<PathBuf> {
+    let stage = create_staging_dir(dest_root, name)?;
+    let staged = copy_dir(src, &stage).and_then(|()| write_copy_manifest(&stage));
+    if let Err(err) = staged {
+        let _ = remove_install_path(&stage);
+        return Err(err);
+    }
+    Ok(stage)
+}
+
+/// update 专用：staging 完成后把旧副本 rename 到备份位置，暂存副本 rename 提交，
+/// 成功后删除备份；中途失败回滚恢复原副本。与 install 的原子语义一致，不先清后拷。
+pub(crate) fn replace_copy_install(src: &Path, dest_root: &Path, dest: &Path) -> Result<()> {
+    let stage = stage_copy(src, dest_root, dest.file_name().unwrap_or_default())?;
+    let result = commit_replacement(&stage, dest);
+    if result.is_err() {
+        let _ = remove_install_path(&stage);
+    }
+    result
+}
+
+fn commit_replacement(stage: &Path, dest: &Path) -> Result<()> {
+    let dest_root = dest
+        .parent()
+        .ok_or_else(|| Error::Msg(format!("目标路径没有父目录: {}", dest.display())))?;
+    match std::fs::symlink_metadata(dest) {
+        Ok(_) => {}
+        // 旧副本已被手动删除：无需备份，直接提交暂存副本
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::rename(stage, dest)?;
+            return Ok(());
+        }
+        Err(err) => return Err(Error::Io(err)),
+    }
+    let backup = unique_backup_path(dest_root, dest.file_name().unwrap_or_default());
+    std::fs::rename(dest, &backup)?;
+    match std::fs::rename(stage, dest) {
+        Ok(()) => {
+            std::fs::remove_dir_all(&backup)?;
+            Ok(())
+        }
+        Err(err) => {
+            // 回滚：恢复原副本，保证“要么完整保留、要么完整替换”
+            let _ = std::fs::rename(&backup, dest);
+            Err(Error::Io(err))
+        }
+    }
+}
+
+fn unique_backup_path(dest_root: &Path, skill: &std::ffi::OsStr) -> PathBuf {
+    let pid = std::process::id();
+    loop {
+        let sequence = STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            ".{}-update-backup-{}-{}.tmp",
+            skill.to_string_lossy(),
+            pid,
+            sequence
+        );
+        let path = dest_root.join(name);
+        if std::fs::symlink_metadata(&path).is_err() {
+            return path;
+        }
+    }
 }
 
 /// 在暂存副本内写入所有权标识，随 rename 原子生效。

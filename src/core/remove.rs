@@ -52,9 +52,9 @@ pub fn remove_install(
     Ok(RemoveOutcome::Removed)
 }
 
-/// 删除前校验记录：技能名必须是单一 Normal 组件（复用 install 的校验函数），
+/// 删除/更新前校验记录：技能名必须是单一 Normal 组件（复用 install 的校验函数），
 /// project root 必须是绝对路径。非法记录视为损坏，返回 Mismatch，不执行任何磁盘删除。
-fn validate_record(rec: &Install) -> Result<()> {
+pub(crate) fn validate_record(rec: &Install) -> Result<()> {
     install::validate_skill_name(&rec.skill).map_err(|_| {
         Error::Mismatch(format!(
             "安装记录损坏：技能名 {:?} 非法，未执行磁盘删除",
@@ -94,6 +94,18 @@ fn remove_recorded_link(
 }
 
 fn remove_recorded_copy(dest: &Path, meta: &std::fs::Metadata, rec: &Install) -> Result<()> {
+    verify_copy_ownership(dest, meta, rec)?;
+    std::fs::remove_dir_all(dest)?;
+    Ok(())
+}
+
+/// 核验 copy 副本实况与记录一致（真目录、非链接）且带所有权标识；
+/// 不符返回 Mismatch。remove 与 update 共用此前置校验，无法确认归属时不得动磁盘。
+pub(crate) fn verify_copy_ownership(
+    dest: &Path,
+    meta: &std::fs::Metadata,
+    rec: &Install,
+) -> Result<()> {
     if !meta.is_dir() || meta.file_type().is_symlink() || is_junction(dest) {
         return Err(Error::Mismatch(format!(
             "{dest:?} 实况与安装方式 {:?} 不符，已保留",
@@ -115,7 +127,6 @@ fn remove_recorded_copy(dest: &Path, meta: &std::fs::Metadata, rec: &Install) ->
         }
         Err(err) => return Err(Error::Io(err)),
     }
-    std::fs::remove_dir_all(dest)?;
     Ok(())
 }
 
