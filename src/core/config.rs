@@ -1,11 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Method {
-    Symlink,
-    Copy,
-}
+use super::registry::Method;
 
 pub struct Config {
     pub targets: BTreeMap<String, PathBuf>,
