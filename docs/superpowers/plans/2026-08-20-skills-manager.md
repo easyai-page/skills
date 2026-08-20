@@ -436,6 +436,14 @@ mod tests {
     }
 
     #[test]
+    fn file_url_supported_for_local_bare_repos() {
+        let s = parse_source("file:///tmp/repos/bare.git").unwrap();
+        assert_eq!(s.key, "file/repos/bare");
+        assert_eq!(s.url.as_deref(), Some("file:///tmp/repos/bare.git"));
+        assert!(s.local_path.is_none());
+    }
+
+    #[test]
     fn rejects_empty_and_single_word() {
         assert!(parse_source("").is_err());
         assert!(parse_source("noslash").is_err());
@@ -485,6 +493,21 @@ pub fn parse_source(input: &str) -> Result<SourceSpec> {
             });
         }
         return Err(Error::Msg(format!("无法解析 source: {input}")));
+    }
+    // file:// URL（本地 bare 仓库，测试与离线场景）
+    if let Some(rest) = input.strip_prefix("file://") {
+        let trimmed = rest.trim_end_matches('/').trim_end_matches(".git");
+        let parts: Vec<&str> = trimmed.rsplitn(3, '/').collect();
+        let name = parts[0];
+        let parent = parts.get(1).copied().unwrap_or("root");
+        if name.is_empty() {
+            return Err(Error::Msg(format!("无法解析 source: {input}")));
+        }
+        return Ok(SourceSpec {
+            key: format!("file/{parent}/{name}"),
+            url: Some(input.into()),
+            local_path: None,
+        });
     }
     // https://host/owner/repo[.git]
     if let Some(rest) = input.strip_prefix("https://").or_else(|| input.strip_prefix("http://")) {
@@ -2904,11 +2927,11 @@ fn add_list_remove_copy_flow() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("config.toml"),
         format!("[targets]\nagents = \"{}\"\n", agents_dir.display().to_string().replace('\\', "\\\\"))).unwrap();
-    skills(&home).args(["add", &format!("file://{}/o/r", bare.display()),
+    skills(&home).args(["add", &format!("file://{}", bare.display()),
         "-s", "alpha", "--method", "copy", "-y"]).assert().success();
     assert!(agents_dir.join("alpha/SKILL.md").exists());
     // 再 add 同仓库 → 复用缓存不重复下载（stderr/stdout 有提示）
-    let out = skills(&home).args(["add", &format!("file://{}/o/r", bare.display()),
+    let out = skills(&home).args(["add", &format!("file://{}", bare.display()),
         "-s", "beta", "--method", "copy", "-y"]).output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("已缓存"));
     // list
@@ -2930,7 +2953,7 @@ fn update_respects_two_level_policy() {
     let agents_dir = home.join("agents-skills");
     std::fs::write(home.join("config.toml"),
         format!("[targets]\nagents = \"{}\"\n", agents_dir.display().to_string().replace('\\', "\\\\"))).unwrap();
-    skills(&home).args(["add", &format!("file://{}/o/r", bare.display()),
+    skills(&home).args(["add", &format!("file://{}", bare.display()),
         "-s", "alpha", "-s", "beta", "--method", "copy", "-y"]).assert().success();
     // 包级开、alpha 副本关
     // file:// URL 的 key 推导见 source.rs：host 部分为 bare 父目录名… 测试中用 list 输出断言前
