@@ -9,6 +9,10 @@ use super::registry::{Install, Method, Registry, TargetRec};
 
 static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// copy 副本内的所有权标识文件名。与计划任务 15 的 `.skills-manifest` 约定同名：
+/// 任务 15 会扩展该文件写入文件名+sha256 清单；remove 只依赖其存在性确认副本归属。
+pub(crate) const COPY_MANIFEST: &str = ".skills-manifest";
+
 /// 把技能从缓存安装到一个目标；目标已有同名目录时返回 Error::Conflict 交由前端决策。
 pub fn install_skill(
     layout: &Layout,
@@ -56,7 +60,7 @@ pub fn install_skill(
     Ok(rec)
 }
 
-fn validate_skill_name(skill: &str) -> Result<()> {
+pub(crate) fn validate_skill_name(skill: &str) -> Result<()> {
     let path = Path::new(skill);
     let mut components = path.components();
     if skill.contains('/')
@@ -119,6 +123,7 @@ fn copy_install(src: &Path, dest_root: &Path, dest: &Path) -> Result<()> {
     let stage = create_staging_dir(dest_root, dest.file_name().unwrap_or_default())?;
     let result = (|| {
         copy_dir(src, &stage)?;
+        write_copy_manifest(&stage)?;
         ensure_destination_absent(dest)?;
         commit_staging_dir(&stage, dest)
     })();
@@ -127,6 +132,16 @@ fn copy_install(src: &Path, dest_root: &Path, dest: &Path) -> Result<()> {
         let _ = remove_install_path(&stage);
     }
     result
+}
+
+/// 在暂存副本内写入所有权标识，随 rename 原子生效。
+fn write_copy_manifest(stage: &Path) -> Result<()> {
+    let body = serde_json::json!({ "version": 1, "manager": "skills" });
+    std::fs::write(
+        stage.join(COPY_MANIFEST),
+        serde_json::to_string_pretty(&body)?,
+    )?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -580,6 +595,60 @@ mod tests {
         assert!(matches!(err, Error::SourceNotDirectory(_)));
         assert!(reg.installs.is_empty());
         assert!(!cfg.targets["agents"].exists());
+    }
+
+    #[test]
+    fn copy_install_writes_manifest_marker() {
+        let (_t, layout, cfg, mut reg) = setup();
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &Target::Global {
+                name: "agents".into(),
+            },
+            Method::Copy,
+            "c1",
+        )
+        .unwrap();
+        let marker = cfg.targets["agents"].join("alpha").join(COPY_MANIFEST);
+        assert!(marker.is_file());
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(marker).unwrap()).unwrap();
+        assert_eq!(body["version"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_install_does_not_write_manifest_marker() {
+        let (_t, layout, cfg, mut reg) = setup();
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &Target::Global {
+                name: "agents".into(),
+            },
+            Method::Symlink,
+            "c1",
+        )
+        .unwrap();
+        let dest = cfg.targets["agents"].join("alpha");
+        // 链接本身和缓存源都没有标识文件
+        assert!(!dest.join(COPY_MANIFEST).exists());
+        assert!(
+            !layout
+                .cache_dir("github/o/r")
+                .join("skills/alpha")
+                .join(COPY_MANIFEST)
+                .exists()
+        );
     }
 
     #[cfg(unix)]
