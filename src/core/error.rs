@@ -24,6 +24,8 @@ pub enum Error {
     Conflict(std::path::PathBuf),
     #[error("技能未安装: {0}")]
     NotInstalled(String),
+    #[error("磁盘实况与安装记录不一致: {0}")]
+    Mismatch(String),
     #[error("git 操作失败: {0}")]
     Git(String),
     #[error("git 回滚失败，缓存不可用: {0}")]

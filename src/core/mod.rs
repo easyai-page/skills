@@ -5,4 +5,5 @@ pub mod git;
 pub mod install;
 pub mod paths;
 pub mod registry;
+pub mod remove;
 pub mod source;
