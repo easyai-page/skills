@@ -14,6 +14,12 @@ pub enum Error {
     NoHome,
     #[error("source 已缓存: {0}")]
     AlreadyCached(String),
+    #[error("无效的技能名，必须是单一普通路径组件: {0}")]
+    InvalidSkillName(String),
+    #[error("源路径不在缓存目录内: {0}")]
+    InvalidSourcePath(std::path::PathBuf),
+    #[error("源路径不存在或不是目录: {0}")]
+    SourceNotDirectory(std::path::PathBuf),
     #[error("目标已存在同名技能: {0}")]
     Conflict(std::path::PathBuf),
     #[error("技能未安装: {0}")]

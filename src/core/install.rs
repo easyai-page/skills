@@ -1,10 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::cache::copy_dir;
 use super::config::Config;
 use super::error::{Error, Result};
 use super::paths::{Layout, Target};
 use super::registry::{Install, Method, Registry, TargetRec};
+
+static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// 把技能从缓存安装到一个目标；目标已有同名目录时返回 Error::Conflict 交由前端决策。
 pub fn install_skill(
@@ -18,17 +21,26 @@ pub fn install_skill(
     method: Method,
     commit: &str,
 ) -> Result<Install> {
-    let src_dir = layout.cache_dir(source_key).join(source_path);
+    validate_skill_name(skill)?;
+    let src_dir = resolve_source_dir(layout, source_key, source_path)?;
     let dest_root = target.install_dir(cfg)?;
     let dest = dest_root.join(skill);
-    if dest.exists() || dest.symlink_metadata().is_ok() {
-        return Err(Error::Conflict(dest));
-    }
+    ensure_destination_absent(&dest)?;
     std::fs::create_dir_all(&dest_root)?;
+
     match method {
-        Method::Copy => copy_dir(&src_dir, &dest)?,
-        Method::Symlink => make_symlink(&src_dir, &dest)?,
+        Method::Copy => copy_install(&src_dir, &dest_root, &dest)?,
+        Method::Symlink => {
+            ensure_destination_absent(&dest)?;
+            make_symlink(&src_dir, &dest).map_err(|err| match err {
+                Error::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Error::Conflict(dest.clone())
+                }
+                err => err,
+            })?;
+        }
     }
+
     let rec = Install {
         skill: skill.into(),
         source: source_key.into(),
@@ -42,6 +54,141 @@ pub fn install_skill(
     };
     reg.installs.push(rec.clone());
     Ok(rec)
+}
+
+fn validate_skill_name(skill: &str) -> Result<()> {
+    let path = Path::new(skill);
+    let mut components = path.components();
+    if skill.contains('/')
+        || skill.contains('\\')
+        || !matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        )
+    {
+        return Err(Error::InvalidSkillName(skill.into()));
+    }
+    Ok(())
+}
+
+fn resolve_source_dir(layout: &Layout, source_key: &str, source_path: &str) -> Result<PathBuf> {
+    let relative = Path::new(source_path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::RootDir | Component::Prefix(_) | Component::ParentDir
+            )
+        })
+    {
+        return Err(Error::InvalidSourcePath(relative.to_path_buf()));
+    }
+
+    let cache_path = layout.cache_dir(source_key);
+    let cache_root = canonicalize_source_path(&cache_path)?;
+    let candidate = cache_path.join(relative);
+    let resolved = canonicalize_source_path(&candidate)?;
+    if !resolved.starts_with(&cache_root) {
+        return Err(Error::InvalidSourcePath(relative.to_path_buf()));
+    }
+    if !resolved.is_dir() {
+        return Err(Error::SourceNotDirectory(candidate));
+    }
+    Ok(candidate)
+}
+
+fn canonicalize_source_path(path: &Path) -> Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::SourceNotDirectory(path.to_path_buf()))
+        }
+        Err(err) => Err(Error::Io(err)),
+    }
+}
+
+fn ensure_destination_absent(dest: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(_) => Err(Error::Conflict(dest.to_path_buf())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(Error::Io(err)),
+    }
+}
+
+fn copy_install(src: &Path, dest_root: &Path, dest: &Path) -> Result<()> {
+    let stage = create_staging_dir(dest_root, dest.file_name().unwrap_or_default())?;
+    let result = (|| {
+        copy_dir(src, &stage)?;
+        ensure_destination_absent(dest)?;
+        commit_staging_dir(&stage, dest)
+    })();
+
+    if result.is_err() {
+        let _ = remove_install_path(&stage);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn commit_staging_dir(stage: &Path, dest: &Path) -> Result<()> {
+    match std::fs::create_dir(dest) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(Error::Conflict(dest.to_path_buf()));
+        }
+        Err(err) => return Err(Error::Io(err)),
+    }
+
+    match std::fs::rename(stage, dest) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_dir(dest);
+            Err(Error::Io(err))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn commit_staging_dir(stage: &Path, dest: &Path) -> Result<()> {
+    match std::fs::rename(stage, dest) {
+        Ok(()) => Ok(()),
+        Err(err) if std::fs::symlink_metadata(dest).is_ok() => {
+            Err(Error::Conflict(dest.to_path_buf()))
+        }
+        Err(err) => Err(Error::Io(err)),
+    }
+}
+
+fn create_staging_dir(dest_root: &Path, skill: &std::ffi::OsStr) -> Result<PathBuf> {
+    let pid = std::process::id();
+    loop {
+        let sequence = STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            ".{}-install-{}-{}.tmp",
+            skill.to_string_lossy(),
+            pid,
+            sequence
+        );
+        let stage = dest_root.join(name);
+        match std::fs::create_dir(&stage) {
+            Ok(()) => return Ok(stage),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(Error::Io(err)),
+        }
+    }
+}
+
+fn remove_install_path(path: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 pub fn to_rec(target: &Target) -> TargetRec {
@@ -62,11 +209,18 @@ fn make_symlink(src: &Path, dst: &Path) -> Result<()> {
     if std::os::windows::fs::symlink_dir(src, dst).is_ok() {
         return Ok(());
     }
+    if std::fs::symlink_metadata(dst).is_ok() {
+        return Err(Error::Conflict(dst.to_path_buf()));
+    }
     junction::create(src, dst).map_err(|err| {
-        Error::Msg(format!(
-            "创建链接失败（{}）：请用 --method copy，或开启 Windows 开发者模式",
-            err
-        ))
+        if std::fs::symlink_metadata(dst).is_ok() {
+            Error::Conflict(dst.to_path_buf())
+        } else {
+            Error::Msg(format!(
+                "创建链接失败（{}）：请用 --method copy，或开启 Windows 开发者模式",
+                err
+            ))
+        }
     })?;
     Ok(())
 }
@@ -134,6 +288,31 @@ mod tests {
                 name: "agents".into()
             }
         );
+    }
+
+    #[test]
+    fn project_target_installs_under_dot_agents_skills() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let project_root = tmp.path().join("project");
+        let target = Target::Project {
+            root: project_root.clone(),
+        };
+
+        let rec = install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Copy,
+            "c1",
+        )
+        .unwrap();
+
+        assert!(project_root.join(".agents/skills/alpha/SKILL.md").is_file());
+        assert_eq!(rec.target, TargetRec::Project { root: project_root });
     }
 
     #[cfg(unix)]
@@ -215,5 +394,219 @@ mod tests {
             .unwrap();
         }
         assert_eq!(reg.installs.len(), 2);
+    }
+
+    #[test]
+    fn commit_does_not_replace_a_competing_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join("stage");
+        let dest = root.path().join("alpha");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("SKILL.md"), "staged").unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("owned-by-other"), "keep").unwrap();
+
+        let err = commit_staging_dir(&stage, &dest).unwrap_err();
+
+        assert!(matches!(err, Error::Conflict(_)));
+        assert_eq!(
+            std::fs::read_to_string(dest.join("owned-by-other")).unwrap(),
+            "keep"
+        );
+        assert!(stage.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn rejects_skill_names_that_are_not_one_normal_component() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let target = Target::Global {
+            name: "agents".into(),
+        };
+        let absolute = tmp.path().join("escaped").to_string_lossy().into_owned();
+
+        for skill in ["", ".", "..", "nested/alpha", r"nested\alpha", &absolute] {
+            let err = install_skill(
+                &layout,
+                &cfg,
+                &mut reg,
+                "github/o/r",
+                skill,
+                "skills/alpha",
+                &target,
+                Method::Copy,
+                "c1",
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::InvalidSkillName(_)), "{skill}: {err}");
+        }
+
+        assert!(reg.installs.is_empty());
+        assert!(!cfg.targets["agents"].exists());
+    }
+
+    #[test]
+    fn rejects_source_paths_outside_cache_root() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let absolute = outside.to_string_lossy().into_owned();
+        let target = Target::Global {
+            name: "agents".into(),
+        };
+
+        for source_path in ["../outside", &absolute] {
+            let err = install_skill(
+                &layout,
+                &cfg,
+                &mut reg,
+                "github/o/r",
+                "alpha",
+                source_path,
+                &target,
+                Method::Copy,
+                "c1",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidSourcePath(_)),
+                "{source_path}: {err}"
+            );
+        }
+
+        assert!(reg.installs.is_empty());
+        assert!(!cfg.targets["agents"].exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_source_symlink_that_resolves_outside_cache_root() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let cache = layout.cache_dir("github/o/r");
+        std::os::unix::fs::symlink(&outside, cache.join("escape")).unwrap();
+
+        let err = install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "escape",
+            &Target::Global {
+                name: "agents".into(),
+            },
+            Method::Copy,
+            "c1",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidSourcePath(_)));
+        assert!(reg.installs.is_empty());
+        assert!(!cfg.targets["agents"].exists());
+    }
+
+    #[test]
+    fn rejects_missing_source_without_creating_destination() {
+        let (_tmp, layout, cfg, mut reg) = setup();
+        let err = install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "missing",
+            "skills/missing",
+            &Target::Global {
+                name: "agents".into(),
+            },
+            Method::Symlink,
+            "c1",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::SourceNotDirectory(_)));
+        assert!(reg.installs.is_empty());
+        assert!(!cfg.targets["agents"].exists());
+    }
+
+    #[test]
+    fn rejects_file_source_without_creating_destination() {
+        let (_tmp, layout, cfg, mut reg) = setup();
+        let cache = layout.cache_dir("github/o/r");
+        std::fs::write(cache.join("not-a-directory"), "file").unwrap();
+
+        let err = install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "not-a-directory",
+            "not-a-directory",
+            &Target::Global {
+                name: "agents".into(),
+            },
+            Method::Copy,
+            "c1",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::SourceNotDirectory(_)));
+        assert!(reg.installs.is_empty());
+        assert!(!cfg.targets["agents"].exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_dangling_source_symlink_without_creating_destination() {
+        let (_tmp, layout, cfg, mut reg) = setup();
+        let cache = layout.cache_dir("github/o/r");
+        std::os::unix::fs::symlink("missing", cache.join("dangling")).unwrap();
+
+        let err = install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "dangling",
+            "dangling",
+            &Target::Global {
+                name: "agents".into(),
+            },
+            Method::Symlink,
+            "c1",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::SourceNotDirectory(_)));
+        assert!(reg.installs.is_empty());
+        assert!(!cfg.targets["agents"].exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_failure_cleans_staging_and_destination() {
+        let (_tmp, layout, cfg, mut reg) = setup();
+        let source = layout.cache_dir("github/o/r").join("skills/alpha");
+        std::os::unix::fs::symlink("missing", source.join("broken-link")).unwrap();
+        let dest_root = &cfg.targets["agents"];
+
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &Target::Global {
+                name: "agents".into(),
+            },
+            Method::Copy,
+            "c1",
+        )
+        .unwrap_err();
+
+        assert!(reg.installs.is_empty());
+        assert!(!dest_root.join("alpha").exists());
+        assert_eq!(std::fs::read_dir(dest_root).unwrap().count(), 0);
     }
 }
