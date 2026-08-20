@@ -87,6 +87,7 @@ static NEXT_TRANSACTION_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 enum FailurePoint {
+    AfterWorktreeInstall,
     AfterIndexInstall,
     AfterRefUpdate,
 }
@@ -99,14 +100,19 @@ struct PreparedCheckout {
     index: std::path::PathBuf,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotEntry {
+    Directory(std::path::PathBuf),
+    File(std::path::PathBuf, Vec<u8>),
+    Symlink(std::path::PathBuf, std::path::PathBuf),
+}
+
 struct CheckoutTransaction {
     prepared: PreparedCheckout,
     backup_workdir: std::path::PathBuf,
     old_index: std::path::PathBuf,
-    worktree_started: bool,
-    index_backup_created: bool,
-    index_installed: bool,
-    ref_update_attempted: bool,
+    old_index_bytes: Option<Vec<u8>>,
+    old_worktree: Vec<SnapshotEntry>,
     backed_up_entries: Vec<std::ffi::OsString>,
     installed_entries: Vec<std::ffi::OsString>,
 }
@@ -191,19 +197,29 @@ fn prepare_checkout(repo: &gix::Repository, oid: gix::ObjectId) -> Result<Prepar
 impl CheckoutTransaction {
     fn prepare(repo: &gix::Repository, oid: gix::ObjectId) -> Result<Self> {
         let prepared = prepare_checkout(repo, oid)?;
-        let backup_workdir = prepared.staging.join("backup");
-        let old_index = prepared.staging.join("old-index");
-        Ok(Self {
-            prepared,
-            backup_workdir,
-            old_index,
-            worktree_started: false,
-            index_backup_created: false,
-            index_installed: false,
-            ref_update_attempted: false,
-            backed_up_entries: Vec::new(),
-            installed_entries: Vec::new(),
-        })
+        let staging = prepared.staging.clone();
+        let result = (|| {
+            let backup_workdir = prepared.staging.join("backup");
+            let old_index = prepared.staging.join("old-index");
+            let old_index_bytes = match std::fs::read(&prepared.index) {
+                Ok(bytes) => Some(bytes),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(Error::from(err)),
+            };
+            Ok(Self {
+                old_worktree: snapshot_worktree(&prepared.workdir)?,
+                prepared,
+                backup_workdir,
+                old_index,
+                old_index_bytes,
+                backed_up_entries: Vec::new(),
+                installed_entries: Vec::new(),
+            })
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        result
     }
 
     fn install(
@@ -212,7 +228,6 @@ impl CheckoutTransaction {
         branch: Option<(&str, gix::ObjectId, gix::ObjectId)>,
         failure: Option<FailurePoint>,
     ) -> Result<()> {
-        self.worktree_started = true;
         for entry in std::fs::read_dir(&self.prepared.workdir)? {
             let entry = entry?;
             if entry.file_name() != ".git" {
@@ -227,19 +242,19 @@ impl CheckoutTransaction {
             std::fs::rename(entry.path(), self.prepared.workdir.join(&name))?;
             self.installed_entries.push(name);
         }
+        if matches!(failure, Some(FailurePoint::AfterWorktreeInstall)) {
+            return Err(Error::Git("注入：工作区切换后失败".into()));
+        }
 
         if self.prepared.index.exists() {
             std::fs::rename(&self.prepared.index, &self.old_index)?;
-            self.index_backup_created = true;
         }
         std::fs::rename(&self.prepared.staged_index, &self.prepared.index)?;
-        self.index_installed = true;
         if matches!(failure, Some(FailurePoint::AfterIndexInstall)) {
             return Err(Error::Git("注入：index 切换后失败".into()));
         }
 
         if let Some((branch, old_oid, new_oid)) = branch {
-            self.ref_update_attempted = true;
             repo.reference(
                 branch,
                 new_oid,
@@ -259,50 +274,70 @@ impl CheckoutTransaction {
     fn rollback(
         &self,
         repo: &gix::Repository,
-        branch: Option<(&str, gix::ObjectId)>,
+        branch: Option<(&str, gix::ObjectId, gix::ObjectId)>,
     ) -> Result<()> {
         let mut failures = Vec::new();
-        if self.ref_update_attempted {
-            if let Some((branch, old_oid)) = branch {
-                if let Err(err) = repo.reference(
-                    branch,
-                    old_oid,
-                    gix::refs::transaction::PreviousValue::Any,
-                    "skills rollback",
-                ) {
-                    failures.push(format!("恢复 ref 失败: {err}"));
-                }
+
+        // install 的逆序：ref、index、工作区。每一步都验证旧值，避免返回假成功。
+        if let Some((branch, old_oid, new_oid)) = branch {
+            if let Err(err) = restore_ref(repo, branch, old_oid, new_oid) {
+                failures.push(format!("恢复 ref 失败: {err}"));
             }
         }
-        if self.index_installed {
-            if let Err(err) = std::fs::remove_file(&self.prepared.index) {
-                failures.push(format!("移除新 index 失败: {err}"));
-            }
+        if let Err(err) = self.restore_index() {
+            failures.push(format!("恢复 index 失败: {err}"));
         }
-        if self.index_backup_created {
-            if let Err(err) = std::fs::rename(&self.old_index, &self.prepared.index) {
-                failures.push(format!("恢复旧 index 失败: {err}"));
-            }
+        if let Err(err) = self.restore_worktree() {
+            failures.push(format!("恢复工作区失败: {err}"));
         }
-        if self.worktree_started {
-            if let Err(err) =
-                remove_worktree_entries(&self.prepared.workdir, &self.installed_entries)
-            {
-                failures.push(format!("清理新工作区失败: {err}"));
-            }
-            if let Err(err) = restore_worktree_entries(
-                &self.backup_workdir,
-                &self.prepared.workdir,
-                &self.backed_up_entries,
-            ) {
-                failures.push(format!("恢复旧工作区失败: {err}"));
-            }
-        }
+
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(Error::Git(failures.join("; ")))
+            Err(Error::GitRecovery(failures.join("; ")))
         }
+    }
+
+    fn restore_index(&self) -> std::io::Result<()> {
+        match &self.old_index_bytes {
+            Some(old_bytes) => {
+                if self.prepared.index.exists() {
+                    if std::fs::read(&self.prepared.index)? == *old_bytes {
+                        return Ok(());
+                    }
+                    std::fs::remove_file(&self.prepared.index)?;
+                }
+                std::fs::rename(&self.old_index, &self.prepared.index)?;
+                if std::fs::read(&self.prepared.index)? != *old_bytes {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "恢复后的 index 字节不匹配",
+                    ));
+                }
+            }
+            None => {
+                if self.prepared.index.exists() {
+                    std::fs::remove_file(&self.prepared.index)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_worktree(&self) -> std::io::Result<()> {
+        remove_worktree_entries(&self.prepared.workdir, &self.installed_entries)?;
+        restore_worktree_entries_reverse(
+            &self.backup_workdir,
+            &self.prepared.workdir,
+            &self.backed_up_entries,
+        )?;
+        if snapshot_worktree(&self.prepared.workdir)? != self.old_worktree {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "恢复后的工作区与旧快照不匹配",
+            ));
+        }
+        Ok(())
     }
 
     fn finish(self) {
@@ -330,15 +365,75 @@ fn remove_worktree_entries(
     Ok(())
 }
 
-fn restore_worktree_entries(
+fn restore_worktree_entries_reverse(
     backup: &std::path::Path,
     workdir: &std::path::Path,
     names: &[std::ffi::OsString],
 ) -> std::io::Result<()> {
-    for name in names {
+    for name in names.iter().rev() {
         std::fs::rename(backup.join(name), workdir.join(name))?;
     }
     Ok(())
+}
+
+fn restore_ref(
+    repo: &gix::Repository,
+    branch: &str,
+    old_oid: gix::ObjectId,
+    new_oid: gix::ObjectId,
+) -> Result<()> {
+    let current = repo.find_reference(branch).map_err(gerr)?.id().detach();
+    if current == old_oid {
+        return Ok(());
+    }
+    if current != new_oid {
+        return Err(Error::Git(format!(
+            "ref 当前值 {current} 既非旧值 {old_oid} 也非新值 {new_oid}"
+        )));
+    }
+    repo.reference(
+        branch,
+        old_oid,
+        gix::refs::transaction::PreviousValue::MustExistAndMatch(new_oid.into()),
+        "skills rollback",
+    )
+    .map_err(gerr)?;
+    Ok(())
+}
+
+fn snapshot_worktree(root: &std::path::Path) -> std::io::Result<Vec<SnapshotEntry>> {
+    fn visit(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<SnapshotEntry>,
+    ) -> std::io::Result<()> {
+        let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if dir == root && entry.file_name() == ".git" {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("快照路径在工作区内")
+                .to_path_buf();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                out.push(SnapshotEntry::Symlink(relative, std::fs::read_link(path)?));
+            } else if metadata.is_dir() {
+                out.push(SnapshotEntry::Directory(relative));
+                visit(root, &path, out)?;
+            } else {
+                out.push(SnapshotEntry::File(relative, std::fs::read(path)?));
+            }
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    visit(root, root, &mut out)?;
+    Ok(out)
 }
 
 fn checkout_tree(repo: &gix::Repository, oid: gix::ObjectId) -> Result<()> {
@@ -376,16 +471,20 @@ fn checkout_transaction(
     branch: Option<(&str, gix::ObjectId, gix::ObjectId)>,
     failure: Option<FailurePoint>,
 ) -> Result<()> {
-    let old_ref = branch.map(|(name, old_oid, _)| (name, old_oid));
     let mut transaction = CheckoutTransaction::prepare(repo, oid)?;
     match transaction.install(repo, branch, failure) {
         Ok(()) => {
             transaction.finish();
             Ok(())
         }
-        Err(err) => match transaction.rollback(repo, old_ref) {
-            Ok(()) => Err(err),
-            Err(rollback_err) => Err(Error::Git(format!("{err}; {rollback_err}"))),
+        Err(err) => match transaction.rollback(repo, branch) {
+            Ok(()) => {
+                transaction.finish();
+                Err(err)
+            }
+            Err(recovery_err) => Err(Error::GitRecovery(format!(
+                "切换失败且缓存不可用：{err}; {recovery_err}"
+            ))),
         },
     }
 }
@@ -618,6 +717,19 @@ mod tests {
                 old_oid,
                 new_oid,
                 FailurePoint::AfterIndexInstall,
+            )
+            .is_err()
+        );
+        assert_old_state();
+
+        let repo = gix::open(&dest).unwrap();
+        assert!(
+            checkout_tree_with_failure(
+                &repo,
+                branch,
+                old_oid,
+                new_oid,
+                FailurePoint::AfterWorktreeInstall,
             )
             .is_err()
         );

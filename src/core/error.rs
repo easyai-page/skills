@@ -18,6 +18,8 @@ pub enum Error {
     NotInstalled(String),
     #[error("git 操作失败: {0}")]
     Git(String),
+    #[error("git 回滚失败，缓存不可用: {0}")]
+    GitRecovery(String),
     #[error("{0}")]
     Msg(String),
 }
