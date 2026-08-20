@@ -98,6 +98,8 @@ registry 写入用临时文件 + rename 原子替换，避免中途失败写脏�
 
 **source 解析**：`owner/repo` 自动补全为 `https://github.com/owner/repo`；完整 URL、SSH URL 原样使用；本地路径映射到 `~/.skills/local/`。
 
+**target 寻址语法**：命令行中 `--target` 统一用 `global:<name>`（如 `global:agents`）或 `project:<项目根绝对路径>` 两种形式；`-g` 是 `--target global:agents` 的快捷方式。
+
 ### TUI（ratatui）
 
 三个主视图 Tab 切换：
