@@ -14,6 +14,8 @@ pub enum Error {
     NoHome,
     #[error("source 已缓存: {0}")]
     AlreadyCached(String),
+    #[error("目标已存在同名技能: {0}")]
+    Conflict(std::path::PathBuf),
     #[error("技能未安装: {0}")]
     NotInstalled(String),
     #[error("git 操作失败: {0}")]

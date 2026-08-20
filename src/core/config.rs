@@ -97,14 +97,18 @@ mod tests {
     #[test]
     fn config_file_overrides_and_extends() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("config.toml"), r#"
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            r#"
 [defaults]
 method = "copy"
 [web]
 port = 9000
 [targets]
 cursor = "~/.cursor/skills"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let cfg = Config::load(&Layout::at(tmp.path().to_path_buf())).unwrap();
         assert_eq!(cfg.default_method, Method::Copy);
         assert_eq!(cfg.web_port, 9000);
@@ -115,8 +119,11 @@ cursor = "~/.cursor/skills"
     #[test]
     fn tilde_expands_in_targets() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("config.toml"),
-            "[targets]\ncursor = \"~/.cursor/skills\"\n").unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[targets]\ncursor = \"~/.cursor/skills\"\n",
+        )
+        .unwrap();
         let cfg = Config::load(&Layout::at(tmp.path().to_path_buf())).unwrap();
         let p = &cfg.targets["cursor"];
         assert!(!p.to_string_lossy().contains('~'));
