@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Method { Symlink, Copy }
+pub enum Method {
+    Symlink,
+    Copy,
+}
 
 pub struct Config {
     pub targets: BTreeMap<String, PathBuf>,
@@ -18,6 +21,10 @@ impl Default for Config {
             targets.insert("claude".into(), home.join(".claude").join("skills"));
             targets.insert("codex".into(), home.join(".codex").join("skills"));
         }
-        Config { targets, default_method: Method::Symlink, web_port: 7823 }
+        Config {
+            targets,
+            default_method: Method::Symlink,
+            web_port: 7823,
+        }
     }
 }

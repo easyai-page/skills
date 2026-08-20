@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use super::error::{Error, Result};
+use std::path::PathBuf;
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct SourceSpec {
@@ -16,10 +16,15 @@ pub fn parse_source(input: &str) -> Result<SourceSpec> {
     // 本地绝对路径
     let p = PathBuf::from(input);
     if p.is_absolute() {
-        let name = p.file_name()
+        let name = p
+            .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "unnamed".into());
-        return Ok(SourceSpec { key: format!("local/{name}"), url: None, local_path: Some(p) });
+        return Ok(SourceSpec {
+            key: format!("local/{name}"),
+            url: None,
+            local_path: Some(p),
+        });
     }
     // SSH 形式 git@host:owner/repo[.git]
     if let Some(rest) = input.strip_prefix("git@") {
@@ -33,7 +38,7 @@ pub fn parse_source(input: &str) -> Result<SourceSpec> {
             });
         }
         return Err(Error::Msg(format!("无法解析 source: {input}")));
-    }    // file:// URL（本地 bare 仓库，测试与离线场景）
+    } // file:// URL（本地 bare 仓库，测试与离线场景）
     if let Some(rest) = input.strip_prefix("file://") {
         let trimmed = rest.trim_end_matches('/').trim_end_matches(".git");
         let parts: Vec<&str> = trimmed.rsplitn(3, '/').collect();
@@ -49,10 +54,15 @@ pub fn parse_source(input: &str) -> Result<SourceSpec> {
         });
     }
     // https://host/owner/repo[.git]
-    if let Some(rest) = input.strip_prefix("https://").or_else(|| input.strip_prefix("http://")) {
+    if let Some(rest) = input
+        .strip_prefix("https://")
+        .or_else(|| input.strip_prefix("http://"))
+    {
         let mut parts = rest.splitn(2, '/');
         let host = parts.next().unwrap_or_default();
-        let path = parts.next().map(|p| p.trim_end_matches('/').trim_end_matches(".git"));
+        let path = parts
+            .next()
+            .map(|p| p.trim_end_matches('/').trim_end_matches(".git"));
         match (host, path) {
             (h, Some(p)) if !h.is_empty() && p.matches('/').count() == 1 => {
                 let short = if h == "github.com" { "github" } else { h };
@@ -67,7 +77,9 @@ pub fn parse_source(input: &str) -> Result<SourceSpec> {
     }
     // GitHub 简写 owner/repo
     if input.matches('/').count() == 1
-        && input.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+        && input
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
     {
         return Ok(SourceSpec {
             key: format!("github/{input}"),
@@ -86,7 +98,10 @@ mod tests {
     fn github_shorthand_expands() {
         let s = parse_source("mattpocock/skills").unwrap();
         assert_eq!(s.key, "github/mattpocock/skills");
-        assert_eq!(s.url.as_deref(), Some("https://github.com/mattpocock/skills"));
+        assert_eq!(
+            s.url.as_deref(),
+            Some("https://github.com/mattpocock/skills")
+        );
         assert!(s.local_path.is_none());
     }
 
@@ -118,7 +133,11 @@ mod tests {
 
     #[test]
     fn local_absolute_path() {
-        let p = if cfg!(windows) { "C:\\tmp\\myskill" } else { "/tmp/myskill" };
+        let p = if cfg!(windows) {
+            "C:\\tmp\\myskill"
+        } else {
+            "/tmp/myskill"
+        };
         let s = parse_source(p).unwrap();
         assert!(s.key.starts_with("local/"));
         assert!(s.url.is_none());

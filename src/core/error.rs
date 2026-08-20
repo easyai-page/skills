@@ -1,8 +1,11 @@
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("io: {0}")] Io(#[from] std::io::Error),
-    #[error("json: {0}")] Json(#[from] serde_json::Error),
-    #[error("toml: {0}")] Toml(#[from] toml::de::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("toml: {0}")]
+    Toml(#[from] toml::de::Error),
     #[error("无效的 target 语法: {0}（应为 global:<name> 或 project:<绝对路径>）")]
     BadTarget(String),
     #[error("未知的全局 target: {0}")]
@@ -15,6 +18,7 @@ pub enum Error {
     NotInstalled(String),
     #[error("git 操作失败: {0}")]
     Git(String),
-    #[error("{0}")] Msg(String),
+    #[error("{0}")]
+    Msg(String),
 }
 pub type Result<T> = std::result::Result<T, Error>;
