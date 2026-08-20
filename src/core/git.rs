@@ -37,6 +37,13 @@ pub fn fetch_and_reset(path: &Path) -> Result<Option<String>> {
         .find_default_remote(gix::remote::Direction::Fetch)
         .ok_or_else(|| Error::Git("无默认 remote".into()))?
         .map_err(gerr)?;
+    let remote_name = match remote
+        .name()
+        .ok_or_else(|| Error::Git("默认 remote 无名称".into()))?
+    {
+        gix::remote::Name::Symbol(name) => name.to_owned(),
+        gix::remote::Name::Url(_) => return Err(Error::Git("默认 remote 名称为 URL".into())),
+    };
     remote
         .connect(gix::remote::Direction::Fetch)
         .map_err(gerr)?
@@ -56,7 +63,7 @@ pub fn fetch_and_reset(path: &Path) -> Result<Option<String>> {
         .ok_or_else(|| Error::Git("HEAD 为 detached 状态，不支持 reset".into()))?;
     let short = branch.trim_start_matches("refs/heads/");
     let oid = repo
-        .find_reference(&format!("refs/remotes/origin/{short}"))
+        .find_reference(&format!("refs/remotes/{remote_name}/{short}"))
         .map_err(gerr)?
         .id()
         .detach();
@@ -82,63 +89,87 @@ pub fn head_commit(path: &Path) -> Result<String> {
     Ok(repo.head_id().map_err(gerr)?.to_string())
 }
 
-/// 把 `oid` 的树检出到工作区并重建索引。先清空工作区中非 .git 内容，
-/// 保证远端删除的文件也被移除（等价 git reset --hard）。
+/// 把 `oid` 的树检出到工作区并重建索引。先在临时目录完成所有
+/// 可能失败的 tree/index/checkout 操作，成功后再替换工作区内容。
 fn checkout_tree(repo: &gix::Repository, oid: gix::ObjectId) -> Result<()> {
     let workdir = repo
         .work_dir()
         .ok_or_else(|| Error::Git("bare 仓库无工作区".into()))?
         .to_path_buf();
-    for entry in std::fs::read_dir(&workdir)? {
-        let entry = entry?;
-        if entry.file_name() == ".git" {
-            continue;
-        }
-        if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(entry.path())?;
-        } else {
-            std::fs::remove_file(entry.path())?;
-        }
-    }
+    let staging = workdir
+        .parent()
+        .unwrap_or(&workdir)
+        .join(format!(".skills-checkout-{}", oid));
+    std::fs::create_dir(&staging)?;
+    let staged_workdir = staging.join("worktree");
+    std::fs::create_dir(&staged_workdir)?;
 
-    let tree_id = repo
-        .find_commit(oid)
-        .map_err(gerr)?
-        .tree_id()
-        .map_err(gerr)?
-        .detach();
-    let state = gix::index::State::from_tree(&tree_id, repo.objects.clone(), Default::default())
+    let result = (|| {
+        let tree_id = repo
+            .find_commit(oid)
+            .map_err(gerr)?
+            .tree_id()
+            .map_err(gerr)?
+            .detach();
+        let state =
+            gix::index::State::from_tree(&tree_id, repo.objects.clone(), Default::default())
+                .map_err(gerr)?;
+        let staged_index_path = staging.join("index");
+        let mut index = gix::index::File::from_state(state, staged_index_path.clone());
+        let opts = gix_worktree_state::checkout::Options {
+            fs: gix::fs::Capabilities::probe(repo.git_dir()),
+            validate: Default::default(),
+            thread_limit: None,
+            destination_is_initially_empty: true,
+            overwrite_existing: false,
+            keep_going: false,
+            stat_options: Default::default(),
+            attributes: gix_worktree::stack::state::Attributes::new(
+                Default::default(),
+                None,
+                gix_worktree::stack::state::attributes::Source::IdMapping,
+                Default::default(),
+            ),
+            filters: gix_filter::Pipeline::default(),
+            filter_process_delay: gix_filter::driver::apply::Delay::Forbid,
+        };
+        gix_worktree_state::checkout(
+            &mut index,
+            &staged_workdir,
+            repo.objects.clone().into_arc()?,
+            &gix::progress::Discard,
+            &gix::progress::Discard,
+            &AtomicBool::new(false),
+            opts,
+        )
         .map_err(gerr)?;
-    let mut index = gix::index::File::from_state(state, repo.index_path());
-    let opts = gix_worktree_state::checkout::Options {
-        fs: gix::fs::Capabilities::probe(repo.git_dir()),
-        validate: Default::default(),
-        thread_limit: None,
-        destination_is_initially_empty: true,
-        overwrite_existing: false,
-        keep_going: false,
-        stat_options: Default::default(),
-        attributes: gix_worktree::stack::state::Attributes::new(
-            Default::default(),
-            None,
-            gix_worktree::stack::state::attributes::Source::IdMapping,
-            Default::default(),
-        ),
-        filters: gix_filter::Pipeline::default(),
-        filter_process_delay: gix_filter::driver::apply::Delay::Forbid,
-    };
-    gix_worktree_state::checkout(
-        &mut index,
-        &workdir,
-        repo.objects.clone().into_arc()?,
-        &gix::progress::Discard,
-        &gix::progress::Discard,
-        &AtomicBool::new(false),
-        opts,
-    )
-    .map_err(gerr)?;
-    index.write(Default::default()).map_err(gerr)?;
-    Ok(())
+        index.write(Default::default()).map_err(gerr)?;
+
+        for entry in std::fs::read_dir(&workdir)? {
+            let entry = entry?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        for entry in std::fs::read_dir(&staged_workdir)? {
+            let entry = entry?;
+            std::fs::rename(entry.path(), workdir.join(entry.file_name()))?;
+        }
+        std::fs::rename(staged_index_path, repo.index_path()).map_err(gerr)?;
+        Ok(())
+    })();
+
+    let cleanup = std::fs::remove_dir_all(&staging);
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(gerr(err)),
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +300,51 @@ mod tests {
         );
         // 再跑一次应回到 None（幂等）
         assert_eq!(fetch_and_reset(&dest).unwrap(), None);
+    }
+
+    #[test]
+    fn fetch_and_reset_uses_non_origin_default_remote() {
+        let (tmp, work, bare) = make_bare_repo();
+        let dest = tmp.path().join("clone");
+        let c1 = shallow_clone(&format!("file://{}", bare.display()), &dest).unwrap();
+        git(&dest, &["remote", "rename", "origin", "upstream"]);
+
+        std::fs::write(work.join("new.txt"), "new\n").unwrap();
+        git(&work, &["add", "new.txt"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "c2",
+            ],
+        );
+        git(&work, &["push", bare.to_str().unwrap(), "main"]);
+
+        let c2 = fetch_and_reset(&dest).unwrap().expect("应有新 commit");
+        assert_ne!(c1, c2);
+        assert_eq!(head_commit(&dest).unwrap(), c2);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("new.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[test]
+    fn checkout_tree_failure_preserves_existing_worktree() {
+        let (_tmp, _work, bare) = make_bare_repo();
+        let dst = tempfile::tempdir().unwrap();
+        let dest = dst.path().join("clone");
+        shallow_clone(&format!("file://{}", bare.display()), &dest).unwrap();
+        let existing = dest.join("stale.txt");
+        let repo = gix::open(&dest).unwrap();
+
+        assert!(checkout_tree(&repo, gix::ObjectId::null(gix::hash::Kind::Sha1)).is_err());
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), "stale\n");
     }
 
     #[test]
