@@ -48,8 +48,6 @@ pub enum Cmd {
         target: Vec<String>,
         #[arg(long)]
         tag: Option<String>,
-        #[arg(short = 'y', long)]
-        yes: bool,
     },
     /// 按两级策略更新；显式指定技能时强制更新该副本
     Update {
@@ -70,19 +68,23 @@ pub enum Cmd {
         #[arg(long)]
         remove: bool,
     },
-    /// 升级策略（只写 registry.json）
+    /// 升级策略（只写 registry.json）；--on/--off/--inherit 必须且只能给一个
+    #[command(group = clap::ArgGroup::new("policy").required(true).multiple(false).args(["on", "off", "inherit"]))]
     AutoUpdate {
         skill: Option<String>,
         #[arg(short, long)]
         target: Option<String>,
         #[arg(short, long)]
         source: Option<String>,
+        /// 开启自动更新
         #[arg(long)]
         on: bool,
+        /// 关闭自动更新
         #[arg(long)]
         off: bool,
+        /// 清除副本级覆盖，跟随包级
         #[arg(long)]
-        inherit: bool, // 清除副本级覆盖，跟随包级
+        inherit: bool,
     },
     /// 全局配置（只写 config.toml）
     Config {

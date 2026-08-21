@@ -45,8 +45,11 @@ pub struct Layout {
 
 impl Layout {
     pub fn new() -> Result<Layout> {
+        // 空串视为未设置：否则 root="" 会把 registry/config 写进当前工作目录
         if let Ok(p) = std::env::var("SKILLS_HOME") {
-            return Ok(Layout { root: p.into() });
+            if !p.is_empty() {
+                return Ok(Layout { root: p.into() });
+            }
         }
         let home = dirs::home_dir().ok_or(Error::NoHome)?;
         Ok(Layout {
@@ -119,6 +122,30 @@ mod tests {
         };
         let dir = t.install_dir(&cfg).unwrap();
         assert!(dir.ends_with(".agents/skills") || dir.ends_with(".agents\\skills"));
+    }
+
+    #[test]
+    fn skills_home_env_handling() {
+        // 本进程内只有此测试读写 SKILLS_HOME（cli_smoke 在子进程设 env），单测试内顺序断言无竞态
+        unsafe {
+            std::env::set_var("SKILLS_HOME", "/tmp/skills-test-override");
+        }
+        assert_eq!(
+            Layout::new().unwrap().root,
+            PathBuf::from("/tmp/skills-test-override")
+        );
+        unsafe {
+            std::env::set_var("SKILLS_HOME", "");
+        }
+        let l = Layout::new().unwrap();
+        assert!(
+            l.root.is_absolute() && l.root.ends_with(".skills"),
+            "{:?}",
+            l.root
+        );
+        unsafe {
+            std::env::remove_var("SKILLS_HOME");
+        }
     }
 
     #[test]

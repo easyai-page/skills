@@ -37,6 +37,13 @@ fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// 校验一段 TOML 文本能否被 Config::load 解析。
+/// `config set` 写入前自检用：避免写出锁死 CLI 的配置值。
+pub fn validate_config_toml(text: &str) -> Result<()> {
+    let _: FileConfig = toml::from_str(text)?;
+    Ok(())
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut targets = BTreeMap::new();
@@ -114,6 +121,17 @@ cursor = "~/.cursor/skills"
         assert_eq!(cfg.web_port, 9000);
         assert!(cfg.targets.contains_key("cursor"));
         assert!(cfg.targets.contains_key("agents")); // 内置的还在
+    }
+
+    #[test]
+    fn validate_config_toml_catches_unloadable_values() {
+        assert!(validate_config_toml("[web]\nport = 99999").is_err());
+        assert!(validate_config_toml("[defaults]\nmethod = \"foo\"").is_err());
+        assert!(validate_config_toml("[targets]\nx = 123").is_err());
+        assert!(validate_config_toml("[web]\nport = 9000").is_ok());
+        assert!(validate_config_toml("[defaults]\nmethod = \"copy\"").is_ok());
+        assert!(validate_config_toml("[targets]\nx = \"~/x\"").is_ok());
+        assert!(validate_config_toml("").is_ok());
     }
 
     #[test]
