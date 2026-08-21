@@ -91,3 +91,43 @@
   - `fetch_without_change_does_not_touch_commit`：fetch 无变化时 commit/fetched_at 不抖动、无“仓库 →”条目
 - `cargo fmt` 已执行；`cargo test` 全量：**71 passed, 0 failed**（任务 1-8 的 59 个无回归）
 - 无新增编译警告（`reason` 字段告警为 bf528c3 既有）
+
+---
+
+# 任务 9 第 2 轮修复报告（收尾 Warning）
+
+- 提交：（本次提交后回填短 SHA）fix(core): 收尾更新引擎 Warning（备份清理降级+回滚错误带备份路径+故障注入测试）
+- 日期：2026-08-20
+- 复审结论：第 1 轮 5 条原问题（manifest 丢失 / 绕过归属防线 / 非原子替换 / unwrap panic / execute_plan 零测试）已全部解决且无回归，仅剩 2 个 Warning。
+
+## 逐条处理
+
+1. **Warning（备份删除失败传播 Err）**：`commit_replacement` 中 `std::fs::remove_dir_all(&backup)?` 改为 `remove_backup_dir` + 降级处理——替换已生效后清理失败只 `eprintln!` 警告（含备份路径），返回 Ok。execute_plan 不再中止、reg.save 正常落盘，不再有「备份残留 + registry 落后 + 误报失败」三连。
+2. **Warning（回滚 `let _ =` 静默吞错）**：回滚 rename 失败时返回 `Error::Msg`，错误信息同时带上提交失败原因、回滚失败原因、备份完整路径与「请手动重命名回 dest」提示，用户可定位并找回原副本。
+
+## 可选项（已做）
+
+- `unique_backup_path` 的 `is_err()` 判定对齐 `create_staging_dir` 的 AlreadyExists 重试风格：改为返回 `Result<PathBuf>`，`Ok(_)`（已占用）换序号重试，`Err(NotFound)` 才采用，其他错误如实 `Error::Io` 上报而非当作「不存在」。
+
+## 测试（故障注入）
+
+新增注入点（仅 `#[cfg(test)]`，线程本地 `Cell`，位掩码按调用序号注入，不影响并行测试与其他线程）：
+
+- `checked_rename`：commit_replacement 内 rename 封装，可按第 n 次调用注入失败；
+- `remove_backup_dir`：备份清理封装，可注入清理失败。
+
+新增 3 个测试（install.rs）：
+
+- `replacement_succeeds_even_when_backup_cleanup_fails`：替换成功但备份清理失败 → 返回 Ok，dest 已是 v2，备份残留且内容仍是 v1（核心回归断言）；
+- `commit_failure_rolls_back_to_original_copy`：提交 rename 失败 → 回滚恢复 v1，无备份残留；
+- `rollback_failure_reports_backup_path_for_manual_recovery`：提交+回滚双失败 → Err 含备份路径与注入原因，备份完整保留，模拟用户按提示手动 rename 可完整找回。
+
+## 测试小结
+
+- `cargo fmt` 已执行；`cargo clippy --all-targets`：新代码 0 告警（`io::Error::other`、thread_local const 初始化均已采纳），剩余 dead_code 均为既有未接线告警
+- `cargo test install`：23/23 PASS；`cargo test update`：12/12 PASS
+- `cargo test` 全量：**74 passed, 0 failed**（71 → 74，新增 3 个，无回归）
+
+## 未触碰
+
+- `docs/`、`.superpowers/` 未改动。

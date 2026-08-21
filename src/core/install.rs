@@ -165,22 +165,77 @@ fn commit_replacement(stage: &Path, dest: &Path) -> Result<()> {
         }
         Err(err) => return Err(Error::Io(err)),
     }
-    let backup = unique_backup_path(dest_root, dest.file_name().unwrap_or_default());
-    std::fs::rename(dest, &backup)?;
-    match std::fs::rename(stage, dest) {
+    let backup = unique_backup_path(dest_root, dest.file_name().unwrap_or_default())?;
+    checked_rename(dest, &backup)?;
+    match checked_rename(stage, dest) {
         Ok(()) => {
-            std::fs::remove_dir_all(&backup)?;
+            // 替换已生效：备份清理失败不否决成功（否则 execute_plan 中止、registry 不落盘、
+            // 用户看到误报失败）。降级为警告并给出备份路径，便于手动清理。
+            if let Err(err) = remove_backup_dir(&backup) {
+                eprintln!(
+                    "warning: 副本已更新，但旧副本备份 {} 清理失败（{err}），可手动删除",
+                    backup.display()
+                );
+            }
             Ok(())
         }
         Err(err) => {
             // 回滚：恢复原副本，保证“要么完整保留、要么完整替换”
-            let _ = std::fs::rename(&backup, dest);
-            Err(Error::Io(err))
+            match checked_rename(&backup, dest) {
+                Ok(()) => Err(Error::Io(err)),
+                // 回滚也失败：错误必须带上备份路径与失败原因，让用户能找回原副本
+                Err(rollback_err) => Err(Error::Msg(format!(
+                    "更新提交失败（{err}），且回滚恢复原副本也失败（{rollback_err}）；\
+                     原副本保留在备份 {}，请手动重命名回 {}",
+                    backup.display(),
+                    dest.display()
+                ))),
+            }
         }
     }
 }
 
-fn unique_backup_path(dest_root: &Path, skill: &std::ffi::OsStr) -> PathBuf {
+/// commit_replacement 内部的 rename 封装。
+/// 测试构建下支持按调用序号注入失败（线程本地位掩码，不影响并行测试与其他线程）。
+fn checked_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let seq = RENAME_SEQ.with(|seq| {
+            let next = seq.get() + 1;
+            seq.set(next);
+            next
+        });
+        let mask = RENAME_FAIL_MASK.with(|mask| mask.get());
+        if seq <= 64 && mask & (1u64 << (seq - 1)) != 0 {
+            return Err(std::io::Error::other("测试注入的 rename 失败"));
+        }
+    }
+    std::fs::rename(from, to)
+}
+
+/// 备份目录清理。单独成函数是为了测试构建下可注入失败（线程本地开关）。
+fn remove_backup_dir(backup: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if BACKUP_CLEANUP_FAILS.with(|fails| fails.get()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "测试注入的备份清理失败",
+        ));
+    }
+    std::fs::remove_dir_all(backup)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 当前线程内 checked_rename 的调用计数（1 起计），配合 RENAME_FAIL_MASK 使用
+    static RENAME_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// 位掩码：第 n 次调用对应位 (n-1) 置位时注入失败；0 = 不注入
+    static RENAME_FAIL_MASK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// 置位时 remove_backup_dir 注入失败
+    static BACKUP_CLEANUP_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn unique_backup_path(dest_root: &Path, skill: &std::ffi::OsStr) -> Result<PathBuf> {
     let pid = std::process::id();
     loop {
         let sequence = STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -191,8 +246,12 @@ fn unique_backup_path(dest_root: &Path, skill: &std::ffi::OsStr) -> PathBuf {
             sequence
         );
         let path = dest_root.join(name);
-        if std::fs::symlink_metadata(&path).is_err() {
-            return path;
+        match std::fs::symlink_metadata(&path) {
+            // 与 create_staging_dir 的 AlreadyExists 重试风格对齐：
+            // 仅在确认不存在时采用；已占用换下一个序号；其他错误如实上报而非当作不存在
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Err(err) => return Err(Error::Io(err)),
         }
     }
 }
@@ -492,6 +551,114 @@ mod tests {
             "keep"
         );
         assert!(stage.join("SKILL.md").is_file());
+    }
+
+    /// 构造 commit_replacement 的输入：暂存副本（v2）与已存在的旧副本 dest（v1）。
+    fn setup_replacement(root: &Path) -> (PathBuf, PathBuf) {
+        let stage = root.join("stage");
+        let dest = root.join("alpha");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("SKILL.md"), "v2").unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("SKILL.md"), "v1").unwrap();
+        (stage, dest)
+    }
+
+    fn dir_names(root: &Path) -> Vec<String> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn replacement_succeeds_even_when_backup_cleanup_fails() {
+        // 回归（任务 9 第 2 轮）：替换已生效后，备份删除失败不得传播 Err——
+        // 否则 execute_plan 中止、reg.save 不执行，磁盘与 registry 脱节且误报失败。
+        let root = tempfile::tempdir().unwrap();
+        let (stage, dest) = setup_replacement(root.path());
+
+        BACKUP_CLEANUP_FAILS.with(|fails| fails.set(true));
+        let result = commit_replacement(&stage, &dest);
+        BACKUP_CLEANUP_FAILS.with(|fails| fails.set(false));
+
+        assert!(
+            result.is_ok(),
+            "备份清理失败不应否决已成功的替换: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "v2"
+        );
+        // 备份残留，内容仍是旧副本，留给用户按警告提示手动清理
+        let backup = dir_names(root.path())
+            .into_iter()
+            .find(|name| name.contains("-update-backup-"))
+            .expect("清理失败时应残留备份目录");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(&backup).join("SKILL.md")).unwrap(),
+            "v1"
+        );
+        std::fs::remove_dir_all(root.path().join(backup)).unwrap();
+    }
+
+    #[test]
+    fn commit_failure_rolls_back_to_original_copy() {
+        // 提交 rename（本次第 2 次调用）失败时，回滚恢复原副本，无备份残留。
+        let root = tempfile::tempdir().unwrap();
+        let (stage, dest) = setup_replacement(root.path());
+
+        RENAME_SEQ.with(|seq| seq.set(0));
+        RENAME_FAIL_MASK.with(|mask| mask.set(0b10));
+        let err = commit_replacement(&stage, &dest).unwrap_err();
+        RENAME_FAIL_MASK.with(|mask| mask.set(0));
+
+        assert!(matches!(err, Error::Io(_)), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "v1"
+        );
+        assert!(
+            !dir_names(root.path())
+                .iter()
+                .any(|name| name.contains("-update-backup-")),
+            "回滚成功后不应有备份残留"
+        );
+    }
+
+    #[test]
+    fn rollback_failure_reports_backup_path_for_manual_recovery() {
+        // 回归（任务 9 第 2 轮）：回滚失败不得静默吞错，错误信息必须带备份路径与原因。
+        let root = tempfile::tempdir().unwrap();
+        let (stage, dest) = setup_replacement(root.path());
+
+        // 第 2 次调用（提交）与第 3 次调用（回滚）均注入失败
+        RENAME_SEQ.with(|seq| seq.set(0));
+        RENAME_FAIL_MASK.with(|mask| mask.set(0b110));
+        let err = commit_replacement(&stage, &dest).unwrap_err();
+        RENAME_FAIL_MASK.with(|mask| mask.set(0));
+
+        let msg = format!("{err}");
+        assert!(matches!(err, Error::Msg(_)), "{err}");
+        assert!(msg.contains("回滚"), "{msg}");
+        assert!(msg.contains("测试注入"), "{msg}");
+        // 备份仍在原地（回滚失败），里面是旧副本；错误信息含备份路径可定位
+        let backup = dir_names(root.path())
+            .into_iter()
+            .find(|name| name.contains("-update-backup-"))
+            .expect("回滚失败时备份应仍在原地");
+        assert!(msg.contains(&backup), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(&backup).join("SKILL.md")).unwrap(),
+            "v1"
+        );
+        assert!(!dest.exists());
+        // 模拟用户按错误提示手动恢复：原副本可完整找回
+        std::fs::rename(root.path().join(backup), &dest).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "v1"
+        );
     }
 
     #[test]
