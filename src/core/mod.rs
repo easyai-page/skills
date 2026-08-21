@@ -7,4 +7,5 @@ pub mod paths;
 pub mod registry;
 pub mod remove;
 pub mod source;
+pub mod tags;
 pub mod update;
