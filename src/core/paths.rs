@@ -39,6 +39,7 @@ impl Target {
     }
 }
 
+#[derive(Clone)]
 pub struct Layout {
     pub root: PathBuf,
 }

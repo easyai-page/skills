@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"><title>skills 管理</title>
+<style>
+body { font-family: system-ui; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+table { border-collapse: collapse; width: 100%; }
+td, th { border: 1px solid #ddd; padding: 6px 10px; }
+nav button { margin-right: 8px; }
+.on { color: green; } .off { color: #999; }
+</style>
+</head>
+<body>
+<h1>skills 管理</h1>
+<nav>
+  <button onclick="show('installs')">已安装</button>
+  <button onclick="show('sources')">仓库缓存</button>
+  <button onclick="runUpdate()">执行更新</button>
+</nav>
+<div id="installs"></div>
+<div id="sources" style="display:none"></div>
+<script>
+async function api(path, opts) {
+  const r = await fetch('/api/' + path, opts);
+  return r.ok ? (r.headers.get('content-type')||'').includes('json') ? r.json() : null : Promise.reject(r.status);
+}
+function show(id) {
+  for (const d of ['installs','sources']) document.getElementById(d).style.display = d===id?'':'none';
+  refresh();
+}
+async function refresh() {
+  const installs = await api('installs');
+  document.getElementById('installs').innerHTML =
+    '<table><tr><th>技能</th><th>方式</th><th>目标</th><th>分类</th><th>自动更新</th><th></th></tr>' +
+    installs.map(i => `<tr><td>${i.skill}</td><td>${i.method}</td>
+      <td>${i.target.kind}:${i.target.name||i.target.root}</td>
+      <td><input value="${i.tags.join(',')}" onchange="setTags('${i.skill}','${i.target.kind}','${i.target.name||i.target.root}',this.value)"></td>
+      <td>${i.method==='copy'
+        ? `<select onchange="setAU('${i.skill}','${i.target.kind}','${i.target.name||i.target.root}',this.value)">
+            <option value="" ${i.auto_update===null?'selected':''}>跟随包级</option>
+            <option value="true" ${i.auto_update===true?'selected':''}>开</option>
+            <option value="false" ${i.auto_update===false?'selected':''}>关</option></select>`
+        : '跟随包级'}</td>
+      <td><button onclick="rm('${i.skill}','${i.target.kind}','${i.target.name||i.target.root}')">删除</button></td></tr>`).join('') + '</table>';
+  const sources = await api('sources');
+  document.getElementById('sources').innerHTML =
+    '<table><tr><th>仓库</th><th>commit</th><th>自动更新</th></tr>' +
+    Object.entries(sources).map(([k,s]) => `<tr><td>${k}</td><td>${s.commit.slice(0,7)}</td>
+      <td><input type="checkbox" ${s.auto_update?'checked':''} onchange="setSourceAU('${k}',this.checked)"></td></tr>`).join('') + '</table>';
+}
+function targetBody(kind, ref) { return kind==='global' ? {kind:'global',name:ref} : {kind:'project',root:ref}; }
+async function setAU(skill, kind, ref, v) {
+  await api('auto-update', {method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({skill, target: targetBody(kind, ref), value: v===''?null:v==='true'})});
+}
+async function setSourceAU(key, v) {
+  await api('auto-update', {method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({source: key, value: v})});
+}
+async function setTags(skill, kind, ref, v) {
+  await api('tags', {method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({skill, target: targetBody(kind, ref), tags: v.split(',').map(s=>s.trim()).filter(Boolean)})});
+}
+async function rm(skill, kind, ref) {
+  if (!confirm(`删除 ${skill}？`)) return;
+  await api('remove', {method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({skill, target: targetBody(kind, ref)})});
+  refresh();
+}
+async function runUpdate() {
+  const r = await api('update', {method:'POST'});
+  alert(r.done.join('\n') || '无更新');
+  refresh();
+}
+refresh();
+</script>
+</body>
+</html>
