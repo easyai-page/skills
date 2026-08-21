@@ -78,7 +78,9 @@ pub fn draw(f: &mut Frame, app: &AppState) {
                 .map(|(k, s)| {
                     format!(
                         "{k}\t{}\tauto_update={:?}\n",
-                        &s.commit[..7.min(s.commit.len())],
+                        // chars().take(7)：按字符截断，避免多字节 UTF-8
+                        // 在字节边界切片导致 panic。
+                        s.commit.chars().take(7).collect::<String>(),
                         s.auto_update
                     )
                 })

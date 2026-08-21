@@ -26,7 +26,12 @@ struct TermGuard {
 impl TermGuard {
     fn enter() -> Result<TermGuard> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+        // 半路失败（raw mode 已成但 Alternate Screen 失败）时恢复 raw mode，
+        // 避免把用户终端留在 raw 状态。
+        if let Err(e) = crossterm::execute!(std::io::stdout(), EnterAlternateScreen) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(e.into());
+        }
         Ok(TermGuard { active: true })
     }
 
@@ -65,6 +70,8 @@ pub fn run(layout: &Layout, cfg: &Config) -> Result<()> {
     let res = event_loop(&mut term, &mut guard, layout, cfg, &mut app);
     // 正常/错误路径都先显式恢复终端（panic 路径由 Drop 兜底），再传播结果。
     guard.suspend();
+    // 错误路径（res? 提前返回）有意跳过退出落盘：此时事件循环已异常，
+    // 内存 registry 状态可信度低，保留磁盘上最后一次一致快照更安全。
     res?;
     app.registry.save(layout)?; // 退出时落盘（auto_update 切换等）
     Ok(())
@@ -159,7 +166,10 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
     let target = targets[ti].1.clone();
     let method = cfg.default_method;
 
-    let mut reg = Registry::load(layout)?;
+    // 直接操作 TUI 内存中的 registry：用户在 TUI 内按 a 的 auto_update
+    // 切换只存在于 app.registry，若从磁盘 load 全新副本再覆盖回去，
+    // 未落盘的切换会被静默丢失。
+    let reg = &mut app.registry;
     reg.sources
         .entry(spec.key.clone())
         .or_insert(crate::core::registry::SourceRecord {
@@ -173,7 +183,7 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
         match install::install_skill(
             layout,
             cfg,
-            &mut reg,
+            reg,
             &spec.key,
             &entry.name,
             &entry.rel_path.to_string_lossy(),
@@ -189,11 +199,11 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
                     .map_err(|e| Error::Msg(e.to_string()))?;
                 if overwrite {
                     let rec = install::to_rec(&target);
-                    let _ = remove::remove_install(layout, cfg, &mut reg, &entry.name, &rec);
+                    let _ = remove::remove_install(layout, cfg, reg, &entry.name, &rec);
                     install::install_skill(
                         layout,
                         cfg,
-                        &mut reg,
+                        reg,
                         &spec.key,
                         &entry.name,
                         &entry.rel_path.to_string_lossy(),
@@ -210,6 +220,45 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
         }
     }
     reg.save(layout)?;
-    app.registry = Registry::load(layout)?; // 刷新 TUI 数据
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::registry::{Install, Method, TargetRec};
+
+    /// 回归：install_wizard 直接操作 app.registry 并 save，
+    /// TUI 内按 a 的 auto_update 切换（仅内存状态）不得被磁盘副本覆盖丢失。
+    #[test]
+    fn wizard_save_path_preserves_in_memory_auto_update_toggle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::at(tmp.path().to_path_buf());
+        let mut reg = Registry {
+            version: 1,
+            ..Default::default()
+        };
+        reg.installs.push(Install {
+            skill: "s0".into(),
+            source: "github/o/r".into(),
+            source_path: "skills/s0".into(),
+            target: TargetRec::Global {
+                name: "agents".into(),
+            },
+            method: Method::Copy,
+            commit: "c1".into(),
+            tags: vec![],
+            auto_update: None,
+            installed_at: "t".into(),
+        });
+        let mut app = AppState::new(reg);
+        app.reduce(Action::ToggleAutoUpdate); // 只改内存，未落盘
+        assert_eq!(app.registry.installs[0].auto_update, Some(true));
+
+        // 向导路径：直接 save 内存 registry（不再从磁盘 load 覆盖）。
+        app.registry.save(&layout).unwrap();
+        let reloaded = Registry::load(&layout).unwrap();
+        assert_eq!(reloaded.installs[0].auto_update, Some(true));
+        assert_eq!(reloaded.installs[0].skill, "s0");
+    }
 }
