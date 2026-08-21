@@ -1,0 +1,122 @@
+use clap::{Parser, Subcommand, ValueEnum};
+
+pub mod commands;
+
+#[derive(Parser)]
+#[command(name = "skills", about = "技能包管理器：下载、安装、分类、更新")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub cmd: Option<Cmd>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum MethodArg {
+    Symlink,
+    Copy,
+}
+
+#[derive(Subcommand)]
+pub enum Cmd {
+    /// 下载并安装技能（source 已缓存则复用）
+    Add {
+        source: String,
+        #[arg(short, long)]
+        skill: Vec<String>,
+        #[arg(short, long)]
+        target: Vec<String>, // global:<name> | project:<abs路径>
+        #[arg(short = 'g', long)]
+        global: bool, // 等价 --target global:agents
+        #[arg(long, value_enum)]
+        method: Option<MethodArg>,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// 列出已安装技能
+    #[command(alias = "ls")]
+    List {
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(short, long)]
+        target: Option<String>,
+        #[arg(short = 'g', long)]
+        global: bool,
+    },
+    /// 删除已安装技能（先查记录再核实磁盘）
+    Remove {
+        skills: Vec<String>,
+        #[arg(short, long)]
+        target: Vec<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// 按两级策略更新；显式指定技能时强制更新该副本
+    Update {
+        skills: Vec<String>,
+        #[arg(short, long)]
+        target: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// 分类管理（只写 registry.json）
+    Tag {
+        skill: String,
+        tags: Vec<String>,
+        #[arg(short, long)]
+        target: String,
+        #[arg(long)]
+        remove: bool,
+    },
+    /// 升级策略（只写 registry.json）
+    AutoUpdate {
+        skill: Option<String>,
+        #[arg(short, long)]
+        target: Option<String>,
+        #[arg(short, long)]
+        source: Option<String>,
+        #[arg(long)]
+        on: bool,
+        #[arg(long)]
+        off: bool,
+        #[arg(long)]
+        inherit: bool, // 清除副本级覆盖，跟随包级
+    },
+    /// 全局配置（只写 config.toml）
+    Config {
+        #[command(subcommand)]
+        sub: ConfigCmd,
+    },
+    /// 进入 TUI
+    Tui,
+    /// 启动 Web 管理页
+    Ui {
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        no_open: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCmd {
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: String,
+    },
+    Targets {
+        #[command(subcommand)]
+        sub: TargetsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TargetsCmd {
+    Add { name: String, path: String },
+    Remove { name: String },
+}

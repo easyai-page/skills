@@ -45,6 +45,9 @@ pub struct Layout {
 
 impl Layout {
     pub fn new() -> Result<Layout> {
+        if let Ok(p) = std::env::var("SKILLS_HOME") {
+            return Ok(Layout { root: p.into() });
+        }
         let home = dirs::home_dir().ok_or(Error::NoHome)?;
         Ok(Layout {
             root: home.join(".skills"),

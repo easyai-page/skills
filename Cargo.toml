@@ -29,3 +29,4 @@ junction = "1"
 
 [dev-dependencies]
 tempfile = "3"
+assert_cmd = "2"
