@@ -18,12 +18,17 @@ pub struct SkillEntry {
     pub rel_path: PathBuf,
 }
 
-/// 确保 source 已缓存；已存在则复用（不重复下载）。
+/// 确保 source 已缓存。git 源已缓存则复用（不重复下载，交给 update 刷新）；
+/// 本地源没有远端可 pull，update 对它无能为力，唯一刷新手段就是 add 时重新拷贝，
+/// 故每次 add 都重拷本地目录（纯文件拷贝，代价低）。
 pub fn ensure_cached(layout: &Layout, spec: &SourceSpec) -> Result<Cached> {
     let dest = layout.cache_dir(&spec.key);
     let reusable = match (&spec.url, &spec.local_path) {
         (Some(_), None) => remote_cache_commit(&dest),
-        (None, Some(_)) => local_cache_is_nonempty_dir(&dest).then(|| Ok(String::new())),
+        // 源与缓存同体（用户直接 add 缓存目录自身）：重拷会先清缓存，等于删掉
+        // 用户的源目录。此时无需也无法刷新，直接复用。
+        (None, Some(src)) if same_dir(src, &dest) => Some(Ok(String::new())),
+        (None, Some(_)) => None,
         _ => None,
     };
     if let Some(commit) = reusable.transpose()? {
@@ -77,11 +82,12 @@ fn remote_cache_commit(dest: &Path) -> Option<Result<String>> {
     }
 }
 
-fn local_cache_is_nonempty_dir(dest: &Path) -> bool {
-    dest.is_dir()
-        && std::fs::read_dir(dest)
-            .map(|mut entries| entries.next().is_some())
-            .unwrap_or(false)
+/// 两路径是否指向同一目录（canonicalize 比较；任一不存在则视为不同）。
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn remove_cache_path(path: &Path) -> std::io::Result<()> {
@@ -340,9 +346,12 @@ mod tests {
     }
 
     #[test]
-    fn ensure_cached_copies_local_source_once_then_reuses() {
+    fn ensure_cached_recopies_local_source_on_every_call() {
+        // 本地源没有远端可 pull（update 对它无计可施），唯一刷新手段就是 add 时重拷：
+        // 源目录改动后再次 ensure_cached 必须反映新内容，不得复用旧快照。
         let source = tempfile::tempdir().unwrap();
-        std::fs::write(source.path().join("SKILL.md"), "local skill").unwrap();
+        std::fs::write(source.path().join("SKILL.md"), "v1").unwrap();
+        std::fs::write(source.path().join("stale.txt"), "将被删除").unwrap();
         let root = tempfile::tempdir().unwrap();
         let layout = Layout::at(root.path().to_path_buf());
         let spec = SourceSpec {
@@ -352,14 +361,56 @@ mod tests {
         };
 
         let first = ensure_cached(&layout, &spec).unwrap();
-        let second = ensure_cached(&layout, &spec).unwrap();
-
         assert!(first.fresh);
-        assert!(!second.fresh);
-        assert_eq!(first.path, second.path);
         assert_eq!(
             std::fs::read_to_string(first.path.join("SKILL.md")).unwrap(),
-            "local skill"
+            "v1"
+        );
+
+        // 源目录演进：改内容、删旧文件、加新文件
+        std::fs::write(source.path().join("SKILL.md"), "v2").unwrap();
+        std::fs::remove_file(source.path().join("stale.txt")).unwrap();
+        std::fs::write(source.path().join("new.txt"), "新增").unwrap();
+
+        let second = ensure_cached(&layout, &spec).unwrap();
+        assert!(second.fresh, "本地源每次 add 都应重拷，不得复用旧缓存");
+        assert_eq!(first.path, second.path);
+        assert_eq!(
+            std::fs::read_to_string(second.path.join("SKILL.md")).unwrap(),
+            "v2"
+        );
+        assert!(
+            !second.path.join("stale.txt").exists(),
+            "重拷应先清旧缓存，源里已删的文件不得残留"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.path.join("new.txt")).unwrap(),
+            "新增"
+        );
+    }
+
+    #[test]
+    fn ensure_cached_never_deletes_local_source_that_is_the_cache() {
+        // 自保：本地源路径即缓存目录本身（如直接 add ~/.skills/local/<name>）时，
+        // “先清缓存再拷贝”会删掉用户的源目录。此时源与缓存同体，直接复用。
+        let root = tempfile::tempdir().unwrap();
+        let layout = Layout::at(root.path().to_path_buf());
+        let dest = layout.cache_dir("local-test/self");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("SKILL.md"), "self").unwrap();
+        let spec = SourceSpec {
+            key: "local-test/self".into(),
+            url: None,
+            local_path: Some(dest.clone()),
+        };
+
+        let cached = ensure_cached(&layout, &spec).unwrap();
+
+        assert!(!cached.fresh);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "self",
+            "源即缓存时不得清空目录"
         );
     }
 
