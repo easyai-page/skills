@@ -155,7 +155,14 @@ async fn run_update(
     axum::extract::Query(query): axum::extract::Query<UpdateQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let s = s.lock().unwrap();
-    let cfg = crate::core::config::Config::load(&s.layout).unwrap_or_default();
+    // config 损坏时静默回退默认配置会把内置 target 解析到用户真实 home 目录并落盘，
+    // 与下方损坏 registry 一样必须显式 500，由用户修复配置后重试。
+    let cfg = crate::core::config::Config::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 config 失败: {e}"),
+        )
+    })?;
     // registry 损坏或更新执行（git/网络/落盘）失败必须显式 500 + 错误消息，
     // 不能吞错让前端误报“无更新”
     let mut reg = Registry::load(&s.layout).map_err(|e| {
@@ -302,6 +309,32 @@ mod tests {
             .unwrap();
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("加载 registry 失败"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn run_update_returns_500_on_corrupted_config() {
+        let state = test_state();
+        // 人为写坏 config.toml：若静默回退默认配置，内置 target 会解析到用户真实
+        // home 目录并在 update 中对其落盘。必须与损坏 registry 一样显式 500。
+        std::fs::create_dir_all(&state.layout.root).unwrap();
+        std::fs::write(state.layout.config_path(), "[web]\nport = 99999\n").unwrap();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/update")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("加载 config 失败"), "{text}");
     }
 
     #[tokio::test]
