@@ -9,9 +9,9 @@ use super::registry::{Install, Method, Registry, TargetRec};
 
 static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// copy 副本内的所有权标识文件名。与计划任务 15 的 `.skills-manifest` 约定同名：
-/// 任务 15 会扩展该文件写入文件名+sha256 清单；remove 只依赖其存在性确认副本归属。
-pub(crate) const COPY_MANIFEST: &str = ".skills-manifest";
+/// copy 副本内的所有权标识文件名（定义在 manifest 模块；此处再导出保持既有引用路径）。
+/// remove 只依赖其存在性确认副本归属；manifest 模块负责 files 基线的写入与校验。
+pub(crate) use super::manifest::COPY_MANIFEST;
 
 /// 把技能从缓存安装到一个目标；目标已有同名目录时返回 Error::Conflict 交由前端决策。
 // 参数即安装一次副本的全部上下文（布局/配置/记录/来源/目标/方法/版本），
@@ -132,11 +132,11 @@ fn copy_install(src: &Path, dest_root: &Path, dest: &Path) -> Result<()> {
     result
 }
 
-/// 把 src 复制到 dest_root 下的暂存目录并写入所有权标识，返回暂存路径；失败清理暂存。
+/// 把 src 复制到 dest_root 下的暂存目录并写入带 sha256 基线的 manifest，返回暂存路径；失败清理暂存。
 /// install 与 update 共用同一份 staging+manifest 流程，避免两套复制逻辑漂移。
 pub(crate) fn stage_copy(src: &Path, dest_root: &Path, name: &std::ffi::OsStr) -> Result<PathBuf> {
     let stage = create_staging_dir(dest_root, name)?;
-    let staged = copy_dir(src, &stage).and_then(|()| write_copy_manifest(&stage));
+    let staged = copy_dir(src, &stage).and_then(|()| super::manifest::write_copy_manifest(&stage));
     if let Err(err) = staged {
         let _ = remove_install_path(&stage);
         return Err(err);
@@ -257,16 +257,6 @@ fn unique_backup_path(dest_root: &Path, skill: &std::ffi::OsStr) -> Result<PathB
             Err(err) => return Err(Error::Io(err)),
         }
     }
-}
-
-/// 在暂存副本内写入所有权标识，随 rename 原子生效。
-fn write_copy_manifest(stage: &Path) -> Result<()> {
-    let body = serde_json::json!({ "version": 1, "manager": "skills" });
-    std::fs::write(
-        stage.join(COPY_MANIFEST),
-        serde_json::to_string_pretty(&body)?,
-    )?;
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -852,6 +842,46 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(marker).unwrap()).unwrap();
         assert_eq!(body["version"], 1);
+    }
+
+    #[test]
+    fn copy_install_manifest_records_sha256_baseline() {
+        use sha2::Digest;
+        let (_t, layout, cfg, mut reg) = setup();
+        // 加一层嵌套目录，锁定相对路径的正斜杠约定（Windows 上也必须是 "docs/deep.md"）
+        let cache = layout.cache_dir("github/o/r");
+        std::fs::create_dir_all(cache.join("skills/alpha/docs")).unwrap();
+        std::fs::write(cache.join("skills/alpha/docs/deep.md"), "deep\n").unwrap();
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &Target::Global {
+                name: "agents".into(),
+            },
+            Method::Copy,
+            "c1",
+        )
+        .unwrap();
+        let marker = cfg.targets["agents"].join("alpha").join(COPY_MANIFEST);
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(marker).unwrap()).unwrap();
+        assert_eq!(body["version"], 1);
+        assert_eq!(body["manager"], "skills");
+        let files = body["files"]
+            .as_object()
+            .expect("manifest 必须带 files 基线");
+        let sha = |bytes: &[u8]| format!("{:x}", sha2::Sha256::digest(bytes));
+        assert_eq!(
+            files["SKILL.md"],
+            serde_json::json!(sha(b"---\nname: alpha\ndescription: A\n---\n"))
+        );
+        assert_eq!(files["docs/deep.md"], serde_json::json!(sha(b"deep\n")));
+        // manifest 自身不入清单
+        assert!(!files.contains_key(COPY_MANIFEST));
     }
 
     #[cfg(unix)]

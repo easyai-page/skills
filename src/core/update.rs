@@ -98,14 +98,20 @@ pub fn build_plan(reg: &Registry, selection: Option<&Selection>) -> Plan {
 }
 
 /// 执行计划（非 dry-run）：pull 仓库 → copy 副本原子替换 → 更新 registry commit 字段。
+/// force=false 时先做本地修改预扫描：任何 copy 副本偏离 manifest 基线即整体 Mismatch 中止
+/// （不产生任何变更），前端展示明细确认后以 force=true 重试。
 pub fn execute_plan(
     layout: &super::paths::Layout,
     cfg: &super::config::Config,
     reg: &mut Registry,
     plan: &Plan,
+    force: bool,
 ) -> Result<Vec<String>> {
     if let Some(missing) = &plan.missing {
         return Err(Error::NotInstalled(missing.clone()));
+    }
+    if !force {
+        pre_scan_local_modifications(cfg, reg, plan)?;
     }
     let mut done = Vec::new();
     for key in &plan.sources {
@@ -130,10 +136,7 @@ pub fn execute_plan(
             .clone();
         // 与 remove 相同的前置防线：记录校验 + 副本归属核验；无法确认归属则不删不更新。
         super::remove::validate_record(&rec)?;
-        let target = match &d.target {
-            TargetRec::Global { name } => super::paths::Target::Global { name: name.clone() },
-            TargetRec::Project { root } => super::paths::Target::Project { root: root.clone() },
-        };
+        let target = to_target(&d.target);
         let dest_root = target.install_dir(cfg)?;
         let dest = dest_root.join(&d.skill);
         match std::fs::symlink_metadata(&dest) {
@@ -181,6 +184,53 @@ pub fn execute_plan(
     }
     reg.save(layout)?;
     Ok(done)
+}
+
+fn to_target(rec: &TargetRec) -> super::paths::Target {
+    match rec {
+        TargetRec::Global { name } => super::paths::Target::Global { name: name.clone() },
+        TargetRec::Project { root } => super::paths::Target::Project { root: root.clone() },
+    }
+}
+
+/// 本地修改预扫描（force=false 时、任何 pull/替换之前执行）：汇总所有将更新的 copy 副本
+/// 相对 manifest 基线的分歧，一次性报 Mismatch，避免“更新到一半才发现改动”的部分变更。
+/// 记录缺失、副本被手动删除、副本被替换成链接等归属类问题不在此展开，交由主循环按原语义报错。
+fn pre_scan_local_modifications(
+    cfg: &super::config::Config,
+    reg: &Registry,
+    plan: &Plan,
+) -> Result<()> {
+    let mut report: Vec<String> = Vec::new();
+    for d in plan.copies.iter().filter(|c| c.update) {
+        let Some(rec) = reg.find(&d.skill, &d.target) else {
+            continue; // 记录缺失：主循环报 NotInstalled
+        };
+        let dest = to_target(&d.target).install_dir(cfg)?.join(&rec.skill);
+        let meta = match std::fs::symlink_metadata(&dest) {
+            Ok(meta) => meta,
+            // 副本已被手动删除：无可保护的内容，主循环走 staging 直接重建
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(Error::Io(err)),
+        };
+        // 被替换成链接/文件：归属核验问题（force 也无法跳过），不混入可确认的修改清单
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let lines = super::manifest::detect_local_modifications(&dest)?;
+        if !lines.is_empty() {
+            report.push(format!("{} @ {:?}:", d.skill, d.target));
+            report.extend(lines.into_iter().map(|line| format!("  - {line}")));
+        }
+    }
+    if report.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Mismatch(format!(
+        "以下 copy 副本存在本地修改，更新将覆盖并丢失这些改动：\n{}\n\
+         确认覆盖请强制重试（CLI 加 --force，Web 端在确认框同意后自动重试）",
+        report.join("\n")
+    )))
 }
 
 #[cfg(test)]
@@ -438,7 +488,7 @@ mod tests {
         .unwrap();
         reg.sources.get_mut("github/o/r").unwrap().commit = "c2".into();
 
-        let done = execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha()).unwrap();
+        let done = execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), false).unwrap();
 
         assert!(done.iter().any(|line| line.contains("副本 alpha")));
         assert!(
@@ -477,7 +527,8 @@ mod tests {
         let dest = cfg.targets["agents"].join("alpha");
         std::fs::remove_file(dest.join(COPY_MANIFEST)).unwrap();
 
-        let err = execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha()).unwrap_err();
+        let err =
+            execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), false).unwrap_err();
 
         assert!(matches!(err, Error::Mismatch(_)));
         // 不删不更新：原目录内容与记录保持原状
@@ -497,7 +548,8 @@ mod tests {
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(dest.join("user-file"), "mine").unwrap();
 
-        let err = execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha()).unwrap_err();
+        let err =
+            execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), false).unwrap_err();
 
         assert!(matches!(err, Error::Mismatch(_)));
         assert_eq!(
@@ -522,7 +574,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = execute_plan(&layout, &cfg, &mut reg, &plan).unwrap_err();
+        let err = execute_plan(&layout, &cfg, &mut reg, &plan, false).unwrap_err();
         assert!(matches!(err, Error::NotInstalled(_)));
         assert!(cfg.targets["agents"].join("alpha").exists());
     }
@@ -539,7 +591,7 @@ mod tests {
         let plan = build_plan(&reg, Some(&sel));
         assert!(plan.missing.is_some());
         assert!(plan.sources.is_empty() && plan.copies.is_empty() && plan.symlinks.is_empty());
-        let err = execute_plan(&layout, &cfg, &mut reg, &plan).unwrap_err();
+        let err = execute_plan(&layout, &cfg, &mut reg, &plan, false).unwrap_err();
         assert!(matches!(err, Error::NotInstalled(_)));
     }
 
@@ -550,7 +602,7 @@ mod tests {
             sources: vec!["github/o/r".into()],
             ..Default::default()
         };
-        let err = execute_plan(&layout, &cfg, &mut reg, &plan).unwrap_err();
+        let err = execute_plan(&layout, &cfg, &mut reg, &plan, false).unwrap_err();
         assert!(matches!(err, Error::Msg(_)));
         assert!(format!("{err}").contains("本地源"), "{err}");
     }
@@ -587,7 +639,7 @@ mod tests {
             };
             let plan = build_plan(&reg, Some(&sel)); // auto_update 全为 None，显式强制
             assert!(plan.missing.is_none());
-            execute_plan(&layout, &cfg, &mut reg, &plan).unwrap();
+            execute_plan(&layout, &cfg, &mut reg, &plan, false).unwrap();
 
             let src_commit = reg.sources["github/o/r"].commit.clone();
             assert_ne!(src_commit, c1, "{method:?}: fetch 应推进 commit");
@@ -615,7 +667,7 @@ mod tests {
         let plan = build_plan(&reg, None);
         assert_eq!(plan.sources, vec!["github/o/r".to_string()]);
 
-        let done = execute_plan(&layout, &cfg, &mut reg, &plan).unwrap();
+        let done = execute_plan(&layout, &cfg, &mut reg, &plan, false).unwrap();
 
         // fetch 无变化：记录 commit 与 fetched_at 不抖动，也没有“仓库 →”条目
         let src = &reg.sources["github/o/r"];
@@ -631,5 +683,152 @@ mod tests {
                 .unwrap()
                 .contains("v1")
         );
+    }
+
+    /// 把假缓存的源文件推进到 v2，并把 source 记录标为 c2（不经 git，直改缓存目录）。
+    fn advance_cache_to_v2(layout: &Layout, reg: &mut Registry) {
+        std::fs::write(
+            layout.cache_dir("github/o/r").join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: A\n---\nv2\n",
+        )
+        .unwrap();
+        reg.sources.get_mut("github/o/r").unwrap().commit = "c2".into();
+    }
+
+    #[test]
+    fn local_modification_blocks_update_without_force() {
+        let (_t, layout, cfg, mut reg) = setup_installed(Method::Copy);
+        advance_cache_to_v2(&layout, &mut reg);
+        let dest = cfg.targets["agents"].join("alpha");
+        std::fs::write(dest.join("SKILL.md"), "用户本地修改\n").unwrap();
+
+        let err =
+            execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), false).unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(matches!(err, Error::Mismatch(_)), "{err}");
+        assert!(msg.contains("SKILL.md"), "{msg}");
+        // 未发生任何变更：副本保留用户内容，commit 不推进
+        assert_eq!(
+            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "用户本地修改\n"
+        );
+        assert_eq!(reg.installs[0].commit, "c1");
+    }
+
+    #[test]
+    fn force_update_overwrites_local_modification_and_rewrites_manifest() {
+        use sha2::Digest;
+        let (_t, layout, cfg, mut reg) = setup_installed(Method::Copy);
+        advance_cache_to_v2(&layout, &mut reg);
+        let dest = cfg.targets["agents"].join("alpha");
+        std::fs::write(dest.join("SKILL.md"), "用户本地修改\n").unwrap();
+
+        let done = execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), true).unwrap();
+
+        assert!(done.iter().any(|line| line.contains("副本 alpha")));
+        let content = std::fs::read_to_string(dest.join("SKILL.md")).unwrap();
+        assert!(content.contains("v2"), "{content}");
+        assert_eq!(reg.installs[0].commit, "c2");
+        // manifest 基线被重写为新内容哈希
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dest.join(COPY_MANIFEST)).unwrap())
+                .unwrap();
+        let expected = format!(
+            "{:x}",
+            sha2::Sha256::digest("---\nname: alpha\ndescription: A\n---\nv2\n".as_bytes())
+        );
+        assert_eq!(manifest["files"]["SKILL.md"], serde_json::json!(expected));
+        // 基线刷新后，再跑非 force 更新不得误报本地修改
+        execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), false).unwrap();
+    }
+
+    #[test]
+    fn extra_untracked_file_blocks_update_without_force() {
+        let (_t, layout, cfg, mut reg) = setup_installed(Method::Copy);
+        advance_cache_to_v2(&layout, &mut reg);
+        let dest = cfg.targets["agents"].join("alpha");
+        std::fs::write(dest.join("my-notes.txt"), "私人笔记\n").unwrap();
+
+        let err =
+            execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), false).unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(matches!(err, Error::Mismatch(_)), "{err}");
+        assert!(msg.contains("my-notes.txt"), "{msg}");
+        // 未被触碰：新增文件与记录原样保留
+        assert_eq!(
+            std::fs::read_to_string(dest.join("my-notes.txt")).unwrap(),
+            "私人笔记\n"
+        );
+        assert_eq!(reg.installs[0].commit, "c1");
+    }
+
+    #[test]
+    fn missing_tracked_file_blocks_update_without_force() {
+        let (_t, layout, cfg, mut reg) = setup_installed(Method::Copy);
+        advance_cache_to_v2(&layout, &mut reg);
+        let dest = cfg.targets["agents"].join("alpha");
+        std::fs::remove_file(dest.join("SKILL.md")).unwrap();
+
+        let err =
+            execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), false).unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(matches!(err, Error::Mismatch(_)), "{err}");
+        assert!(msg.contains("SKILL.md"), "{msg}");
+        assert_eq!(reg.installs[0].commit, "c1");
+    }
+
+    #[test]
+    fn legacy_manifest_without_files_blocks_then_force_repairs_baseline() {
+        let (_t, layout, cfg, mut reg) = setup_installed(Method::Copy);
+        advance_cache_to_v2(&layout, &mut reg);
+        let dest = cfg.targets["agents"].join("alpha");
+        // 任务 15 之前的副本：manifest 只有归属标识，没有 files 基线
+        std::fs::write(
+            dest.join(COPY_MANIFEST),
+            "{\n  \"version\": 1,\n  \"manager\": \"skills\"\n}",
+        )
+        .unwrap();
+
+        let err =
+            execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), false).unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(matches!(err, Error::Mismatch(_)), "{err}");
+        assert!(msg.contains("无校验基线"), "{msg}");
+        assert_eq!(reg.installs[0].commit, "c1");
+
+        // 确认后 force 更新成功，并写入带 files 的新基线（永久修复）
+        execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), true).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dest.join(COPY_MANIFEST)).unwrap())
+                .unwrap();
+        assert!(manifest["files"].is_object(), "{manifest}");
+        assert!(
+            std::fs::read_to_string(dest.join("SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+        // 修复后再跑非 force：不再误报
+        execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), false).unwrap();
+    }
+
+    #[test]
+    fn clean_copy_updates_without_force() {
+        // 无本地修改的副本：force=false 也不得误报（无假阳性）
+        let (_t, layout, cfg, mut reg) = setup_installed(Method::Copy);
+        advance_cache_to_v2(&layout, &mut reg);
+        let dest = cfg.targets["agents"].join("alpha");
+
+        execute_plan(&layout, &cfg, &mut reg, &update_plan_for_alpha(), false).unwrap();
+
+        assert!(
+            std::fs::read_to_string(dest.join("SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+        assert_eq!(reg.installs[0].commit, "c2");
     }
 }

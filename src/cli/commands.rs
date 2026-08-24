@@ -217,6 +217,7 @@ pub fn run(cli: Cli) -> Result<()> {
             target,
             all,
             dry_run,
+            force,
         }) => {
             let mut reg = Registry::load(&layout)?;
             // 参数配对校验：显式技能必须搭配 --target；--all 是显式全量更新，与二者互斥。
@@ -276,7 +277,29 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
                 return Ok(());
             }
-            let done = update::execute_plan(&layout, &cfg, &mut reg, &plan)?;
+            let done = match update::execute_plan(&layout, &cfg, &mut reg, &plan, force) {
+                Ok(done) => done,
+                // 副本有本地修改：展示明细并确认后才以 force 重跑；放弃则不产生任何变更。
+                // （归属核验类的 Mismatch 即使确认后重跑也会再次报错，错误信息会如实呈现原因）
+                Err(Error::Mismatch(msg)) if !force => {
+                    println!("{msg}");
+                    let confirmed = dialoguer::Confirm::new()
+                        .with_prompt("将覆盖上述本地修改，继续？")
+                        .default(false)
+                        .interact()
+                        .map_err(|e| {
+                            Error::Msg(format!(
+                                "确认交互失败（{e}）；非交互环境请改用 skills update --force 明确覆盖"
+                            ))
+                        })?;
+                    if !confirmed {
+                        println!("已取消，未做任何修改");
+                        return Ok(());
+                    }
+                    update::execute_plan(&layout, &cfg, &mut reg, &plan, true)?
+                }
+                Err(err) => return Err(err),
+            };
             for line in done {
                 println!("{line}");
             }

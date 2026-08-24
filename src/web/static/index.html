@@ -26,8 +26,10 @@ nav button { margin-right: 8px; }
 async function api(path, opts) {
   const r = await fetch('/api/' + path, opts);
   if (!r.ok) {
-    // 服务端错误以纯文本 body 返回，带给调用方展示
-    throw new Error((await r.text()) || ('HTTP ' + r.status));
+    // 服务端错误以纯文本 body 返回，带给调用方展示；status 一并挂出供按码分支（如 409 确认链）
+    const err = new Error((await r.text()) || ('HTTP ' + r.status));
+    err.status = r.status;
+    throw err;
   }
   return (r.headers.get('content-type')||'').includes('json') ? r.json() : null;
 }
@@ -133,6 +135,18 @@ async function runUpdate() {
     alert(r.done.join('\n') || '无更新');
     refresh();
   } catch (e) {
+    // 409 = 副本存在本地修改：明细确认后以 ?force=true 重试一次；用户取消则不做任何变更
+    if (e.status === 409) {
+      if (!confirm(e.message + '\n\n将覆盖上述本地修改，继续？')) return;
+      try {
+        const r = await api('update?force=true', {method:'POST'});
+        alert(r.done.join('\n') || '无更新');
+        refresh();
+      } catch (e2) {
+        alert('更新失败: ' + e2.message);
+      }
+      return;
+    }
     alert('更新失败: ' + e.message);
   }
 }

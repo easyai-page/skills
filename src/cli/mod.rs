@@ -58,6 +58,9 @@ pub enum Cmd {
         all: bool,
         #[arg(long)]
         dry_run: bool,
+        /// 覆盖 copy 副本的本地修改，跳过确认提示
+        #[arg(long)]
+        force: bool,
     },
     /// 分类管理（只写 registry.json）
     Tag {

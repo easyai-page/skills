@@ -145,7 +145,15 @@ async fn remove_install(State(s): S, Json(req): Json<RemoveReq>) -> StatusCode {
     }
 }
 
-async fn run_update(State(s): S) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+#[derive(serde::Deserialize)]
+struct UpdateQuery {
+    force: Option<bool>,
+}
+
+async fn run_update(
+    State(s): S,
+    axum::extract::Query(query): axum::extract::Query<UpdateQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let s = s.lock().unwrap();
     let cfg = crate::core::config::Config::load(&s.layout).unwrap_or_default();
     // registry 损坏或更新执行（git/网络/落盘）失败必须显式 500 + 错误消息，
@@ -157,13 +165,17 @@ async fn run_update(State(s): S) -> Result<Json<serde_json::Value>, (StatusCode,
         )
     })?;
     let plan = crate::core::update::build_plan(&reg, None);
-    let done =
-        crate::core::update::execute_plan(&s.layout, &cfg, &mut reg, &plan).map_err(|e| {
-            (
+    let force = query.force.unwrap_or(false);
+    let done = crate::core::update::execute_plan(&s.layout, &cfg, &mut reg, &plan, force).map_err(
+        |e| match e {
+            // 副本本地修改：409（用户可决策的冲突），前端确认后带 ?force=true 重试
+            crate::core::error::Error::Mismatch(msg) => (StatusCode::CONFLICT, msg),
+            e => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("执行更新失败: {e}"),
-            )
-        })?;
+            ),
+        },
+    )?;
     Ok(Json(serde_json::json!({ "done": done })))
 }
 
@@ -312,5 +324,143 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["done"], serde_json::json!([]));
+    }
+
+    /// 本地修改的 copy 副本：无 force 返回 409 + 明细；带 ?force=true 则覆盖更新。
+    /// 需要真 git 远端（更新走 fetch 路径），与 update.rs 集成测试同型。
+    #[tokio::test]
+    async fn run_update_409_on_local_modification_then_force_succeeds() {
+        let tmp = Arc::new(tempfile::tempdir().unwrap());
+        let work = tmp.path().join("work");
+        let bare = tmp.path().join("bare.git");
+        std::fs::create_dir_all(work.join("skills/alpha")).unwrap();
+        std::fs::write(
+            work.join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: A\n---\nv1\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} 失败");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "c1",
+        ]);
+        git(&["clone", "--bare", ".", bare.to_str().unwrap()]);
+
+        let layout = Layout::at(tmp.path().join(".skills"));
+        // agents target 必须指到临时目录：默认配置指向真实 home，测试绝不能落盘到那里
+        std::fs::create_dir_all(&layout.root).unwrap();
+        std::fs::write(
+            layout.config_path(),
+            format!("[targets]\nagents = {:?}\n", tmp.path().join("agents")),
+        )
+        .unwrap();
+        let cache = layout.cache_dir("github/o/r");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        let url = format!("file://{}", bare.display());
+        let c1 = crate::core::git::shallow_clone(&url, &cache).unwrap();
+
+        let cfg = crate::core::config::Config::load(&layout).unwrap();
+        let mut reg = Registry {
+            version: 1,
+            ..Default::default()
+        };
+        reg.sources.insert(
+            "github/o/r".into(),
+            crate::core::registry::SourceRecord {
+                url: url.clone(),
+                commit: c1.clone(),
+                fetched_at: "2026-08-20T00:00:00Z".into(),
+                auto_update: Some(true),
+            },
+        );
+        crate::core::install::install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &crate::core::paths::Target::Global {
+                name: "agents".into(),
+            },
+            Method::Copy,
+            &c1,
+        )
+        .unwrap();
+        reg.installs[0].auto_update = Some(true);
+        reg.save(&layout).unwrap();
+
+        // 远端推进到 v2
+        std::fs::write(
+            work.join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: A\n---\nv2\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "c2",
+        ]);
+        git(&["push", bare.to_str().unwrap(), "main"]);
+        // 用户在副本里改了文件
+        let dest = tmp.path().join("agents/alpha");
+        std::fs::write(dest.join("SKILL.md"), "用户本地修改\n").unwrap();
+
+        let post = |uri: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let app = router(AppState {
+            layout: Layout::at(tmp.path().join(".skills")),
+            tmp: tmp.clone(),
+        });
+        // 无 force：409 + 可读明细
+        let resp = app.clone().oneshot(post("/api/update")).await.unwrap();
+        assert_eq!(resp.status(), 409);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("SKILL.md"), "{text}");
+        // 409 不得造成任何变更
+        assert_eq!(
+            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "用户本地修改\n"
+        );
+        // force：覆盖更新成功
+        let resp = app.oneshot(post("/api/update?force=true")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["done"].as_array().unwrap().len() >= 2, "{v}");
+        assert!(
+            std::fs::read_to_string(dest.join("SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
     }
 }
