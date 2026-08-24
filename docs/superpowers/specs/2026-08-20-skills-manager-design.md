@@ -102,15 +102,19 @@ registry 写入用临时文件 + rename 原子替换，避免中途失败写脏�
 
 ### TUI（ratatui）
 
-三个主视图 Tab 切换：
+三个主视图 Tab 切换。v0.1 范围：浏览/导航、已安装副本的 auto_update 三态切换（开/关/跟随包级）、安装向导（单目标、默认 method；向导从 TUI 临时切出，由 dialoguer 承载）。
 
-1. **已安装**：表格列出 技能 / 来源 / 目标 / 方式 / 版本 / 分类 / auto_update，支持按 tag、目标筛选；选中后可 remove、切换 auto_update、改 tag、update。
-2. **安装向导**：输入 source → 拉取/复用缓存 → 多选技能 → 多选目标 → 选方式 → 摘要确认 → 执行。
-3. **仓库缓存**：sources 列表、包级 auto_update 开关、检查更新、清理无引用的缓存。
+1. **已安装**：表格列出 技能 / 方式 / 目标 / 分类 / auto_update，选中后可切换 auto_update。
+2. **安装向导**：输入 source → 拉取/复用缓存 → 多选技能 → 单选目标（配置的 global targets + 当前项目）→ 按配置默认 method 执行。
+3. **仓库缓存**：sources 列表（commit 前缀 + 包级 auto_update 展示，只读）。
+
+后续候选：已安装视图的 remove/tag/update 快捷键、按 tag/目标筛选、向导多选目标与 method 选择、sources 检查更新与无引用缓存清理。
 
 ### Web UI（axum + 内嵌静态前端）
 
-REST API + 单页前端，功能与 TUI 对等（浏览/筛选/安装向导/删除/更新/分类/升级策略/配置管理）。前端资源嵌入二进制，无外部依赖。install 列表每行 auto_update 三态开关（开/关/跟随包级）；sources 页面包级开关；「偏好设置」对应 config.toml，「升级策略」对应 registry.json。
+REST API + 单页前端，前端资源嵌入二进制，无外部依赖。v0.1 范围：已安装列表（分类编辑、每行 auto_update 三态开关（开/关/跟随包级）、删除）、仓库缓存包级 auto_update 开关、执行更新（copy 副本有本地修改时返回 409 明细，确认后强制重试）。无安装向导、无配置管理；「偏好设置」（config.toml）与「升级策略」（registry.json）暂由 CLI 的 `config` / `auto-update` 命令承担。
+
+后续候选：Web 安装向导、配置管理页。
 
 ## 关键流程
 

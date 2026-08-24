@@ -3029,8 +3029,8 @@ git add -A && git commit -m "test: e2e 集成测试 + 三平台 CI"
 - 安装记录、删除时核实磁盘实况 → 任务 3 + 任务 8 ✓
 - 分类管理 → 任务 10 ✓
 - CLI 全量子命令 + 参数指定 method/port → 任务 11 ✓
-- TUI → 任务 12 ✓
-- Web 完整管理界面 → 任务 13 ✓
+- TUI → 任务 12 ✓（v0.1 范围：三视图浏览/导航、auto_update 三态切换、安装向导（单目标、默认 method，dialoguer 承载）。后续候选：remove/tag/update 快捷键、tag 筛选、向导多选目标与 method 选择、sources 检查更新与缓存清理）
+- Web 管理界面 → 任务 13 ✓（v0.1 范围：已安装列表（分类编辑/三态 auto_update/删除）、仓库缓存包级开关、更新执行（含本地修改 409 确认链）。无安装向导、无配置管理。后续候选：Web 安装向导、配置管理页）
 - config.toml 可选、内置默认值、config/auto-update 命令分离 → 任务 4 + 任务 11 ✓
 - 跨平台（gitoxide、junction 兜底、三平台 CI）→ 任务 5 + 任务 7 + 任务 14 ✓
 - copy 副本被手动改过的 update 提示 → 任务 9 execute_plan 目前直接覆盖。**偏差**：规格要求覆盖前提示。任务 14 之后追加小任务处理（见下）。

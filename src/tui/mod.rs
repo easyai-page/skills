@@ -110,7 +110,6 @@ fn event_loop(
                 KeyCode::Tab => Action::NextView,
                 KeyCode::BackTab => Action::PrevView,
                 KeyCode::Char('a') => Action::ToggleAutoUpdate,
-                KeyCode::Enter => Action::Select,
                 _ => continue,
             };
             if action == Action::Quit {

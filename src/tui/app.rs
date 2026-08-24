@@ -16,7 +16,6 @@ pub enum Action {
     NextView,
     PrevView,
     ToggleAutoUpdate,
-    Select,
     Quit,
 }
 
@@ -24,7 +23,6 @@ pub struct AppState {
     pub registry: Registry,
     pub view: View,
     pub selected: usize,
-    pub tag_filter: Option<String>,
 }
 
 impl AppState {
@@ -33,21 +31,11 @@ impl AppState {
             registry,
             view: View::Installed,
             selected: 0,
-            tag_filter: None,
         }
     }
 
     pub fn visible_rows(&self) -> Vec<&Install> {
-        self.registry
-            .installs
-            .iter()
-            .filter(|i| {
-                self.tag_filter
-                    .as_ref()
-                    .map(|t| i.tags.contains(t))
-                    .unwrap_or(true)
-            })
-            .collect()
+        self.registry.installs.iter().collect()
     }
 
     pub fn reduce(&mut self, action: Action) {
@@ -98,7 +86,7 @@ impl AppState {
                     }
                 }
             }
-            Action::Select | Action::Quit => {}
+            Action::Quit => {}
         }
     }
 }
@@ -165,15 +153,5 @@ mod tests {
         assert_eq!(app.view, View::Sources);
         app.reduce(Action::NextView);
         assert_eq!(app.view, View::Installed);
-    }
-
-    #[test]
-    fn filter_by_tag_narrows_rows() {
-        let mut app = app_with(3);
-        app.registry.installs[1].tags = vec!["frontend".into()];
-        app.tag_filter = Some("frontend".into());
-        let rows = app.visible_rows();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].skill, "s1");
     }
 }
