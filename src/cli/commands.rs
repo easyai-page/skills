@@ -112,7 +112,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     .find(|e| &e.name == s)
                     .ok_or_else(|| Error::Msg(format!("仓库中无技能 {s}")))?;
                 for t in &targets {
-                    match install::install_skill(
+                    let installed = match install::install_skill(
                         &layout,
                         &cfg,
                         &mut reg,
@@ -123,10 +123,14 @@ pub fn run(cli: Cli) -> Result<()> {
                         method,
                         &cached.commit,
                     ) {
-                        Ok(_) => println!("已安装 {s} → {t:?} ({method:?})"),
+                        Ok(_) => {
+                            println!("已安装 {s} → {t:?} ({method:?})");
+                            true
+                        }
                         Err(Error::Conflict(p)) => {
                             if yes {
                                 println!("跳过已存在: {p:?}");
+                                false
                             } else {
                                 let overwrite = dialoguer::Confirm::new()
                                     .with_prompt(format!("{p:?} 已存在，覆盖？"))
@@ -147,10 +151,19 @@ pub fn run(cli: Cli) -> Result<()> {
                                         method,
                                         &cached.commit,
                                     )?;
+                                    true
+                                } else {
+                                    false
                                 }
                             }
                         }
                         Err(e) => return Err(e),
+                    };
+                    if installed {
+                        // 逐条落盘（tmp+rename 原子写，代价低）：之后任一技能/目标安装失败
+                        // 或覆盖重装失败而提前返回时，registry 都与磁盘已写入的副本保持一致，
+                        // 不会留下 list/remove 都管不到的孤儿副本。
+                        reg.save(&layout)?;
                     }
                 }
             }

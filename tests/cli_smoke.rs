@@ -210,6 +210,52 @@ fn add_global_flag_uses_first_configured_target_and_bare_add_uses_project() {
     assert!(proj.join(".agents/skills/alpha/SKILL.md").exists());
 }
 
+// ---- 最终审查修复 1：add 中途失败不得留下磁盘/registry 脱节 ----
+
+#[test]
+fn add_partial_failure_keeps_registry_consistent_with_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let agents = tmp.path().join("g/agents");
+    // 把内置 agents target 重定向到隔离目录，避免写真实 HOME
+    ok(
+        &home,
+        &[
+            "config",
+            "targets",
+            "add",
+            "agents",
+            agents.to_str().unwrap(),
+        ],
+    );
+    let src = make_local_source(tmp.path());
+    // 第二个技能在仓库中不存在：报错前 alpha 已安装落盘
+    let err = fail(
+        &home,
+        &[
+            "add",
+            src.to_str().unwrap(),
+            "-s",
+            "alpha",
+            "-s",
+            "ghost",
+            "-t",
+            "global:agents",
+            "--method",
+            "copy",
+            "-y",
+        ],
+    );
+    assert!(err.contains("ghost"), "{err}");
+    // 磁盘副本已写入，registry 必须同步可见（逐条落盘），否则 list/remove 管不到它
+    assert!(agents.join("alpha/SKILL.md").exists());
+    let out = ok(&home, &["list"]);
+    assert!(out.contains("alpha"), "registry 丢失已装副本: {out}");
+    // 脱节副本应能被 remove 正常清掉
+    ok(&home, &["remove", "alpha", "-t", "global:agents"]);
+    assert!(!agents.join("alpha").exists());
+}
+
 // ---- 审查发现 3：update 参数配对与多 skill ----
 
 #[test]
