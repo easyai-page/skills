@@ -145,14 +145,26 @@ async fn remove_install(State(s): S, Json(req): Json<RemoveReq>) -> StatusCode {
     }
 }
 
-async fn run_update(State(s): S) -> Json<serde_json::Value> {
+async fn run_update(State(s): S) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let s = s.lock().unwrap();
     let cfg = crate::core::config::Config::load(&s.layout).unwrap_or_default();
-    let mut reg = Registry::load(&s.layout).unwrap_or_default();
+    // registry 损坏或更新执行（git/网络/落盘）失败必须显式 500 + 错误消息，
+    // 不能吞错让前端误报“无更新”
+    let mut reg = Registry::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 registry 失败: {e}"),
+        )
+    })?;
     let plan = crate::core::update::build_plan(&reg, None);
     let done =
-        crate::core::update::execute_plan(&s.layout, &cfg, &mut reg, &plan).unwrap_or_default();
-    Json(serde_json::json!({ "done": done }))
+        crate::core::update::execute_plan(&s.layout, &cfg, &mut reg, &plan).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("执行更新失败: {e}"),
+            )
+        })?;
+    Ok(Json(serde_json::json!({ "done": done })))
 }
 
 #[cfg(test)]
@@ -254,5 +266,51 @@ mod tests {
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("skills"));
+    }
+
+    #[tokio::test]
+    async fn run_update_returns_500_on_corrupted_registry() {
+        let state = test_state();
+        // 人为写坏 registry.json：加载必须显式 500，而不是吞错返回 200 + {done: []}
+        std::fs::write(state.layout.registry_path(), "{ 这不是合法 json").unwrap();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/update")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("加载 registry 失败"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn run_update_ok_with_empty_plan() {
+        // test_state 无任何 source 开启 auto_update → 空计划，成功路径仍返回 200 + {done: []}
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/update")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["done"], serde_json::json!([]));
     }
 }
