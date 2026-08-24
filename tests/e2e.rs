@@ -189,3 +189,68 @@ fn update_respects_two_level_policy() {
     let alpha_md = std::fs::read_to_string(agents_dir.join("alpha/SKILL.md")).unwrap();
     assert!(alpha_md.contains("v2"), "显式指定应强制更新");
 }
+
+/// symlink 方式全链路：安装产物是指向缓存的符号链接；remove 只删链接、缓存原样保留。
+/// Windows 上 symlink 需开发者模式，失败时安装端会回退 junction（核心单测无覆盖，
+/// e2e 不强行造权限条件），故本测试仅 unix。
+#[cfg(unix)]
+#[test]
+fn add_list_remove_symlink_flow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (bare, _work) = fixture_repo(tmp.path());
+    let agents_dir = redirect_agents_target(&home);
+    skills(&home)
+        .args([
+            "add",
+            &format!("file://{}", bare.display()),
+            "-s",
+            "alpha",
+            "-t",
+            "global:agents",
+            "--method",
+            "symlink",
+            "-y",
+        ])
+        .assert()
+        .success();
+    let link = agents_dir.join("alpha");
+    // 从 registry 读真实缓存 key（key 推导规则见 source.rs，不硬编码）
+    let reg_raw = std::fs::read_to_string(home.join("registry.json")).unwrap();
+    let reg: serde_json::Value = serde_json::from_str(&reg_raw).unwrap();
+    let key = reg["sources"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let cached_skill = home.join(&key).join("skills/alpha");
+    // 安装产物是符号链接，且指向缓存内的技能目录；透过链接可读内容
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "symlink 方式安装的产物必须是符号链接"
+    );
+    assert_eq!(std::fs::read_link(&link).unwrap(), cached_skill);
+    assert!(link.join("SKILL.md").exists());
+    // list 能列出 symlink 安装
+    let out = skills(&home).args(["list"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("alpha") && stdout.contains("Symlink"),
+        "{stdout}"
+    );
+    // remove 只删链接本身，缓存内容原样保留
+    skills(&home).args(["remove", "alpha"]).assert().success();
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "remove 后链接应被删除"
+    );
+    assert!(
+        cached_skill.join("SKILL.md").exists(),
+        "remove symlink 安装不得触碰缓存"
+    );
+}
