@@ -1,0 +1,82 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+# 同名 tag 重复推送时串行，不取消在跑的（发布动作不可重入，宁可排队）
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 校验 tag 与 Cargo.toml 版本一致
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag 与 Cargo.toml version $pkg 不一致（先 bump Cargo.toml 再打 tag）"
+            exit 1
+          fi
+          echo "版本一致: $tag"
+
+  build:
+    needs: verify
+    strategy:
+      # 一个平台失败不取消其他平台——一次跑完能看到全部失败点；
+      # release job needs: build，任何失败都不会产出残缺 release
+      fail-fast: false
+      matrix:
+        include:
+          # musl 与 aarch64-linux 用 cross 容器交叉（工具链完整，不依赖 arm runner 可见性）
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest,  tool: cargo }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest,  tool: cross }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest,  tool: cross }
+          - { target: x86_64-apple-darwin,       os: macos-latest,   tool: cargo }
+          - { target: aarch64-apple-darwin,      os: macos-latest,   tool: cargo }
+          - { target: x86_64-pc-windows-msvc,    os: windows-latest, tool: cargo }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # cross 编译耗时约 2-4 分钟，仅两个 linux 交叉目标需要；
+      # 不用第三方 install-action，保持供应链白名单最小（见 Global Constraints）
+      - if: matrix.tool == 'cross'
+        run: cargo install cross --locked
+      - name: 编译
+        shell: bash
+        run: ${{ matrix.tool }} build --release --target ${{ matrix.target }}
+      - name: 打包
+        shell: bash
+        run: bash scripts/pack-release.sh "${{ matrix.target }}" "${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 校验和并发布
+        shell: bash
+        run: |
+          cd dist
+          ls -la   # 日志留证：6 个归档齐全
+          sha256sum -- *.tar.gz *.zip > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --generate-notes ./*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
