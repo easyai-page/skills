@@ -12,6 +12,8 @@ pub struct Cached {
 
 pub struct SkillEntry {
     pub name: String,
+    // 解析自 SKILL.md frontmatter 并保留：当前展示层尚未消费，但解析正确性由测试锁定
+    #[allow(dead_code)]
     pub description: String,
     pub rel_path: PathBuf,
 }
@@ -109,10 +111,10 @@ pub fn scan_skills(root: &Path) -> Result<Vec<SkillEntry>> {
         if !dir1.is_dir() || dir1.file_name().is_some_and(|name| name == ".git") {
             continue;
         }
-        if dir1.join("SKILL.md").exists() {
-            if let Some(skill) = read_entry(&dir1, relative_path(root, &dir1))? {
-                out.push(skill);
-            }
+        if dir1.join("SKILL.md").exists()
+            && let Some(skill) = read_entry(&dir1, relative_path(root, &dir1))?
+        {
+            out.push(skill);
         }
 
         let mut level_two = std::fs::read_dir(&dir1)?.collect::<std::io::Result<Vec<_>>>()?;

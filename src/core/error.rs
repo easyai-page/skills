@@ -12,8 +12,6 @@ pub enum Error {
     UnknownTarget(String),
     #[error("无法确定用户主目录")]
     NoHome,
-    #[error("source 已缓存: {0}")]
-    AlreadyCached(String),
     #[error("无效的技能名，必须是单一普通路径组件: {0}")]
     InvalidSkillName(String),
     #[error("源路径不在缓存目录内: {0}")]

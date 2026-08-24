@@ -14,6 +14,9 @@ static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) const COPY_MANIFEST: &str = ".skills-manifest";
 
 /// 把技能从缓存安装到一个目标；目标已有同名目录时返回 Error::Conflict 交由前端决策。
+// 参数即安装一次副本的全部上下文（布局/配置/记录/来源/目标/方法/版本），
+// 打包成结构体只是把同样多的字段挪个位置，不降低复杂度，故保留平铺签名。
+#[allow(clippy::too_many_arguments)]
 pub fn install_skill(
     layout: &Layout,
     cfg: &Config,

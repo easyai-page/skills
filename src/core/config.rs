@@ -29,10 +29,10 @@ struct FileWeb {
 }
 
 fn expand_tilde(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
     PathBuf::from(s)
 }
@@ -68,15 +68,15 @@ impl Config {
             return Ok(cfg); // 无配置文件也能工作
         }
         let fc: FileConfig = toml::from_str(&std::fs::read_to_string(&path)?)?;
-        if let Some(d) = fc.defaults {
-            if let Some(m) = d.method {
-                cfg.default_method = m;
-            }
+        if let Some(d) = fc.defaults
+            && let Some(m) = d.method
+        {
+            cfg.default_method = m;
         }
-        if let Some(w) = fc.web {
-            if let Some(p) = w.port {
-                cfg.web_port = p;
-            }
+        if let Some(w) = fc.web
+            && let Some(p) = w.port
+        {
+            cfg.web_port = p;
         }
         if let Some(t) = fc.targets {
             for (name, p) in t {

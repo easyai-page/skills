@@ -18,7 +18,7 @@ pub fn draw(f: &mut Frame, app: &AppState) {
         View::Sources => 2,
     };
     f.render_widget(
-        Tabs::new(titles.iter().map(|t| *t).collect::<Vec<_>>())
+        Tabs::new(titles.to_vec())
             .select(idx)
             .block(Block::default().borders(Borders::ALL).title("skills")),
         chunks[0],

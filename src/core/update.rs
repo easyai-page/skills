@@ -298,7 +298,7 @@ mod tests {
             },
         };
         let plan = build_plan(&reg, Some(&sel));
-        assert_eq!(plan.copies[0].update, true); // 显式指定无视配置
+        assert!(plan.copies[0].update); // 显式指定无视配置
         assert_eq!(plan.sources.len(), 1); // 且会拉仓库
     }
 

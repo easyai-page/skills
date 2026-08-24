@@ -1,5 +1,5 @@
 use super::error::{Error, Result};
-use super::registry::{Install, Method, Registry, TargetRec};
+use super::registry::{Install, Registry, TargetRec};
 
 /// 覆盖式设置某条 install 的分类（同一技能的其他目标副本不受影响）。
 pub fn set_tags(
@@ -27,6 +27,7 @@ pub fn filter_by_tag<'a>(reg: &'a Registry, tag: &str) -> Vec<&'a Install> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::registry::Method;
 
     fn reg() -> Registry {
         let mut r = Registry {

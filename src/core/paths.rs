@@ -47,16 +47,18 @@ pub struct Layout {
 impl Layout {
     pub fn new() -> Result<Layout> {
         // 空串视为未设置：否则 root="" 会把 registry/config 写进当前工作目录
-        if let Ok(p) = std::env::var("SKILLS_HOME") {
-            if !p.is_empty() {
-                return Ok(Layout { root: p.into() });
-            }
+        if let Ok(p) = std::env::var("SKILLS_HOME")
+            && !p.is_empty()
+        {
+            return Ok(Layout { root: p.into() });
         }
         let home = dirs::home_dir().ok_or(Error::NoHome)?;
         Ok(Layout {
             root: home.join(".skills"),
         })
     }
+    /// 跳过环境变量探测直接指定 root —— 仅测试用（生产路径一律走 new 的 SKILLS_HOME 探测）
+    #[cfg(test)]
     pub fn at(root: PathBuf) -> Layout {
         Layout { root }
     }

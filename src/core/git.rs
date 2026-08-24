@@ -40,7 +40,7 @@ pub fn fetch_and_reset(path: &Path) -> Result<Option<String>> {
         .name()
         .ok_or_else(|| Error::Git("默认 remote 无名称".into()))?
     {
-        gix::remote::Name::Symbol(name) => name.to_owned(),
+        gix::remote::Name::Symbol(name) => name.clone().into_owned(),
         gix::remote::Name::Url(_) => return Err(Error::Git("默认 remote 名称为 URL".into())),
     };
     remote
@@ -87,9 +87,9 @@ static NEXT_TRANSACTION_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 enum FailurePoint {
-    AfterWorktreeInstall,
-    AfterIndexInstall,
-    AfterRefUpdate,
+    WorktreeInstall,
+    IndexInstall,
+    RefUpdate,
 }
 
 struct PreparedCheckout {
@@ -242,7 +242,7 @@ impl CheckoutTransaction {
             std::fs::rename(entry.path(), self.prepared.workdir.join(&name))?;
             self.installed_entries.push(name);
         }
-        if matches!(failure, Some(FailurePoint::AfterWorktreeInstall)) {
+        if matches!(failure, Some(FailurePoint::WorktreeInstall)) {
             return Err(Error::Git("注入：工作区切换后失败".into()));
         }
 
@@ -250,7 +250,7 @@ impl CheckoutTransaction {
             std::fs::rename(&self.prepared.index, &self.old_index)?;
         }
         std::fs::rename(&self.prepared.staged_index, &self.prepared.index)?;
-        if matches!(failure, Some(FailurePoint::AfterIndexInstall)) {
+        if matches!(failure, Some(FailurePoint::IndexInstall)) {
             return Err(Error::Git("注入：index 切换后失败".into()));
         }
 
@@ -262,7 +262,7 @@ impl CheckoutTransaction {
                 "skills update",
             )
             .map_err(gerr)?;
-            if matches!(failure, Some(FailurePoint::AfterRefUpdate)) {
+            if matches!(failure, Some(FailurePoint::RefUpdate)) {
                 // 让测试覆盖“ref 已切换但后续阶段失败”的完整回滚。
                 let _ = old_oid;
                 return Err(Error::Git("注入：ref 切换后失败".into()));
@@ -279,10 +279,10 @@ impl CheckoutTransaction {
         let mut failures = Vec::new();
 
         // install 的逆序：ref、index、工作区。每一步都验证旧值，避免返回假成功。
-        if let Some((branch, old_oid, new_oid)) = branch {
-            if let Err(err) = restore_ref(repo, branch, old_oid, new_oid) {
-                failures.push(format!("恢复 ref 失败: {err}"));
-            }
+        if let Some((branch, old_oid, new_oid)) = branch
+            && let Err(err) = restore_ref(repo, branch, old_oid, new_oid)
+        {
+            failures.push(format!("恢复 ref 失败: {err}"));
         }
         if let Err(err) = self.restore_index() {
             failures.push(format!("恢复 index 失败: {err}"));
@@ -436,6 +436,8 @@ fn snapshot_worktree(root: &std::path::Path) -> std::io::Result<Vec<SnapshotEntr
     Ok(out)
 }
 
+// 仅测试使用（失败注入回归），与 checkout_tree_with_failure 同一模式
+#[cfg(test)]
 fn checkout_tree(repo: &gix::Repository, oid: gix::ObjectId) -> Result<()> {
     checkout_transaction(repo, oid, None, None)
 }
@@ -716,7 +718,7 @@ mod tests {
                 branch,
                 old_oid,
                 new_oid,
-                FailurePoint::AfterIndexInstall,
+                FailurePoint::IndexInstall,
             )
             .is_err()
         );
@@ -729,7 +731,7 @@ mod tests {
                 branch,
                 old_oid,
                 new_oid,
-                FailurePoint::AfterWorktreeInstall,
+                FailurePoint::WorktreeInstall,
             )
             .is_err()
         );
@@ -737,14 +739,8 @@ mod tests {
 
         let repo = gix::open(&dest).unwrap();
         assert!(
-            checkout_tree_with_failure(
-                &repo,
-                branch,
-                old_oid,
-                new_oid,
-                FailurePoint::AfterRefUpdate,
-            )
-            .is_err()
+            checkout_tree_with_failure(&repo, branch, old_oid, new_oid, FailurePoint::RefUpdate,)
+                .is_err()
         );
         assert_old_state();
     }

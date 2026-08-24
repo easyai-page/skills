@@ -61,12 +61,12 @@ pub(crate) fn validate_record(rec: &Install) -> Result<()> {
             rec.skill
         ))
     })?;
-    if let TargetRec::Project { root } = &rec.target {
-        if !root.is_absolute() {
-            return Err(Error::Mismatch(format!(
-                "安装记录损坏：project root {root:?} 不是绝对路径，未执行磁盘删除"
-            )));
-        }
+    if let TargetRec::Project { root } = &rec.target
+        && !root.is_absolute()
+    {
+        return Err(Error::Mismatch(format!(
+            "安装记录损坏：project root {root:?} 不是绝对路径，未执行磁盘删除"
+        )));
     }
     Ok(())
 }
