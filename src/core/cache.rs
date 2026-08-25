@@ -12,9 +12,7 @@ pub struct Cached {
 
 pub struct SkillEntry {
     pub name: String,
-    // 解析自 SKILL.md frontmatter 并保留：当前展示层尚未消费，但解析正确性由测试锁定
-    #[allow(dead_code)]
-    pub description: String,
+    pub description: String, // 解析自 SKILL.md frontmatter；收藏快照与展示层消费
     pub rel_path: PathBuf,
 }
 
