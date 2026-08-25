@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use super::config::Config;
 use super::error::{Error, Result};
 use super::install::{self, COPY_MANIFEST};
-use super::paths::{Layout, Target};
+use super::paths::Layout;
 use super::registry::{Install, Method, Registry, TargetRec};
 
 #[derive(PartialEq, Debug)]
@@ -27,10 +27,8 @@ pub fn remove_install(
         .clone();
     validate_record(&rec)?;
 
-    let t = match &rec.target {
-        TargetRec::Global { name } => Target::Global { name: name.clone() },
-        TargetRec::Project { root } => Target::Project { root: root.clone() },
-    };
+    // TargetRec（持久化形态）→ Target（运行时形态）的转换收敛在 TargetRec::to_target
+    let t = rec.target.to_target();
     let dest = t.install_dir(cfg)?.join(&rec.skill);
 
     let meta = match std::fs::symlink_metadata(&dest) {

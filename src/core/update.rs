@@ -136,7 +136,7 @@ pub fn execute_plan(
             .clone();
         // 与 remove 相同的前置防线：记录校验 + 副本归属核验；无法确认归属则不删不更新。
         super::remove::validate_record(&rec)?;
-        let target = to_target(&d.target);
+        let target = d.target.to_target();
         let dest_root = target.install_dir(cfg)?;
         let dest = dest_root.join(&d.skill);
         match std::fs::symlink_metadata(&dest) {
@@ -186,13 +186,6 @@ pub fn execute_plan(
     Ok(done)
 }
 
-fn to_target(rec: &TargetRec) -> super::paths::Target {
-    match rec {
-        TargetRec::Global { name } => super::paths::Target::Global { name: name.clone() },
-        TargetRec::Project { root } => super::paths::Target::Project { root: root.clone() },
-    }
-}
-
 /// 本地修改预扫描（force=false 时、任何 pull/替换之前执行）：汇总所有将更新的 copy 副本
 /// 相对 manifest 基线的分歧，一次性报 Mismatch，避免“更新到一半才发现改动”的部分变更。
 /// 记录缺失、副本被手动删除、副本被替换成链接等归属类问题不在此展开，交由主循环按原语义报错。
@@ -206,7 +199,7 @@ fn pre_scan_local_modifications(
         let Some(rec) = reg.find(&d.skill, &d.target) else {
             continue; // 记录缺失：主循环报 NotInstalled
         };
-        let dest = to_target(&d.target).install_dir(cfg)?.join(&rec.skill);
+        let dest = d.target.to_target().install_dir(cfg)?.join(&rec.skill);
         let meta = match std::fs::symlink_metadata(&dest) {
             Ok(meta) => meta,
             // 副本已被手动删除：无可保护的内容，主循环走 staging 直接重建

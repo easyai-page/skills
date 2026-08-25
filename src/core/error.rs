@@ -22,6 +22,8 @@ pub enum Error {
     Conflict(std::path::PathBuf),
     #[error("技能未安装: {0}")]
     NotInstalled(String),
+    #[error("未收藏: {0}")]
+    NotBookmarked(String),
     #[error("磁盘实况与安装记录不一致: {0}")]
     Mismatch(String),
     #[error("git 操作失败: {0}")]
