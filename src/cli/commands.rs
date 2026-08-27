@@ -1,9 +1,9 @@
-use super::{Cli, Cmd, ConfigCmd, MethodArg, TargetsCmd};
+use super::{Cli, Cmd, ConfigCmd, FavSub, MethodArg, TargetsCmd};
 use crate::core::{
     cache,
     config::Config,
     error::{Error, Result},
-    install,
+    favorites, install,
     paths::{Layout, Target},
     registry::{Method, Registry, TargetRec},
     remove,
@@ -374,6 +374,43 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             reg.save(&layout)
         }
+        Some(Cmd::Fav { source, skill, sub }) => {
+            let mut reg = Registry::load(&layout)?;
+            match (sub, source) {
+                (Some(FavSub::Rm { source, skill }), _) => {
+                    let key = favorites::resolve_key(&reg, &source)?;
+                    if skill.is_empty() {
+                        let n = favorites::unbookmark(&mut reg, &key, &[])?;
+                        reg.save(&layout)?;
+                        println!("已删除收藏 {key}（{n} 个技能）");
+                    } else {
+                        let n = favorites::unbookmark(&mut reg, &key, &skill)?;
+                        reg.save(&layout)?;
+                        println!("已从 {key} 删除 {n} 个技能收藏");
+                    }
+                    Ok(())
+                }
+                (Some(FavSub::Install { .. }), _) => {
+                    Err(Error::Msg("fav install 尚未实现（下一任务）".into()))
+                }
+                (None, Some(source)) => {
+                    let spec = parse_source(&source)?;
+                    let (key, n) = favorites::bookmark(&layout, &mut reg, &spec, &skill)?;
+                    reg.save(&layout)?;
+                    println!("已收藏 {key}（{n} 个技能）");
+                    Ok(())
+                }
+                (None, None) => {
+                    if !skill.is_empty() {
+                        return Err(Error::Msg(
+                            "--skill 需搭配 source：skills fav <仓库> --skill <名>".into(),
+                        ));
+                    }
+                    print_favorites(&reg);
+                    Ok(())
+                }
+            }
+        }
         Some(Cmd::Config { .. }) => unreachable!("config 分支已在 Config::load 之前分发"),
     }
 }
@@ -417,6 +454,38 @@ fn validate_config_set(key: &str, value: &str) -> Result<()> {
             ))),
         },
         _ => Ok(()),
+    }
+}
+
+/// 收藏的两级列表：一级 = 技能包；多技能仓库二级逐行列技能名 + 用途；
+/// 单技能仓库（is_single_skill_repo）二级留空，用途直接挂在一级行。
+fn print_favorites(reg: &Registry) {
+    if reg.favorites.is_empty() {
+        println!("（无收藏）");
+        return;
+    }
+    for (key, fav) in &reg.favorites {
+        let date: String = fav.bookmarked_at.chars().take(10).collect();
+        // chars().take(7)：按字符截断，避免多字节 UTF-8 在字节边界切片 panic
+        let commit_short: String = fav.commit.chars().take(7).collect();
+        let meta = if fav.url.is_some() {
+            format!("({commit_short}, 收藏于 {date})")
+        } else {
+            "(本地源)".to_string()
+        };
+        if favorites::is_single_skill_repo(fav) {
+            println!("{key} — {}    {meta}", fav.skills[0].description);
+            continue;
+        }
+        println!("{key}    {meta}");
+        for (i, s) in fav.skills.iter().enumerate() {
+            let branch = if i + 1 == fav.skills.len() {
+                "└─"
+            } else {
+                "├─"
+            };
+            println!("  {branch} {} — {}", s.name, s.description);
+        }
     }
 }
 

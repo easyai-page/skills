@@ -1,6 +1,6 @@
 //! 技能收藏：只记录地址与功能描述的快照，不安装。收藏与安装是正交的两份记录。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::cache;
 use super::config::Config;
@@ -217,6 +217,7 @@ mod tests {
     use crate::core::paths::Target;
     use crate::core::registry::Method;
     use crate::core::source::parse_source;
+    use std::path::PathBuf;
 
     /// 本地双技能源（local 源每次 ensure_cached 都重拷，天然离线）
     fn setup() -> (tempfile::TempDir, Layout, Registry, PathBuf) {

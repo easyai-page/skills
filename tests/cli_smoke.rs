@@ -362,3 +362,52 @@ fn remove_propagates_errors_with_nonzero_exit() {
     let err = fail(home, &["remove", "ghost", "--target", "global:agents"]);
     assert!(err.contains("未安装"), "{err}");
 }
+
+#[test]
+fn fav_help_and_arg_validation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    // 帮助里能看到 fav
+    let out = Command::cargo_bin("skills")
+        .unwrap()
+        .arg("--help")
+        .output()
+        .unwrap();
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(s.contains("fav"), "{s}");
+    // fav rm / fav install 缺 source：clap 报错非零退出
+    fail(&home, &["fav", "rm"]);
+    fail(&home, &["fav", "install"]);
+    // --skill 必须搭配 source
+    let err = fail(&home, &["fav", "--skill", "x"]);
+    assert!(err.contains("--skill 需搭配 source"), "{err}");
+    // 空收藏列表
+    let out = ok(&home, &["fav"]);
+    assert!(out.contains("（无收藏）"), "{out}");
+}
+
+#[test]
+fn fav_bookmark_list_rm_local_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(src.join("skills/alpha")).unwrap();
+    std::fs::write(
+        src.join("skills/alpha/SKILL.md"),
+        "---\nname: alpha\ndescription: A 技能\n---\n",
+    )
+    .unwrap();
+    // 收藏（本地路径 source；local/<目录名> 是确定规则，key 可硬编码）
+    let out = ok(&home, &["fav", src.to_str().unwrap()]);
+    assert!(out.contains("已收藏 local/src（1 个技能）"), "{out}");
+    // 两级列表：本地源无 commit，一级行显示 (本地源)
+    let out = ok(&home, &["fav"]);
+    assert!(out.contains("local/src"), "{out}");
+    assert!(out.contains("(本地源)"), "{out}");
+    assert!(out.contains("└─ alpha — A 技能"), "{out}");
+    // 删除整包
+    let out = ok(&home, &["fav", "rm", "local/src"]);
+    assert!(out.contains("已删除收藏 local/src"), "{out}");
+    let out = ok(&home, &["fav"]);
+    assert!(out.contains("（无收藏）"), "{out}");
+}

@@ -96,6 +96,15 @@ pub enum Cmd {
     },
     /// 进入 TUI
     Tui,
+    /// 收藏技能（只记录地址与功能，不安装）；无参数时列出收藏
+    #[command(args_conflicts_with_subcommands = true)]
+    Fav {
+        source: Option<String>,
+        #[arg(short, long)]
+        skill: Vec<String>,
+        #[command(subcommand)]
+        sub: Option<FavSub>,
+    },
     /// 启动 Web 管理页
     Ui {
         #[arg(long)]
@@ -124,4 +133,28 @@ pub enum ConfigCmd {
 pub enum TargetsCmd {
     Add { name: String, path: String },
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+pub enum FavSub {
+    /// 删除收藏（--skill 删指定技能，否则删整包；不动缓存与已安装副本）
+    Rm {
+        source: String,
+        #[arg(short, long)]
+        skill: Vec<String>,
+    },
+    /// 从收藏安装（Task 5 实现分发，本任务先建结构）
+    Install {
+        source: String,
+        #[arg(short, long)]
+        skill: Vec<String>,
+        #[arg(short, long)]
+        target: Vec<String>,
+        #[arg(short = 'g', long)]
+        global: bool,
+        #[arg(long, value_enum)]
+        method: Option<MethodArg>,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
