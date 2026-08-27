@@ -16,7 +16,7 @@ cargo test --test e2e              # 端到端测试（真实二进制 + 本地 
 cargo test --test cli_smoke        # CLI 冒烟测试
 cargo clippy                       # lint
 cargo fmt                          # 格式化（提交前必跑）
-cargo run -- list                  # 本地运行 CLI（子命令：add/list/remove/update/tag/auto-update/config/tui/ui）
+cargo run -- list                  # 本地运行 CLI（子命令：add/list/remove/update/tag/auto-update/config/fav/tui/ui）
 bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包（产物在 dist/）
 ```
 

@@ -15,10 +15,19 @@ nav button { margin-right: 8px; }
 <nav>
   <button id="nav-installs">已安装</button>
   <button id="nav-sources">仓库缓存</button>
+  <button id="nav-favorites">收藏</button>
   <button id="nav-update">执行更新</button>
 </nav>
 <div id="installs"></div>
 <div id="sources" style="display:none"></div>
+<div id="favorites" style="display:none">
+  <p>
+    <input id="fav-source" placeholder="仓库地址（owner/repo、URL 或本地路径）" size="42">
+    <input id="fav-skill" placeholder="技能名（可空 = 整仓）" size="18">
+    <button id="fav-add">收藏</button>
+  </p>
+  <div id="fav-list"></div>
+</div>
 <script>
 // 安全约定：registry 数据（技能名/分类/仓库键/commit 等，来自第三方仓库或用户输入）
 // 一律经 textContent / value / checked 注入 DOM，绝不拼接进 innerHTML 或内联事件属性；
@@ -45,7 +54,7 @@ function cell(tr, child) {
   return td;
 }
 function show(id) {
-  for (const d of ['installs','sources']) document.getElementById(d).style.display = d===id?'':'none';
+  for (const d of ['installs','sources','favorites']) document.getElementById(d).style.display = d===id?'':'none';
   refresh();
 }
 function targetRef(i) { return i.target.kind==='global' ? i.target.name : i.target.root; }
@@ -104,11 +113,145 @@ function renderSources(sources) {
   }
   return table;
 }
+function renderFavorites(favs) {
+  const wrap = el('div');
+  for (const [key, f] of Object.entries(favs)) {
+    const single = f.skills.length === 1 && f.skills[0].source_path === '.';
+    const head = el('p');
+    head.appendChild(el('strong', key));
+    const meta = f.url ? `  （${(f.commit||'').slice(0,7)}，收藏于 ${(f.bookmarked_at||'').slice(0,10)}）` : '  （本地源）';
+    head.appendChild(document.createTextNode(meta));
+    if (single) {
+      // 单技能仓库：二级留空，用途与操作挂一级行
+      head.appendChild(document.createTextNode(' — ' + f.skills[0].description));
+      const ins = el('button', '安装');
+      ins.addEventListener('click', () => openInstall(key, f.skills[0].name));
+      head.appendChild(ins);
+      const del = el('button', '删除');
+      del.addEventListener('click', () => rmFav(key, []));
+      head.appendChild(del);
+      wrap.appendChild(head);
+      continue;
+    }
+    const delAll = el('button', '删除整包');
+    delAll.addEventListener('click', () => rmFav(key, []));
+    head.appendChild(delAll);
+    wrap.appendChild(head);
+    const table = el('table');
+    for (const s of f.skills) {
+      const tr = el('tr');
+      tr.appendChild(el('td', s.name));
+      tr.appendChild(el('td', s.description));
+      const ins = el('button', '安装');
+      ins.addEventListener('click', () => openInstall(key, s.name));
+      cell(tr, ins);
+      const del = el('button', '删除');
+      del.addEventListener('click', () => rmFav(key, [s.name]));
+      cell(tr, del);
+      table.appendChild(tr);
+    }
+    wrap.appendChild(table);
+  }
+  return wrap;
+}
+async function addFav() {
+  const source = document.getElementById('fav-source').value.trim();
+  const skill = document.getElementById('fav-skill').value.trim();
+  if (!source) return;
+  try {
+    await api('favorites', {method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({source, skill: skill ? [skill] : []})});
+    refresh();
+  } catch (e) {
+    alert('收藏失败: ' + e.message);
+  }
+}
+async function rmFav(source, skills) {
+  if (!confirm(`删除收藏 ${source}${skills.length ? ' 的 ' + skills.join(',') : ''}？`)) return;
+  await api('favorites/remove', {method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({source, skill: skills})});
+  refresh();
+}
+// 安装面板：global target 下拉（/api/targets）+ project 绝对路径输入 + method 选择
+let installPanel = null;
+async function openInstall(source, skill) {
+  if (installPanel) installPanel.remove();
+  let targets;
+  try {
+    targets = await api('targets');
+  } catch (e) {
+    alert('加载 targets 失败: ' + e.message);
+    return;
+  }
+  const panel = el('p');
+  panel.appendChild(el('span', `安装 ${skill} → `));
+  const sel = document.createElement('select');
+  for (const t of targets) {
+    const opt = el('option', `global:${t.name}`);
+    opt.value = `global:${t.name}`;
+    sel.appendChild(opt);
+  }
+  const optP = el('option', 'project（绝对路径）');
+  optP.value = 'project';
+  sel.appendChild(optP);
+  panel.appendChild(sel);
+  const pathInput = document.createElement('input');
+  pathInput.placeholder = '/abs/project/path';
+  pathInput.style.display = 'none';
+  sel.addEventListener('change', () => {
+    pathInput.style.display = sel.value === 'project' ? '' : 'none';
+  });
+  panel.appendChild(pathInput);
+  const msel = document.createElement('select');
+  for (const [v, label] of [['', '默认'], ['symlink', 'symlink'], ['copy', 'copy']]) {
+    const o = el('option', label);
+    o.value = v;
+    msel.appendChild(o);
+  }
+  panel.appendChild(msel);
+  const ok = el('button', '确认安装');
+  ok.addEventListener('click', () => doInstall(source, skill, sel.value, pathInput.value.trim(), msel.value));
+  panel.appendChild(ok);
+  const cancel = el('button', '取消');
+  cancel.addEventListener('click', () => { panel.remove(); installPanel = null; });
+  panel.appendChild(cancel);
+  document.getElementById('favorites').appendChild(panel);
+  installPanel = panel;
+}
+async function doInstall(source, skill, targetSel, projectPath, method) {
+  const target = targetSel === 'project'
+    ? {kind:'project', root: projectPath}
+    : {kind:'global', name: targetSel.slice('global:'.length)};
+  const body = {source, skill, target, overwrite: false};
+  if (method) body.method = method;
+  try {
+    await api('favorites/install', {method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify(body)});
+    alert('已安装 ' + skill);
+  } catch (e) {
+    // 409 = 目标已存在：确认后以 overwrite 重试一次（同 runUpdate 的确认链）
+    if (e.status === 409) {
+      if (!confirm(e.message + '\n\n覆盖现有目录？')) return;
+      body.overwrite = true;
+      try {
+        await api('favorites/install', {method:'POST', headers:{'content-type':'application/json'},
+          body: JSON.stringify(body)});
+        alert('已覆盖安装 ' + skill);
+      } catch (e2) {
+        alert('安装失败: ' + e2.message);
+      }
+      return;
+    }
+    alert('安装失败: ' + e.message);
+  }
+}
 async function refresh() {
   const installs = await api('installs');
   document.getElementById('installs').replaceChildren(renderInstalls(installs));
   const sources = await api('sources');
   document.getElementById('sources').replaceChildren(renderSources(sources));
+  const favs = await api('favorites');
+  document.getElementById('fav-list').replaceChildren(renderFavorites(favs));
 }
 function targetBody(kind, ref) { return kind==='global' ? {kind:'global',name:ref} : {kind:'project',root:ref}; }
 async function setAU(skill, kind, ref, v) {
@@ -152,6 +295,8 @@ async function runUpdate() {
 }
 document.getElementById('nav-installs').addEventListener('click', () => show('installs'));
 document.getElementById('nav-sources').addEventListener('click', () => show('sources'));
+document.getElementById('nav-favorites').addEventListener('click', () => show('favorites'));
+document.getElementById('fav-add').addEventListener('click', addFav);
 document.getElementById('nav-update').addEventListener('click', runUpdate);
 refresh();
 </script>
