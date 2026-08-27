@@ -424,3 +424,74 @@ fn fav_install_heals_missing_cache() {
         .success();
     assert!(agents_dir.join("beta/SKILL.md").exists());
 }
+
+/// fav install 中途失败（多 --skill 中含未收藏名）：前面的技能已装好并逐条落盘，
+/// registry 与磁盘保持一致，不留 list/remove 管不到的孤儿副本。
+/// 锁定「中途失败逐条落盘」不变量：add 路径的技能存在性校验已前置（中途不再可能
+/// 撞上未知技能），此路径改由 fav install 的收藏校验覆盖。
+#[test]
+fn fav_install_partial_failure_keeps_registry_consistent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (bare, _work) = fixture_repo(tmp.path());
+    let agents_dir = redirect_agents_target(&home);
+    let url = format!("file://{}", bare.display());
+
+    // 只收藏 alpha；ghost 既不在仓库也不可能被收藏
+    skills(&home)
+        .args(["fav", &url, "--skill", "alpha"])
+        .assert()
+        .success();
+
+    // 从 registry 读真实 source key（file:// 的 key 推导见 source.rs，不硬编码）
+    let key = {
+        let reg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("registry.json")).unwrap())
+                .unwrap();
+        reg["favorites"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone()
+    };
+
+    // fav install：alpha 已收藏 → 装好并逐条落盘；ghost 未收藏 → NotBookmarked 中断
+    let out = skills(&home)
+        .args([
+            "fav",
+            "install",
+            &key,
+            "--skill",
+            "alpha",
+            "--skill",
+            "ghost",
+            "-t",
+            "global:agents",
+            "--method",
+            "copy",
+            "-y",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "含未收藏技能的 fav install 应整体失败"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("未收藏") && stderr.contains("ghost"),
+        "{stderr}"
+    );
+
+    // 失败前装好的 alpha 副本在磁盘上保留
+    assert!(
+        agents_dir.join("alpha/SKILL.md").exists(),
+        "alpha 应在失败前装好"
+    );
+    // 逐条落盘保证 registry 与磁盘一致：list 能看到 alpha，无孤儿副本
+    let out = skills(&home).args(["list"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("alpha"), "{stdout}");
+}

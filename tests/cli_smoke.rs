@@ -210,8 +210,8 @@ fn add_global_flag_uses_first_configured_target_and_bare_add_uses_project() {
     assert!(proj.join(".agents/skills/alpha/SKILL.md").exists());
 }
 
-// ---- 最终审查修复 1：add 中途失败不得留下磁盘/registry 脱节 ----
-// （fav 任务重构后：技能存在性全部校验通过才开工，"仓库中无技能"不再可能发生在安装中途）
+// ---- add 的技能存在性校验前置：任一 -s 不在仓库中即整体报错，尚未开工 ----
+// （"中途失败逐条落盘"不变量由 e2e 的 fav_install_partial_failure_keeps_registry_consistent 锁定）
 
 #[test]
 fn add_unknown_skill_fails_before_any_install() {
