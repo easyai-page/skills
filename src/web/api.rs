@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::{
     paths::Layout,
-    registry::{Registry, TargetRec},
+    registry::{Method, Registry, TargetRec},
 };
 
 /// tmp 字段仅用于测试中持有临时目录句柄（防过早删除）。
@@ -39,6 +39,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tags", post(set_tags))
         .route("/api/remove", post(remove_install))
         .route("/api/update", post(run_update))
+        .route("/api/favorites", get(list_favorites).post(add_favorite))
+        .route("/api/favorites/remove", post(remove_favorite))
+        .route("/api/favorites/install", post(install_favorite))
+        .route("/api/targets", get(list_targets))
         .with_state(Arc::new(Mutex::new(state)))
 }
 
@@ -184,6 +188,183 @@ async fn run_update(
         },
     )?;
     Ok(Json(serde_json::json!({ "done": done })))
+}
+
+async fn list_favorites(State(s): S) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let s = s.lock().unwrap();
+    let reg = Registry::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 registry 失败: {e}"),
+        )
+    })?;
+    Ok(Json(serde_json::json!(reg.favorites)))
+}
+
+#[derive(serde::Deserialize)]
+struct FavAddReq {
+    source: String,
+    #[serde(default)]
+    skill: Vec<String>,
+}
+
+async fn add_favorite(
+    State(s): S,
+    Json(req): Json<FavAddReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let s = s.lock().unwrap();
+    let spec = crate::core::source::parse_source(&req.source)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+    let mut reg = Registry::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 registry 失败: {e}"),
+        )
+    })?;
+    // 用户输入类错误（无法解析/仓内无此技能）→ 400；clone/IO 类 → 500
+    let (key, n) = crate::core::favorites::bookmark(&s.layout, &mut reg, &spec, &req.skill)
+        .map_err(|e| {
+            let bad_input = matches!(
+                e,
+                crate::core::error::Error::Msg(_) | crate::core::error::Error::BadTarget(_)
+            );
+            let code = if bad_input {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, format!("收藏失败: {e}"))
+        })?;
+    reg.save(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("保存 registry 失败: {e}"),
+        )
+    })?;
+    Ok(Json(serde_json::json!({ "key": key, "skills": n })))
+}
+
+#[derive(serde::Deserialize)]
+struct FavRemoveReq {
+    source: String,
+    #[serde(default)]
+    skill: Vec<String>,
+}
+
+async fn remove_favorite(
+    State(s): S,
+    Json(req): Json<FavRemoveReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let s = s.lock().unwrap();
+    let mut reg = Registry::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 registry 失败: {e}"),
+        )
+    })?;
+    let key = crate::core::favorites::resolve_key(&reg, &req.source)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e}")))?;
+    crate::core::favorites::unbookmark(&mut reg, &key, &req.skill)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e}")))?;
+    reg.save(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("保存 registry 失败: {e}"),
+        )
+    })?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(serde::Deserialize)]
+struct FavInstallReq {
+    source: String,
+    skill: String,
+    target: TargetRec,
+    method: Option<Method>,
+    overwrite: Option<bool>,
+}
+
+/// 从收藏安装。冲突 → 409 + 明细，前端 confirm 后带 overwrite=true 重试（同 run_update 的确认链）。
+async fn install_favorite(
+    State(s): S,
+    Json(req): Json<FavInstallReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let s = s.lock().unwrap();
+    // config 损坏必须显式 500（同 run_update：静默回退默认会把内置 target 解析到真实 home 并落盘）
+    let cfg = crate::core::config::Config::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 config 失败: {e}"),
+        )
+    })?;
+    let mut reg = Registry::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 registry 失败: {e}"),
+        )
+    })?;
+    let key = crate::core::favorites::resolve_key(&reg, &req.source)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e}")))?;
+    let target = req.target.to_target();
+    let method = req.method.unwrap_or(cfg.default_method);
+    let do_install = |reg: &mut Registry| {
+        crate::core::favorites::fav_install(&s.layout, &cfg, reg, &key, &req.skill, &target, method)
+    };
+    match do_install(&mut reg) {
+        Ok(_) => {
+            reg.save(&s.layout).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("保存 registry 失败: {e}"),
+                )
+            })?;
+            Ok(Json(serde_json::json!({ "installed": req.skill })))
+        }
+        Err(crate::core::error::Error::Conflict(p)) => {
+            if !req.overwrite.unwrap_or(false) {
+                return Err((StatusCode::CONFLICT, format!("{p:?} 已存在")));
+            }
+            // 与 CLI 的覆盖路径一致：先按记录删（无记录则忽略），再重装
+            let _ = crate::core::remove::remove_install(
+                &s.layout,
+                &cfg,
+                &mut reg,
+                &req.skill,
+                &req.target,
+            );
+            do_install(&mut reg).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("覆盖安装失败: {e}"),
+                )
+            })?;
+            reg.save(&s.layout).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("保存 registry 失败: {e}"),
+                )
+            })?;
+            Ok(Json(serde_json::json!({ "installed": req.skill })))
+        }
+        Err(crate::core::error::Error::NotBookmarked(e)) => Err((StatusCode::NOT_FOUND, e)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("安装失败: {e}"))),
+    }
+}
+
+async fn list_targets(State(s): S) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let s = s.lock().unwrap();
+    let cfg = crate::core::config::Config::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 config 失败: {e}"),
+        )
+    })?;
+    let v: Vec<serde_json::Value> = cfg
+        .targets
+        .iter()
+        .map(|(n, p)| serde_json::json!({ "name": n, "path": p }))
+        .collect();
+    Ok(Json(serde_json::json!(v)))
 }
 
 #[cfg(test)]
@@ -495,5 +676,222 @@ mod tests {
                 .unwrap()
                 .contains("v2")
         );
+    }
+
+    /// 在 state.tmp 里造一个本地双技能源，返回其绝对路径。
+    fn make_local_source(tmp: &tempfile::TempDir) -> String {
+        let src = tmp.path().join("mysrc");
+        std::fs::create_dir_all(src.join("skills/alpha")).unwrap();
+        std::fs::create_dir_all(src.join("skills/beta")).unwrap();
+        std::fs::write(
+            src.join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: A 技能\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("skills/beta/SKILL.md"),
+            "---\nname: beta\ndescription: B 技能\n---\n",
+        )
+        .unwrap();
+        src.to_string_lossy().into_owned()
+    }
+
+    fn post_json(uri: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_string(&body).unwrap(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn favorites_api_lifecycle() {
+        let state = test_state();
+        let src = make_local_source(&state.tmp);
+        let keep = state.tmp.clone();
+        let app = router(state);
+        // 收藏整仓
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/favorites",
+                serde_json::json!({"source": src, "skill": []}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["key"], "local/mysrc");
+        assert_eq!(v["skills"], 2);
+        // 列表
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/favorites")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["local/mysrc"]["skills"][0]["description"], "A 技能");
+        // 删单个再删整包
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/favorites/remove",
+                serde_json::json!({"source": "local/mysrc", "skill": ["alpha"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/favorites/remove",
+                serde_json::json!({"source": "local/mysrc", "skill": []}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // 再删：404
+        let resp = app
+            .oneshot(post_json(
+                "/api/favorites/remove",
+                serde_json::json!({"source": "local/mysrc", "skill": []}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn add_favorite_rejects_bad_source_and_unknown_skill() {
+        let state = test_state();
+        let src = make_local_source(&state.tmp);
+        let keep = state.tmp.clone();
+        let app = router(state);
+        // 无法解析的 source：400
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/favorites",
+                serde_json::json!({"source": "noslash", "skill": []}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        // 仓内不存在的技能：400
+        let resp = app
+            .oneshot(post_json(
+                "/api/favorites",
+                serde_json::json!({"source": src, "skill": ["nope"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn install_favorite_conflict_then_overwrite() {
+        let state = test_state();
+        // agents target 指到临时目录：绝不能落盘到真实 home
+        std::fs::create_dir_all(&state.layout.root).unwrap();
+        std::fs::write(
+            state.layout.config_path(),
+            format!(
+                "[targets]\nagents = {:?}\n",
+                state.tmp.path().join("agents")
+            ),
+        )
+        .unwrap();
+        let src = make_local_source(&state.tmp);
+        let agents = state.tmp.path().join("agents");
+        let keep = state.tmp.clone();
+        let app = router(state);
+        // 先收藏
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/favorites",
+                serde_json::json!({"source": src, "skill": []}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let install = |overwrite: bool| {
+            post_json(
+                "/api/favorites/install",
+                serde_json::json!({
+                    "source": "local/mysrc",
+                    "skill": "alpha",
+                    "target": {"kind": "global", "name": "agents"},
+                    "method": "copy",
+                    "overwrite": overwrite
+                }),
+            )
+        };
+        // 首次安装 200
+        let resp = app.clone().oneshot(install(false)).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(agents.join("alpha/SKILL.md").exists());
+        // 冲突 409
+        let resp = app.clone().oneshot(install(false)).await.unwrap();
+        assert_eq!(resp.status(), 409);
+        // overwrite 重试 200
+        let resp = app.clone().oneshot(install(true)).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        // 未收藏的技能 404
+        let resp = app
+            .oneshot(post_json(
+                "/api/favorites/install",
+                serde_json::json!({
+                    "source": "local/mysrc",
+                    "skill": "nope",
+                    "target": {"kind": "global", "name": "agents"}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn targets_endpoint_lists_configured() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/targets")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"agents"), "{names:?}");
     }
 }

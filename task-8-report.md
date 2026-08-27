@@ -1,54 +1,55 @@
-# Task 8 报告：删除引擎
+# Task 8 报告：Web 收藏 API（5 个新端点）
 
-## 实现
+## 实现内容
 
-- 新建 `src/core/remove.rs`，提供 `RemoveOutcome::{Removed, RecordOnly}` 和 `remove_install`。
-- 删除前先按技能名与目标查找 Registry 记录。
-- 记录存在但目标磁盘路径不存在时，仅移除 Registry 记录并返回 `RecordOnly`。
-- `Method::Copy` 仅删除确认是普通目录的目标。
-- `Method::Symlink` 仅删除确认是符号链接的入口，并核对链接目标是否为记录对应的缓存路径。
-- 记录与磁盘实况不一致时返回 `Error::Mismatch`，保留磁盘内容与 Registry 记录。
-- 通过 `symlink_metadata` 检查入口，删除链接本身，不跟随链接进入缓存。
-- 在 `src/core/mod.rs` 声明 `remove` 模块，并在 `src/core/error.rs` 增加 `Mismatch` 错误。
+修改 `src/web/api.rs`（唯一改动文件）：
 
-## 测试
+**路由**（`router()` 追加 4 条）：
+- `GET/POST /api/favorites` → `list_favorites` / `add_favorite`
+- `POST /api/favorites/remove` → `remove_favorite`
+- `POST /api/favorites/install` → `install_favorite`
+- `GET /api/targets` → `list_targets`
 
-按 TDD 执行：
+**5 个 handler**（追加在 `run_update` 之后，逐字采用 brief 代码）：
+- `list_favorites`：registry 加载失败显式 500；成功原样序列化 `reg.favorites` map。
+- `add_favorite`：`parse_source` 失败 → 400；`bookmark` 错误按类型分流——`Error::Msg|BadTarget`（用户输入类）→ 400，其余（clone/IO）→ 500；成功后落盘并返回 `{key, skills:n}`。
+- `remove_favorite`：`resolve_key`/`unbookmark` 失败 → 404；成功落盘后返回 200。
+- `install_favorite`：config 损坏显式 500（与 run_update 同一纪律，绝不回退默认配置）；`resolve_key` 失败 → 404；`Error::Conflict` 且无 `overwrite` → 409 + 路径明细，`overwrite:true` 时先按记录 `remove_install`（无记录则忽略）再重装；`Error::NotBookmarked` → 404；其余 → 500。成功返回 `{installed}`。
+- `list_targets`：config 损坏显式 500；成功返回 `[{name, path}]`。
 
-1. 先加入内联测试并运行 `cargo test remove`，确认因删除 API 和 `Error::Mismatch` 尚未实现而按预期编译失败。
-2. 加入最小实现后运行 `cargo test remove`，6 个测试通过。
-3. 运行 `cargo fmt -- --check`，通过。
-4. 运行 `git diff --check`，通过。
-5. 运行 `cargo test`，53 个测试通过，0 个失败。
+**use 区**：补 `Method`（`FavInstallReq.method` 需要）。
 
-测试覆盖：复制安装删除、符号链接删除且缓存保留、磁盘已手动删除时只清理记录、未知安装、符号链接记录与普通目录实况不匹配时拒绝删除。
+**测试**：追加 brief 给定的 4 个测试 + 2 个辅助函数（`make_local_source`、`post_json`）。
 
-## 审查备注
+## 测试结果（RED/GREEN 证据）
 
-代码审查指出了简报给定实现边界之外的潜在增强项，包括对异常 `metadata` 错误、恶意 Registry 中的技能路径以及 Windows junction 的额外覆盖。本任务按简报要求的签名、行为和实现保持范围不扩展；当前平台测试覆盖 Unix 符号链接路径。
+**RED**（只加测试未实现时，`cargo test web::api`）：
 
-## 结果
+```
+failures:
+    web::api::tests::add_favorite_rejects_bad_source_and_unknown_skill
+    web::api::tests::favorites_api_lifecycle
+    web::api::tests::install_favorite_conflict_then_overwrite
+    web::api::tests::targets_endpoint_lists_configured
+test result: FAILED. 7 passed; 4 failed
+```
 
-任务 8 实现完成，已提交。
+4 个新测试全部 404（路由不存在），与 brief 预期一致。
 
----
+**GREEN**（实现后）：
+- `cargo test web::api`：11 passed; 0 failed（7 既有 + 4 新增）
+- `cargo test`（全量）：127（单元）+ 13（cli_smoke）+ 7（e2e）全绿
+- `cargo clippy --all-targets`：零警告
+- `cargo fmt --check`：通过
 
-## 第 1 轮修复（审查必须修复项）
+关键断言覆盖：收藏整仓返回 `key=local/mysrc, skills=2`；列表含技能描述快照；删单个/删整包/再删 404；坏 source 与未知技能 400；install 首次 200 → 冲突 409 → overwrite 重试 200 → 未收藏 404；targets 列表含 `agents`。
 
-提交：`569a213 fix(core): 加固删除引擎（错误细分+副本所有权标识+junction+记录校验）`
+## 与 brief 的偏差
 
-### 修复内容
+无实质偏差。测试与 handler 代码逐字采用 brief；仅 `cargo fmt` 做了纯格式化重排（闭包换行、`.map_err` 链式缩进），语义不变。
 
-1. **symlink_metadata 错误细分**：仅 `ErrorKind::NotFound` 返回 `RecordOnly` 并清记录；权限/I/O 等其他错误返回 `Error::Io`，记录与磁盘均保留。回归测试用文件充当 target 根目录制造 ENOTDIR 验证（跨平台可复现，不依赖 root 下失效的 chmod 权限位）。
-2. **copy 副本所有权标识**：采用 `.skills-manifest`（而非 `.skills-managed`），与计划任务 15 的约定同名兼容——任务 15 将扩展该文件写入文件名+sha256 清单，本修复写入 `{ "version": 1, "manager": "skills" }` 作为标识。install 在暂存目录写入、随 rename 原子生效；remove 仅当副本内标识为文件时才 `remove_dir_all`，否则 `Error::Mismatch` 并保留目录与记录。**兼容性说明**：修复前安装的旧副本无标识，remove 将拒绝删除并提示 Mismatch，属安全方向的有意行为。
-3. **Windows junction**：`#[cfg(windows)]` 下经 `junction::exists` 识别挂载点，`junction::get_target` 取目标并 canonicalize 规范化后比较（容忍 `\\?\` 前缀）；删除用 `std::fs::remove_dir`（RemoveDirectory 只删 reparse point 本身，不递归缓存源，目录软链接同理由 remove_dir 处理）。junction API 签名已对 docs.rs 核实。**验证策略**：本机仅 Linux 工具链，无法创建 junction；junction 相关代码全部 cfg(windows) 隔离，Linux 编译与全量测试通过，Windows 行为依赖任务 14 的三平台 CI 验证。
-4. **删除前记录校验**：复用 `install::validate_skill_name`（提升为 `pub(crate)`，无第二套逻辑）校验技能名为单一 Normal 组件；`TargetRec::Project.root` 必须为绝对路径。非法记录返回 `Error::Mismatch`（记录损坏），在执行任何磁盘操作前拒绝。
+## 留给审查者的疑虑
 
-### 测试
-
-新增：install 2 项（copy 写入标识、symlink 不写标识），remove 4 项（外部目录替换副本→Mismatch、metadata I/O 错误→记录保留、非法技能名记录→不删磁盘、相对 project root 记录→拒绝）。
-
-- `cargo test remove`：10 passed
-- `cargo test install`：18 passed
-- `cargo test`：59 passed, 0 failed
-- `cargo fmt -- --check`、`git diff --check` 通过
+1. **`add_favorite` 的 400/500 分流依赖错误类型约定**：`Error::Msg` 被整体归为「用户输入类 → 400」，但 `bookmark` 内部 `ensure_cached`/`scan_skills` 的某些 IO 失败若也包装成 `Msg`（如本地源路径不存在时的缓存拷贝失败），会被误报为 400 而非 500。这是 brief 的设计取舍（沿用了 CLI 的错误分类粒度），当前测试未覆盖该边界。
+2. **`install_favorite` 的 overwrite 路径忽略 `remove_install` 错误**（`let _ =`）：与 CLI 覆盖路径语义一致（无记录则忽略），但若 remove 因 `Mismatch`（副本被外部改动）失败而 install 恰好不再冲突，理论上可能留下不一致现场。当前 copy 安装的存在性检查使该路径在实践中安全，测试已锁定 409→overwrite→200 链路。
+3. **`list_targets` 暴露绝对路径**：绑 127.0.0.1 的本地 Web 契约需要路径展示给用户确认落盘位置，属设计意图；若未来绑定地址放开需重新评估。
