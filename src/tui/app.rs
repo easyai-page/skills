@@ -18,9 +18,6 @@ pub enum Action {
     NextView,
     PrevView,
     ToggleAutoUpdate,
-    // 事件循环的 'd' 键接线在下一任务落地，目前仅测试构造此变体
-    // （与 git.rs FailurePoint 的 allow(dead_code) 同一过渡模式）。
-    #[allow(dead_code)]
     DeleteFav,
     Quit,
 }
