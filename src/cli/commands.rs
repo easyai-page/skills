@@ -87,86 +87,38 @@ pub fn run(cli: Cli) -> Result<()> {
             } else {
                 skill
             };
-            let targets: Vec<Target> = if !target.is_empty() {
-                target
-                    .iter()
-                    .map(|s| Target::parse(s))
-                    .collect::<Result<_>>()?
-            } else if global {
-                // -g：装进配置里第一个可用 global target（内置默认下即 agents）
-                vec![default_global_target(&cfg)?]
-            } else {
-                // 默认装进当前项目：<cwd>/.agents/skills（-g 才装全局）
-                vec![Target::Project {
-                    root: std::env::current_dir()?,
-                }]
-            };
-            let method = match method {
-                Some(MethodArg::Copy) => Method::Copy,
-                Some(MethodArg::Symlink) => Method::Symlink,
-                None => cfg.default_method,
-            };
+            let targets = resolve_targets(&target, global, &cfg)?;
+            let method = resolve_method(method, &cfg);
+            // 全部技能名先校验再开工，避免装到一半才报"仓库中无技能"
             for s in &picked {
-                let entry = all
-                    .iter()
-                    .find(|e| &e.name == s)
-                    .ok_or_else(|| Error::Msg(format!("仓库中无技能 {s}")))?;
-                for t in &targets {
-                    let installed = match install::install_skill(
+                if !all.iter().any(|e| &e.name == s) {
+                    return Err(Error::Msg(format!("仓库中无技能 {s}")));
+                }
+            }
+            install_loop(
+                &layout,
+                &cfg,
+                &mut reg,
+                &picked,
+                &targets,
+                method,
+                yes,
+                &|reg: &mut Registry, s: &str, t: &Target| {
+                    let entry = all.iter().find(|e| e.name == s).expect("刚校验过存在");
+                    install::install_skill(
                         &layout,
                         &cfg,
-                        &mut reg,
+                        reg,
                         &spec.key,
                         &entry.name,
                         &entry.rel_path.to_string_lossy(),
                         t,
                         method,
                         &cached.commit,
-                    ) {
-                        Ok(_) => {
-                            println!("已安装 {s} → {t:?} ({method:?})");
-                            true
-                        }
-                        Err(Error::Conflict(p)) => {
-                            if yes {
-                                println!("跳过已存在: {p:?}");
-                                false
-                            } else {
-                                let overwrite = dialoguer::Confirm::new()
-                                    .with_prompt(format!("{p:?} 已存在，覆盖？"))
-                                    .interact()
-                                    .map_err(|e| Error::Msg(e.to_string()))?;
-                                if overwrite {
-                                    let rec = install::to_rec(t);
-                                    let _ =
-                                        remove::remove_install(&layout, &cfg, &mut reg, s, &rec);
-                                    install::install_skill(
-                                        &layout,
-                                        &cfg,
-                                        &mut reg,
-                                        &spec.key,
-                                        &entry.name,
-                                        &entry.rel_path.to_string_lossy(),
-                                        t,
-                                        method,
-                                        &cached.commit,
-                                    )?;
-                                    true
-                                } else {
-                                    false
-                                }
-                            }
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    if installed {
-                        // 逐条落盘（tmp+rename 原子写，代价低）：之后任一技能/目标安装失败
-                        // 或覆盖重装失败而提前返回时，registry 都与磁盘已写入的副本保持一致，
-                        // 不会留下 list/remove 都管不到的孤儿副本。
-                        reg.save(&layout)?;
-                    }
-                }
-            }
+                    )?;
+                    Ok(())
+                },
+            )?;
             reg.save(&layout)
         }
         Some(Cmd::Remove {
@@ -390,8 +342,56 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                     Ok(())
                 }
-                (Some(FavSub::Install { .. }), _) => {
-                    Err(Error::Msg("fav install 尚未实现（下一任务）".into()))
+                (
+                    Some(FavSub::Install {
+                        source,
+                        skill,
+                        target,
+                        global,
+                        method,
+                        yes,
+                    }),
+                    _,
+                ) => {
+                    let key = favorites::resolve_key(&reg, &source)?;
+                    let picked: Vec<String> = if skill.is_empty() {
+                        let fav = &reg.favorites[&key];
+                        if fav.skills.len() == 1 {
+                            vec![fav.skills[0].name.clone()]
+                        } else {
+                            // 从收藏的技能集里选（不重扫全仓）
+                            let names: Vec<String> =
+                                fav.skills.iter().map(|s| s.name.clone()).collect();
+                            let idx = dialoguer::MultiSelect::new()
+                                .with_prompt("选择要安装的技能")
+                                .items(&names)
+                                .interact()
+                                .map_err(|e| Error::Msg(e.to_string()))?;
+                            idx.into_iter().map(|i| names[i].clone()).collect()
+                        }
+                    } else {
+                        skill
+                    };
+                    if picked.is_empty() {
+                        println!("未选择技能，取消安装");
+                        return Ok(());
+                    }
+                    let targets = resolve_targets(&target, global, &cfg)?;
+                    let method = resolve_method(method, &cfg);
+                    install_loop(
+                        &layout,
+                        &cfg,
+                        &mut reg,
+                        &picked,
+                        &targets,
+                        method,
+                        yes,
+                        &|reg: &mut Registry, s: &str, t: &Target| {
+                            favorites::fav_install(&layout, &cfg, reg, &key, s, t, method)?;
+                            Ok(())
+                        },
+                    )?;
+                    reg.save(&layout)
                 }
                 (None, Some(source)) => {
                     let spec = parse_source(&source)?;
@@ -567,6 +567,84 @@ fn run_config(layout: &Layout, sub: &ConfigCmd) -> Result<()> {
             save(&doc)
         }
     }
+}
+
+/// add 与 fav install 共用的目标解析：-t 列表 / -g（配置里第一个 global target）/ 裸默认（当前项目）。
+fn resolve_targets(target: &[String], global: bool, cfg: &Config) -> Result<Vec<Target>> {
+    if !target.is_empty() {
+        return target.iter().map(|s| Target::parse(s)).collect();
+    }
+    if global {
+        // -g：装进配置里第一个可用 global target（内置默认下即 agents）
+        return Ok(vec![default_global_target(cfg)?]);
+    }
+    // 默认装进当前项目：<cwd>/.agents/skills（-g 才装全局）
+    Ok(vec![Target::Project {
+        root: std::env::current_dir()?,
+    }])
+}
+
+fn resolve_method(method: Option<MethodArg>, cfg: &Config) -> Method {
+    match method {
+        Some(MethodArg::Copy) => Method::Copy,
+        Some(MethodArg::Symlink) => Method::Symlink,
+        None => cfg.default_method,
+    }
+}
+
+/// 「逐技能逐目标安装 + Conflict 确认/跳过 + 逐条落盘」循环。
+/// 逐条落盘的原因同 add 原注释：中途失败时 registry 与磁盘已写入的副本保持一致。
+/// install_fn 返回 Ok=装成，Err(Conflict)=走确认，其余 Err 直接中断。
+// 参数即一次安装批次的全部上下文（布局/配置/记录/技能集/目标集/方式/确认/动作），
+// 打包成结构体只是挪位置，与 install_skill 同款保留平铺签名。
+#[allow(clippy::too_many_arguments)]
+fn install_loop(
+    layout: &Layout,
+    cfg: &Config,
+    reg: &mut Registry,
+    picked: &[String],
+    targets: &[Target],
+    method: Method,
+    yes: bool,
+    install_fn: &dyn Fn(&mut Registry, &str, &Target) -> Result<()>,
+) -> Result<()> {
+    for s in picked {
+        for t in targets {
+            let installed = match install_fn(reg, s, t) {
+                Ok(()) => {
+                    println!("已安装 {s} → {t:?} ({method:?})");
+                    true
+                }
+                Err(Error::Conflict(p)) => {
+                    if yes {
+                        println!("跳过已存在: {p:?}");
+                        false
+                    } else {
+                        let overwrite = dialoguer::Confirm::new()
+                            .with_prompt(format!("{p:?} 已存在，覆盖？"))
+                            .interact()
+                            .map_err(|e| Error::Msg(e.to_string()))?;
+                        if overwrite {
+                            let rec = install::to_rec(t);
+                            let _ = remove::remove_install(layout, cfg, reg, s, &rec);
+                            install_fn(reg, s, t)?;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            if installed {
+                // 逐条落盘（tmp+rename 原子写，代价低）：之后任一技能/目标安装失败
+                // 或覆盖重装失败而提前返回时，registry 都与磁盘已写入的副本保持一致，
+                // 不会留下 list/remove 都管不到的孤儿副本。
+                reg.save(layout)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

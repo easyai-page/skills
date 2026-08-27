@@ -254,3 +254,173 @@ fn add_list_remove_symlink_flow() {
         "remove symlink 安装不得触碰缓存"
     );
 }
+
+/// 收藏全链路：整仓收藏 → 两级列表 → 单技能删/补 → 从收藏安装 → 删收藏不影响已安装副本。
+#[test]
+fn favorites_flow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (bare, _work) = fixture_repo(tmp.path());
+    let agents_dir = redirect_agents_target(&home);
+    let url = format!("file://{}", bare.display());
+
+    // 收藏整仓
+    let out = skills(&home).args(["fav", &url]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("已收藏") && stdout.contains("（2 个技能）"),
+        "{stdout}"
+    );
+
+    // 两级列表
+    let out = skills(&home).args(["fav"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("├─ alpha — 技能 alpha"), "{stdout}");
+    assert!(stdout.contains("└─ beta — 技能 beta"), "{stdout}");
+
+    // 从 registry 读真实 source key（file:// 的 key 推导见 source.rs，不硬编码）
+    let key = {
+        let reg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("registry.json")).unwrap())
+                .unwrap();
+        reg["favorites"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone()
+    };
+
+    // 删单个再补回（upsert）
+    skills(&home)
+        .args(["fav", "rm", &key, "--skill", "alpha"])
+        .assert()
+        .success();
+    let out = skills(&home).args(["fav"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("alpha") && stdout.contains("beta"),
+        "{stdout}"
+    );
+    skills(&home)
+        .args(["fav", &url, "--skill", "alpha"])
+        .assert()
+        .success();
+
+    // 从收藏安装：source 给 URL（验证 resolve_key 的规范化路径）
+    skills(&home)
+        .args([
+            "fav",
+            "install",
+            &url,
+            "--skill",
+            "alpha",
+            "-t",
+            "global:agents",
+            "--method",
+            "copy",
+            "-y",
+        ])
+        .assert()
+        .success();
+    assert!(agents_dir.join("alpha/SKILL.md").exists());
+
+    // 收藏与安装是正交记录：删整包收藏，已安装副本原样保留
+    skills(&home).args(["fav", "rm", &key]).assert().success();
+    let out = skills(&home).args(["fav"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("（无收藏）"));
+    assert!(
+        agents_dir.join("alpha/SKILL.md").exists(),
+        "删收藏不得影响已安装副本"
+    );
+    let out = skills(&home).args(["list"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("alpha"));
+}
+
+/// 单技能仓库：二级留空，用途挂在一级行。
+#[test]
+fn favorites_single_skill_repo_display() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("solo-work");
+    let bare = tmp.path().join("solo.git");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        work.join("SKILL.md"),
+        "---\nname: solo\ndescription: 单技能用途\n---\n",
+    )
+    .unwrap();
+    git(&work, &["init", "-b", "main"]);
+    git(&work, &["add", "."]);
+    git(
+        &work,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "c1",
+        ],
+    );
+    git(&work, &["clone", "--bare", ".", bare.to_str().unwrap()]);
+
+    skills(&home)
+        .args(["fav", &format!("file://{}", bare.display())])
+        .assert()
+        .success();
+    let out = skills(&home).args(["fav"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("— 单技能用途"), "{stdout}");
+    assert!(
+        !stdout.contains("├─") && !stdout.contains("└─"),
+        "单技能仓库不得有二级行: {stdout}"
+    );
+}
+
+/// 缓存被手动删除后，fav install 自愈重克隆。
+#[test]
+fn fav_install_heals_missing_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (bare, _work) = fixture_repo(tmp.path());
+    let agents_dir = redirect_agents_target(&home);
+    let url = format!("file://{}", bare.display());
+    skills(&home).args(["fav", &url]).assert().success();
+    let key = {
+        let reg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("registry.json")).unwrap())
+                .unwrap();
+        reg["favorites"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone()
+    };
+    std::fs::remove_dir_all(home.join(&key)).unwrap();
+    skills(&home)
+        .args([
+            "fav",
+            "install",
+            &key,
+            "--skill",
+            "beta",
+            "-t",
+            "global:agents",
+            "--method",
+            "copy",
+            "-y",
+        ])
+        .assert()
+        .success();
+    assert!(agents_dir.join("beta/SKILL.md").exists());
+}

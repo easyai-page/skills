@@ -211,9 +211,10 @@ fn add_global_flag_uses_first_configured_target_and_bare_add_uses_project() {
 }
 
 // ---- 最终审查修复 1：add 中途失败不得留下磁盘/registry 脱节 ----
+// （fav 任务重构后：技能存在性全部校验通过才开工，"仓库中无技能"不再可能发生在安装中途）
 
 #[test]
-fn add_partial_failure_keeps_registry_consistent_with_disk() {
+fn add_unknown_skill_fails_before_any_install() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let agents = tmp.path().join("g/agents");
@@ -229,7 +230,7 @@ fn add_partial_failure_keeps_registry_consistent_with_disk() {
         ],
     );
     let src = make_local_source(tmp.path());
-    // 第二个技能在仓库中不存在：报错前 alpha 已安装落盘
+    // 第二个技能在仓库中不存在：校验前置，alpha 尚未开工即整体报错
     let err = fail(
         &home,
         &[
@@ -247,13 +248,10 @@ fn add_partial_failure_keeps_registry_consistent_with_disk() {
         ],
     );
     assert!(err.contains("ghost"), "{err}");
-    // 磁盘副本已写入，registry 必须同步可见（逐条落盘），否则 list/remove 管不到它
-    assert!(agents.join("alpha/SKILL.md").exists());
+    // 不得留下半截状态：磁盘无副本，registry 无安装记录
+    assert!(!agents.join("alpha").exists(), "校验前置后不得留下半截安装");
     let out = ok(&home, &["list"]);
-    assert!(out.contains("alpha"), "registry 丢失已装副本: {out}");
-    // 脱节副本应能被 remove 正常清掉
-    ok(&home, &["remove", "alpha", "-t", "global:agents"]);
-    assert!(!agents.join("alpha").exists());
+    assert!(out.contains("（无已安装技能）"), "{out}");
 }
 
 // ---- 审查发现 3：update 参数配对与多 skill ----
