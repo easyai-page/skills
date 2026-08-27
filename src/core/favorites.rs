@@ -3,9 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use super::cache;
+use super::config::Config;
 use super::error::{Error, Result};
-use super::paths::Layout;
-use super::registry::{FavSkill, Favorite, Registry, SourceRecord};
+use super::install;
+use super::paths::{Layout, Target};
+use super::registry::{FavSkill, Favorite, Install, Method, Registry, SourceRecord};
 use super::source::SourceSpec;
 
 fn to_fav_skill(e: &cache::SkillEntry) -> FavSkill {
@@ -124,9 +126,96 @@ pub fn is_single_skill_repo(fav: &Favorite) -> bool {
     fav.skills.len() == 1 && fav.skills[0].source_path == Path::new(".")
 }
 
+/// 从收藏安装一个技能：source_path 取自收藏快照（不重扫仓库）。
+/// 缓存缺失时凭快照的 url/local_path 重建 SourceSpec 并 ensure_cached 自愈（仅缺失时）；
+/// 自愈后 HEAD 可能前进，同步刷新 sources 记录与收藏快照的 commit。
+/// Error::Conflict 原样上抛交由前端决策；调用方负责落盘 registry。
+pub fn fav_install(
+    layout: &Layout,
+    cfg: &Config,
+    reg: &mut Registry,
+    source_key: &str,
+    skill: &str,
+    target: &Target,
+    method: Method,
+) -> Result<Install> {
+    let (source_path, url, local_path) = {
+        let fav = reg
+            .favorites
+            .get(source_key)
+            .ok_or_else(|| Error::NotBookmarked(source_key.into()))?;
+        let s = fav
+            .skills
+            .iter()
+            .find(|s| s.name == skill)
+            .ok_or_else(|| Error::NotBookmarked(format!("{source_key} 中无技能 {skill}")))?;
+        (
+            s.source_path.clone(),
+            fav.url.clone(),
+            fav.local_path.clone(),
+        )
+    };
+    // 缓存自愈：git 源以 .git 存在为完整标准，本地源以目录存在为准
+    let cache = layout.cache_dir(source_key);
+    let intact = if url.is_some() {
+        cache.join(".git").is_dir()
+    } else {
+        cache.is_dir()
+    };
+    if !intact {
+        if url.is_none() && local_path.as_ref().is_some_and(|p| !p.is_dir()) {
+            return Err(Error::Msg(format!(
+                "本地源 {} 已不存在，无法重建缓存；请重新 fav 有效路径",
+                local_path.unwrap_or_default().display()
+            )));
+        }
+        let spec = SourceSpec {
+            key: source_key.into(),
+            url,
+            local_path,
+        };
+        let cached = cache::ensure_cached(layout, &spec)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let src = reg
+            .sources
+            .entry(source_key.into())
+            .or_insert(SourceRecord {
+                url: spec.url.clone().unwrap_or_default(),
+                commit: String::new(),
+                fetched_at: now.clone(),
+                auto_update: None,
+            });
+        src.commit = cached.commit.clone();
+        src.fetched_at = now;
+        if let Some(fav) = reg.favorites.get_mut(source_key) {
+            fav.commit = cached.commit.clone();
+        }
+    }
+    let commit = reg
+        .sources
+        .get(source_key)
+        .map(|s| s.commit.clone())
+        .unwrap_or_default();
+    install::install_skill(
+        layout,
+        cfg,
+        reg,
+        source_key,
+        skill,
+        &source_path.to_string_lossy(),
+        target,
+        method,
+        &commit,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::Config;
+    use crate::core::install::COPY_MANIFEST;
+    use crate::core::paths::Target;
+    use crate::core::registry::Method;
     use crate::core::source::parse_source;
 
     /// 本地双技能源（local 源每次 ensure_cached 都重拷，天然离线）
@@ -295,5 +384,144 @@ mod tests {
         let (_t2, layout2, mut reg2, src2) = setup();
         bookmark(&layout2, &mut reg2, &local_spec(&src2), &[]).unwrap();
         assert!(!is_single_skill_repo(&reg2.favorites["local/src"]));
+    }
+
+    /// setup + Config（agents target 指向临时目录），返回可复制安装的环境
+    fn setup_with_cfg() -> (tempfile::TempDir, Layout, Config, Registry, PathBuf) {
+        let (tmp, layout, reg, src) = setup();
+        let mut cfg = Config::default();
+        cfg.targets
+            .insert("agents".into(), tmp.path().join("global/agents"));
+        (tmp, layout, cfg, reg, src)
+    }
+
+    #[test]
+    fn fav_install_installs_from_snapshot() {
+        let (tmp, layout, cfg, mut reg, src) = setup_with_cfg();
+        bookmark(&layout, &mut reg, &local_spec(&src), &[]).unwrap();
+        let rec = fav_install(
+            &layout,
+            &cfg,
+            &mut reg,
+            "local/src",
+            "alpha",
+            &Target::Global {
+                name: "agents".into(),
+            },
+            Method::Copy,
+        )
+        .unwrap();
+        let dest = tmp.path().join("global/agents/alpha");
+        assert!(dest.join("SKILL.md").exists());
+        assert!(dest.join(COPY_MANIFEST).exists(), "copy 副本必须带归属标识");
+        assert_eq!(rec.source, "local/src");
+        assert_eq!(reg.installs.len(), 1);
+    }
+
+    #[test]
+    fn fav_install_unknown_favorite_or_skill_errors() {
+        let (_t, layout, cfg, mut reg, src) = setup_with_cfg();
+        bookmark(&layout, &mut reg, &local_spec(&src), &[]).unwrap();
+        let t = Target::Global {
+            name: "agents".into(),
+        };
+        assert!(matches!(
+            fav_install(
+                &layout,
+                &cfg,
+                &mut reg,
+                "local/nope",
+                "alpha",
+                &t,
+                Method::Copy
+            ),
+            Err(Error::NotBookmarked(_))
+        ));
+        assert!(matches!(
+            fav_install(
+                &layout,
+                &cfg,
+                &mut reg,
+                "local/src",
+                "nope",
+                &t,
+                Method::Copy
+            ),
+            Err(Error::NotBookmarked(_))
+        ));
+        assert!(reg.installs.is_empty());
+    }
+
+    #[test]
+    fn fav_install_heals_missing_cache() {
+        let (tmp, layout, cfg, mut reg, src) = setup_with_cfg();
+        bookmark(&layout, &mut reg, &local_spec(&src), &[]).unwrap();
+        // 缓存被手动删除：fav install 凭快照的 local_path 重建缓存
+        std::fs::remove_dir_all(layout.cache_dir("local/src")).unwrap();
+        fav_install(
+            &layout,
+            &cfg,
+            &mut reg,
+            "local/src",
+            "beta",
+            &Target::Global {
+                name: "agents".into(),
+            },
+            Method::Copy,
+        )
+        .unwrap();
+        assert!(tmp.path().join("global/agents/beta/SKILL.md").exists());
+    }
+
+    #[test]
+    fn fav_install_errors_when_cache_and_local_source_both_gone() {
+        let (_t, layout, cfg, mut reg, src) = setup_with_cfg();
+        bookmark(&layout, &mut reg, &local_spec(&src), &[]).unwrap();
+        std::fs::remove_dir_all(layout.cache_dir("local/src")).unwrap();
+        std::fs::remove_dir_all(&src).unwrap(); // 本地源本身也没了，无法自愈
+        let err = fav_install(
+            &layout,
+            &cfg,
+            &mut reg,
+            "local/src",
+            "alpha",
+            &Target::Global {
+                name: "agents".into(),
+            },
+            Method::Copy,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("本地源"), "{err}");
+        assert!(reg.installs.is_empty());
+    }
+
+    #[test]
+    fn fav_install_conflict_returns_decision_request() {
+        let (_t, layout, cfg, mut reg, src) = setup_with_cfg();
+        bookmark(&layout, &mut reg, &local_spec(&src), &[]).unwrap();
+        let t = Target::Global {
+            name: "agents".into(),
+        };
+        fav_install(
+            &layout,
+            &cfg,
+            &mut reg,
+            "local/src",
+            "alpha",
+            &t,
+            Method::Copy,
+        )
+        .unwrap();
+        let err = fav_install(
+            &layout,
+            &cfg,
+            &mut reg,
+            "local/src",
+            "alpha",
+            &t,
+            Method::Copy,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)), "{err}");
     }
 }
