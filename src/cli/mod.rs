@@ -143,7 +143,7 @@ pub enum FavSub {
         #[arg(short, long)]
         skill: Vec<String>,
     },
-    /// 从收藏安装（Task 5 实现分发，本任务先建结构）
+    /// 从收藏安装（--skill 装指定技能，多技能收藏缺省时交互选择）
     Install {
         source: String,
         #[arg(short, long)]
