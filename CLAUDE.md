@@ -58,5 +58,5 @@ bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包�
 ## 仓库惯例
 
 - 代码注释、commit message、文档一律中文；代码与命名用英文。
-- `docs/superpowers/specs|plans/` 是设计与实现计划文档；根目录 `task-*-report.md` 是子代理开发的任务报告（历史记录，非文档入口）。
+- `docs/superpowers/specs|plans/` 是设计与实现计划文档；`docs/task-reports/task-*.md` 是子代理开发的任务报告（历史记录，非文档入口）。
 - `.agents/skills/` 是本仓库通过本工具自安装的技能集（dogfooding），`.codex/skills` 是指向它的符号链接，不是源码。
