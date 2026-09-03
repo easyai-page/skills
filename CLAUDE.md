@@ -20,7 +20,7 @@ cargo run -- list                  # 本地运行 CLI（子命令：add/list/rem
 bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包（产物在 dist/）
 ```
 
-发版：改 `Cargo.toml` version → 提交 → `git tag vX.Y.Z && git push origin master --tags`，release workflow 自动跑 verify（tag 与 version 一致性）→ 6 平台 build → 发布。故障处置见 `RELEASE.md`。
+发版：改 `Cargo.toml` version → 提交 → `git tag vX.Y.Z && git push origin master --tags`，ci workflow（`ci.yml`，结构与 ssh-tunnel 一致：test 常驻、build/release 仅 tag 触发）自动跑 test → verify（tag 与 version 一致性）→ 6 平台 build → 发布。故障处置见 `RELEASE.md`。
 
 ## 架构
 
@@ -53,7 +53,7 @@ bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包�
 - 单元测试就地 `#[cfg(test)]`；集成测试在 `tests/`，用 `assert_cmd` 跑真实二进制，**靠 `SKILLS_HOME` 环境变量指向临时目录隔离**，fixture 用本地 bare git 仓库（`file://` URL），全程不联网。
 - 失败注入是既有模式：`install.rs` 用线程本地计数/掩码注入 rename、备份清理失败；`git.rs` 用 `FailurePoint` 枚举注入 checkout 各阶段失败。新增原子操作沿用此模式写回归测试。
 - TUI 的安装向导直接操作内存中的 `app.registry`（用户在 TUI 里的未落盘修改不能被磁盘副本覆盖），退出时才落盘；错误路径有意跳过落盘。
-- CI（`ci.yml`）在 ubuntu/macos/windows 三平台跑 `cargo test`，提交前本地至少保证 `cargo test` 全绿。
+- CI（`ci.yml`）在 ubuntu/macos/windows 三平台跑 `cargo test`（带 rust-cache），提交前本地至少保证 `cargo test` 全绿。
 
 ## 仓库惯例
 
