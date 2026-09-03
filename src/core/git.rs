@@ -4,8 +4,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::error::{Error, Result};
 
-fn gerr<E: std::fmt::Display>(e: E) -> Error {
-    Error::Git(e.to_string())
+fn gerr<E: std::error::Error>(e: E) -> Error {
+    // 拼接完整 source 链：gix 很多错误的真正原因藏在底层 source 里，
+    // 只取顶层 to_string() 会只剩一句模糊的概述，无法定位问题
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        msg.push_str(": ");
+        msg.push_str(&s.to_string());
+        source = s.source();
+    }
+    Error::Git(msg)
 }
 
 /// 保持缓存为 depth=1 浅克隆，fetch 时浅边界随远端前移。
