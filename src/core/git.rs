@@ -22,6 +22,14 @@ fn depth_one() -> gix::remote::fetch::Shallow {
     gix::remote::fetch::Shallow::DepthAtRemote(NonZeroU32::new(1).expect("非零"))
 }
 
+/// 打开缓存仓库并关闭 reflog：缓存克隆是内部状态，reflog 没有意义；
+/// 且写 reflog 需要 committer 身份，在未配置 git 身份的机器上（CI、全新服务器）会直接失败。
+fn open_cache_repo(path: &Path) -> Result<gix::Repository> {
+    let mut repo = gix::open(path).map_err(gerr)?;
+    repo.refs.write_reflog = gix::refs::store::WriteReflog::Disable;
+    Ok(repo)
+}
+
 /// 浅克隆 url 到 dest（含工作区 checkout），返回 HEAD commit 全 hash。
 pub fn shallow_clone(url: &str, dest: &Path) -> Result<String> {
     let url = gix::url::parse(url.into()).map_err(gerr)?;
@@ -40,7 +48,7 @@ pub fn shallow_clone(url: &str, dest: &Path) -> Result<String> {
 /// fetch 远端并 hard reset（分支 ref + 索引 + 工作区）到 origin/<当前分支>。
 /// HEAD 有新 commit 返回 Some(hash)，否则 None。
 pub fn fetch_and_reset(path: &Path) -> Result<Option<String>> {
-    let repo = gix::open(path).map_err(gerr)?;
+    let repo = open_cache_repo(path)?;
     let remote = repo
         .find_default_remote(gix::remote::Direction::Fetch)
         .ok_or_else(|| Error::Git("无默认 remote".into()))?
@@ -62,7 +70,7 @@ pub fn fetch_and_reset(path: &Path) -> Result<Option<String>> {
         .map_err(gerr)?;
 
     // fetch 后重新打开，解析本地分支对应的上游 ref
-    let repo = gix::open(path).map_err(gerr)?;
+    let repo = open_cache_repo(path)?;
     let branch = repo
         .head()
         .map_err(gerr)?
@@ -660,6 +668,88 @@ mod tests {
             std::fs::read_to_string(dest.join("new.txt")).unwrap(),
             "new\n"
         );
+    }
+
+    /// 串行化会改动进程环境变量的测试，避免与并行测试互相干扰。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 模拟未配置 git 身份的环境（CI runner、全新服务器）：
+    /// global/system 配置指向空文件，committer/author 环境变量全部移除。
+    struct IdentitylessEnv {
+        saved: Vec<(&'static str, Option<String>)>,
+        _empty_config: tempfile::NamedTempFile,
+    }
+
+    impl IdentitylessEnv {
+        fn new() -> Self {
+            const VARS: [&str; 6] = [
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_SYSTEM",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL",
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+            ];
+            let empty = tempfile::NamedTempFile::new().unwrap();
+            let saved = VARS.map(|k| (k, std::env::var(k).ok())).to_vec();
+            // SAFETY: 由 ENV_LOCK 保证同一时间只有一个测试读写这些环境变量
+            unsafe {
+                std::env::set_var("GIT_CONFIG_GLOBAL", empty.path());
+                std::env::set_var("GIT_CONFIG_SYSTEM", empty.path());
+                for k in &VARS[2..] {
+                    std::env::remove_var(k);
+                }
+            }
+            Self {
+                saved,
+                _empty_config: empty,
+            }
+        }
+    }
+
+    impl Drop for IdentitylessEnv {
+        fn drop(&mut self) {
+            // SAFETY: 同 new()，由 ENV_LOCK 串行化
+            unsafe {
+                for (k, v) in &self.saved {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_and_reset_works_without_git_identity() {
+        // 回归：gix fetch 更新引用时默认写 reflog，而 reflog 需要 committer 身份；
+        // 未配置身份的机器上会直接报错，导致 update 整体失败（CI 上曾稳定复现）。
+        let _serial = ENV_LOCK.lock().unwrap();
+        let _env = IdentitylessEnv::new();
+        let (tmp, work, bare) = make_bare_repo();
+        let dest = tmp.path().join("clone");
+        shallow_clone(&format!("file://{}", bare.display()), &dest).unwrap();
+
+        std::fs::write(work.join("new.txt"), "new\n").unwrap();
+        git(&work, &["add", "new.txt"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "c2",
+            ],
+        );
+        git(&work, &["push", bare.to_str().unwrap(), "main"]);
+
+        fetch_and_reset(&dest)
+            .unwrap()
+            .expect("无 git 身份时也应能 fetch 到新 commit");
     }
 
     #[test]
