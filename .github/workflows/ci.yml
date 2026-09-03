@@ -1,5 +1,9 @@
 name: ci
-on: [push, pull_request]
+# 分支推送与 PR 只跑必要的功能测试；tag 推送的构建发布走 release.yml
+on:
+  push:
+    branches: ['**']
+  pull_request:
 jobs:
   test:
     strategy:

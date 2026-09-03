@@ -42,6 +42,8 @@ jobs:
           - { target: x86_64-apple-darwin,       os: macos-latest,   tool: cargo }
           - { target: aarch64-apple-darwin,      os: macos-latest,   tool: cargo }
           - { target: x86_64-pc-windows-msvc,    os: windows-latest, tool: cargo }
+          # windows-2022 镜像自带 MSVC ARM64 工具集，可直接在 x64 runner 上交叉
+          - { target: aarch64-pc-windows-msvc,   os: windows-latest, tool: cargo }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -75,8 +77,28 @@ jobs:
         shell: bash
         run: |
           cd dist
-          ls -la   # 日志留证：6 个归档齐全
+          ls -la   # 日志留证：7 个归档齐全
           sha256sum -- *.tar.gz *.zip > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" --generate-notes ./*
+          # 中文安装说明 + 自动生成的变更记录拼成 release notes
+          cat > notes.md <<'EOF'
+          ## 安装说明
+
+          每个归档内含二进制和中文安装脚本，解压后运行对应脚本即可：
+
+          | 平台 | 归档 | 安装命令 |
+          |---|---|---|
+          | Linux / macOS | `skills-*-<target>.tar.gz` | `tar xzf <归档> && cd skills-*-<target> && bash install.sh` |
+          | Windows | `skills-*-<target>.zip` | 解压后在目录内运行 `powershell -ExecutionPolicy Bypass -File install.ps1` |
+
+          安装脚本默认把 `skills` 装到 PATH 覆盖的目录（Linux/macOS 为 `/usr/local/bin` 或 `~/.local/bin`，Windows 为 `%LOCALAPPDATA%\Programs\skills` 并自动加入用户 PATH），可用 `--dir` / `-Dir` 自定义。
+
+          校验下载完整性：`sha256sum -c SHA256SUMS`
+
+          ## 更新内容
+
+          EOF
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" --jq .body >> notes.md || true
+          gh release create "$GITHUB_REF_NAME" --notes-file notes.md ./*
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
