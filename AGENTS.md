@@ -17,6 +17,8 @@ cargo test --test cli_smoke        # CLI 冒烟测试
 cargo clippy                       # lint
 cargo fmt                          # 格式化（提交前必跑）
 cargo run -- list                  # 本地运行 CLI（子命令：add/list/remove/update/tag/auto-update/config/fav/tui/ui）
+# add 常用参数：-s <技能>（可多个，'*' 全选）-a/--agent <id>（可多个，'*' 全内置 agent）
+#               --all（全技能+全 agent）-g（全局）-t <agent@global|agent@project:/abs> --method symlink|copy -y
 bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包（产物在 dist/）
 ```
 
@@ -26,14 +28,16 @@ bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包�
 
 **三前端共享一个 core。** `src/main.rs` → `cli::commands::run` 分发；`src/core/` 承载全部业务逻辑，`src/tui/`（ratatui）与 `src/web/`（axum，绑 127.0.0.1，页面是 `src/web/static/index.html` 内嵌单文件）只是薄壳，所有磁盘/git/registry 操作都必须走 core，不在前端另写逻辑。
 
-**核心概念**（详见 `docs/superpowers/specs/2026-08-20-skills-manager-design.md`）：
+**核心概念**（详见 `docs/superpowers/specs/2026-08-20-skills-manager-design.md` 与 `docs/superpowers/specs/2026-09-05-add-wizard-redesign-design.md`）：
 
 - **source（技能包）**：git 仓库或本地目录，缓存到 `$SKILLS_HOME`（默认 `~/.skills/`）下 `<host>/<owner>/<repo>/`（GitHub 归到 `github/`，本地路径归到 `local/`）。缓存按来源去重，已缓存则 `add` 复用、`update` 才刷新；git 缓存一律 depth=1 浅克隆。
 - **skill**：含 `SKILL.md` 的目录，名字取 frontmatter 的 `name`；扫描只认根级或两层目录内、frontmatter 完整（name+description）的条目，非法条目跳过并警告。
-- **target**：`global:<name>`（路径由 config.toml 的 `[targets]` 解析，内置 agents/claude/codex）或 `project:<绝对路径>`（固定装到 `<root>/.agents/skills`）。交互终端下裸 `add` 弹目标多选（默认勾当前项目，空格多选、全不选取消），`-t` 列表或 `-g` 显式指定时不弹；非交互（管道/脚本）保持旧默认装当前项目。
+- **target = agent × scope**（`src/core/paths.rs`）：agent 来自内置注册表（`src/core/agents.rs`，78 条，移植自 vercel-labs/skills 的 agents.ts 数据 + 自加 "agents" universal 条目）或 config.toml 自定义；scope 为 `global`（agent 全局目录）或 `project:<绝对路径>`（装到 `<root>/<agent.project_dir>`，多个 universal agent 共享 `.agents/skills`）。命令行语法 `agent@global` / `agent@project:<abs>`，兼容旧写法 `global:<agent>` / `project:<abs>`（后者 = agents + 项目根）；Display 输出新格式。`config.toml [targets]` 只做覆盖扩展：同名 id 覆盖内置全局路径，新 id = 自定义 agent（仅全局，无项目目录）。
 - **install**：一条「技能 × 目标」记录，方式二选一——`symlink`（默认，指向缓存）或 `copy`（独立副本，根目录带 `.skills-manifest`：sha256 基线，既证明副本归属又用于本地修改检测）。
 
-**状态文件**（都在 `$SKILLS_HOME` 下）：`registry.json`（sources + installs + skill_tags，tmp+rename 原子写）与 `config.toml`（可选，只做覆盖扩展；无配置文件也能工作）。标签绑定 (source, skill)，与安装目标无关；旧版 installs[].tags 加载时自动迁移。
+交互终端下裸 `add` 走四步向导（`src/wizard.rs`，CLI/TUI 共用）：选技能 → 选 agent（多选，检测到的默认勾，未检测到预选 agents）→ 选 scope（项目/全局；所选 agent 均不支持全局时不问，直接项目）→ 选安装方式。显式参数不弹窗：`-s` 选技能（支持 `'*'` 全选）、`-a/--agent` 选 agent（支持 `'*'` 全内置）、`--all` = 全技能 + 全 agent、`-g` 全局、`-t` 直接给 target 列表、`--method` 指定方式；`-y` = 全技能 + 检测到的 agent（无检测 → agents）+ 项目 + 默认方式；非交互（管道/脚本）兜底 = 全技能 + agents + 项目。按 install_dir 去重：同目录的多个 agent 只装一份。空技能包（无可安装技能）先报错不弹窗。
+
+**状态文件**（都在 `$SKILLS_HOME` 下）：`registry.json`（version 3：sources + installs + skill_tags，tmp+rename 原子写；install 的 target 记为 `{"scope":"global","agent":"..."}` / `{"scope":"project","agent":"...","root":"..."}`）与 `config.toml`（可选，只做覆盖扩展；无配置文件也能工作）。**registry v3 不兼容旧版**：v3 起 target 改为 agent×scope 格式，不做迁移——version != 3 直接拒绝加载，提示备份后删除重建（旧记录无法用旧二进制之外的途径自动转换，按提示操作即可）。标签绑定 (source, skill)，与安装目标无关。
 
 **两级更新策略**：包级 `sources[key].auto_update` 控制是否 fetch；copy 副本级 `auto_update` 可覆盖包级（`--inherit` 清除覆盖）；symlink 永远跟随包级。裸 `update` 按策略全量跑；`update <skill> --target <t>` 显式强制更新该副本（参数配对有严格校验，不静默吞参）。
 
