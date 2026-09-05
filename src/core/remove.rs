@@ -36,6 +36,7 @@ pub fn remove_install(
         Err(err) if err.kind() == ErrorKind::NotFound => {
             // 仅 NotFound 视为“磁盘已不存在”→ 只清记录
             reg.remove(&rec.skill, &rec.target);
+            prune_skill_tags(reg, &rec);
             return Ok(RemoveOutcome::RecordOnly);
         }
         // 权限/I/O 等其他错误：保留记录，不动磁盘
@@ -47,7 +48,26 @@ pub fn remove_install(
         Method::Copy => remove_recorded_copy(&dest, &meta, &rec)?,
     }
     reg.remove(&rec.skill, &rec.target);
+    prune_skill_tags(reg, &rec);
     Ok(RemoveOutcome::Removed)
+}
+
+/// 技能的最后一个副本删除后清理其标签：标签只对已安装技能可见、可改
+/// （tag 命令要求已安装），留着就成无法管理的孤儿数据。
+fn prune_skill_tags(reg: &mut Registry, rec: &Install) {
+    if reg
+        .installs
+        .iter()
+        .any(|i| i.source == rec.source && i.skill == rec.skill)
+    {
+        return;
+    }
+    if let Some(skills) = reg.skill_tags.get_mut(&rec.source) {
+        skills.remove(&rec.skill);
+        if skills.is_empty() {
+            reg.skill_tags.remove(&rec.source);
+        }
+    }
 }
 
 /// 删除/更新前校验记录：技能名必须是单一 Normal 组件（复用 install 的校验函数），
@@ -237,6 +257,61 @@ mod tests {
         assert!(reg.installs.is_empty());
     }
 
+    #[test]
+    fn remove_last_install_prunes_skill_tags() {
+        let (_t, layout, cfg, mut reg) = setup_installed(Method::Copy);
+        reg.skill_tags
+            .entry("github/o/r".into())
+            .or_default()
+            .insert("alpha".into(), vec!["t1".into()]);
+        remove_install(
+            &layout,
+            &cfg,
+            &mut reg,
+            "alpha",
+            &TargetRec::Global {
+                name: "agents".into(),
+            },
+        )
+        .unwrap();
+        // 最后一个副本删除后，标签成无法管理的孤儿数据，一并清理
+        assert!(reg.skill_tags.is_empty());
+    }
+
+    #[test]
+    fn remove_keeps_tags_while_other_target_remains() {
+        let (_t, layout, cfg, mut reg) = setup_installed(Method::Copy);
+        // 同技能再装一个 claude 副本
+        reg.installs.push(Install {
+            skill: "alpha".into(),
+            source: "github/o/r".into(),
+            source_path: "skills/alpha".into(),
+            target: TargetRec::Global {
+                name: "claude".into(),
+            },
+            method: Method::Symlink,
+            commit: "c1".into(),
+            auto_update: None,
+            installed_at: "t".into(),
+        });
+        reg.skill_tags
+            .entry("github/o/r".into())
+            .or_default()
+            .insert("alpha".into(), vec!["t1".into()]);
+        remove_install(
+            &layout,
+            &cfg,
+            &mut reg,
+            "alpha",
+            &TargetRec::Global {
+                name: "agents".into(),
+            },
+        )
+        .unwrap();
+        // 技能仍有其他目标副本，标签保留
+        assert_eq!(reg.tags_of("github/o/r", "alpha"), &["t1"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn remove_symlink_only_removes_link_not_cache() {
@@ -302,7 +377,6 @@ mod tests {
             target,
             method: Method::Copy,
             commit: "c1".into(),
-            tags: vec![],
             auto_update: None,
             installed_at: "2026-08-20T10:00:00Z".into(),
         }

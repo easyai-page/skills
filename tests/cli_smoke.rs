@@ -28,13 +28,13 @@ fn fail(home: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8(out.stderr).unwrap()
 }
 
-/// 写入 registry fixture：local/src 包下 alpha（带 tag t1）与 beta 两个 copy 副本 @ global:agents。
+/// 写入 registry fixture：local/src 包下 alpha（带技能级 tag t1）与 beta 两个 copy 副本 @ global:agents。
 fn write_registry_fixture(home: &std::path::Path) {
     std::fs::create_dir_all(home).unwrap();
     std::fs::write(
         home.join("registry.json"),
         r#"{
-  "version": 1,
+  "version": 2,
   "sources": {
     "local/src": {
       "url": "",
@@ -42,6 +42,9 @@ fn write_registry_fixture(home: &std::path::Path) {
       "fetched_at": "2026-08-20T00:00:00Z",
       "auto_update": null
     }
+  },
+  "skill_tags": {
+    "local/src": {"alpha": ["t1"]}
   },
   "installs": [
     {
@@ -51,7 +54,6 @@ fn write_registry_fixture(home: &std::path::Path) {
       "target": {"kind": "global", "name": "agents"},
       "method": "copy",
       "commit": "c1",
-      "tags": ["t1"],
       "auto_update": null,
       "installed_at": "2026-08-20T00:00:00Z"
     },
@@ -62,7 +64,6 @@ fn write_registry_fixture(home: &std::path::Path) {
       "target": {"kind": "global", "name": "agents"},
       "method": "copy",
       "commit": "c1",
-      "tags": [],
       "auto_update": null,
       "installed_at": "2026-08-20T00:00:00Z"
     }
@@ -113,6 +114,66 @@ fn help_lists_all_subcommands() {
 fn list_on_empty_layout_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     ok(tmp.path(), &["list"]);
+}
+
+// ---- tag：标签绑定 (source, skill)，与安装目标无关 ----
+
+#[test]
+fn tag_command_binds_to_skill_and_list_filters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_registry_fixture(home);
+    // 打标签不需要 --target
+    ok(home, &["tag", "beta", "t2"]);
+    // list --tag 按技能级标签过滤
+    let out = ok(home, &["list", "--tag", "t2"]);
+    assert!(out.contains("beta"), "{out}");
+    assert!(!out.contains("alpha"), "{out}");
+    // list 输出展示技能级标签
+    let out = ok(home, &["list"]);
+    assert!(out.contains("t1"), "{out}");
+    // --remove 清空
+    ok(home, &["tag", "alpha", "--remove"]);
+    let out = ok(home, &["list"]);
+    assert!(!out.contains("t1"), "{out}");
+    // 未安装技能报错
+    fail(home, &["tag", "ghost", "t9"]);
+}
+
+#[test]
+fn tag_command_requires_source_when_skill_name_ambiguous() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home).unwrap();
+    // 同名 alpha 来自两个来源
+    std::fs::write(
+        home.join("registry.json"),
+        r#"{
+  "version": 2,
+  "sources": {},
+  "installs": [
+    {"skill":"alpha","source":"local/a","source_path":"skills/alpha","target":{"kind":"global","name":"agents"},"method":"copy","commit":"c1","auto_update":null,"installed_at":"t"},
+    {"skill":"alpha","source":"local/b","source_path":"skills/alpha","target":{"kind":"global","name":"agents"},"method":"copy","commit":"c1","auto_update":null,"installed_at":"t"}
+  ]
+}"#,
+    )
+    .unwrap();
+    // 裸技能名歧义：报错提示 --source
+    let err = fail(home, &["tag", "alpha", "t1"]);
+    assert!(err.contains("--source"), "{err}");
+    // 显式 --source 正常写入
+    ok(home, &["tag", "alpha", "t1", "--source", "local/b"]);
+    let raw = std::fs::read_to_string(home.join("registry.json")).unwrap();
+    let reg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        reg["skill_tags"]["local/b"]["alpha"],
+        serde_json::json!(["t1"])
+    );
+    assert!(
+        reg["skill_tags"].get("local/a").is_none()
+            || reg["skill_tags"]["local/a"].get("alpha").is_none(),
+        "{raw}"
+    );
 }
 
 // ---- 审查发现 1：config 自愈与写入前校验 ----

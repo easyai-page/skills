@@ -62,12 +62,13 @@ pub enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// 分类管理（只写 registry.json）
+    /// 分类管理（只写 registry.json）；标签绑定技能本身，与安装目标无关
     Tag {
         skill: String,
         tags: Vec<String>,
+        /// 同名技能来自多个来源时用于消歧
         #[arg(short, long)]
-        target: String,
+        source: Option<String>,
         #[arg(long)]
         remove: bool,
     },

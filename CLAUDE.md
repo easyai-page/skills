@@ -33,7 +33,7 @@ bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包�
 - **target**：`global:<name>`（路径由 config.toml 的 `[targets]` 解析，内置 agents/claude/codex）或 `project:<绝对路径>`（固定装到 `<root>/.agents/skills`）。裸 `add` 默认装当前项目，`-g` 才装全局。
 - **install**：一条「技能 × 目标」记录，方式二选一——`symlink`（默认，指向缓存）或 `copy`（独立副本，根目录带 `.skills-manifest`：sha256 基线，既证明副本归属又用于本地修改检测）。
 
-**状态文件**（都在 `$SKILLS_HOME` 下）：`registry.json`（sources + installs，tmp+rename 原子写）与 `config.toml`（可选，只做覆盖扩展；无配置文件也能工作）。
+**状态文件**（都在 `$SKILLS_HOME` 下）：`registry.json`（sources + installs + skill_tags，tmp+rename 原子写）与 `config.toml`（可选，只做覆盖扩展；无配置文件也能工作）。标签绑定 (source, skill)，与安装目标无关；旧版 installs[].tags 加载时自动迁移。
 
 **两级更新策略**：包级 `sources[key].auto_update` 控制是否 fetch；copy 副本级 `auto_update` 可覆盖包级（`--inherit` 清除覆盖）；symlink 永远跟随包级。裸 `update` 按策略全量跑；`update <skill> --target <t>` 显式强制更新该副本（参数配对有严格校验，不静默吞参）。
 

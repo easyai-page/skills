@@ -38,7 +38,7 @@ pub fn draw(f: &mut Frame, app: &AppState) {
                     Cell::from(r.skill.clone()),
                     Cell::from(format!("{:?}", r.method)),
                     Cell::from(format!("{:?}", r.target)),
-                    Cell::from(r.tags.join(",")),
+                    Cell::from(app.registry.tags_of(&r.source, &r.skill).join(",")),
                     Cell::from(match r.auto_update {
                         Some(true) => "开",
                         Some(false) => "关",
@@ -179,10 +179,13 @@ mod tests {
             },
             method: Method::Copy,
             commit: "c1".into(),
-            tags: vec!["frontend".into()],
             auto_update: Some(true),
             installed_at: "t".into(),
         });
+        reg.skill_tags
+            .entry("github/o/r".into())
+            .or_default()
+            .insert("web-design".into(), vec!["frontend".into()]);
         reg.sources.insert(
             "github/o/r".into(),
             SourceRecord {

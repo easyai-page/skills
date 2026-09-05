@@ -37,8 +37,6 @@ pub struct Install {
     pub method: Method,
     pub commit: String,
     #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
     pub auto_update: Option<bool>,
     pub installed_at: String,
 }
@@ -86,6 +84,10 @@ pub struct Registry {
     // 收藏不代表已安装，后续 bookmark/fav install 只读写这一段
     #[serde(default)]
     pub favorites: BTreeMap<String, Favorite>,
+    // 技能级标签：source → skill → tags。标签是技能的固有属性，与装到哪个目标
+    // 无关，不存 install 记录；旧版 installs[].tags 在 load 时迁移至此
+    #[serde(default)]
+    pub skill_tags: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 impl Registry {
@@ -93,12 +95,39 @@ impl Registry {
         let path = layout.registry_path();
         if !path.exists() {
             return Ok(Registry {
-                version: 1,
+                version: 2,
                 ..Default::default()
             });
         }
         let raw = std::fs::read_to_string(&path)?;
-        Ok(serde_json::from_str(&raw)?)
+        let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+        let legacy = take_legacy_install_tags(&mut value);
+        let mut reg: Registry = serde_json::from_value(value)?;
+        // 旧版按副本存的标签并入技能级：同 (source, skill) 多副本取并集去重
+        for (source, skill, tags) in legacy {
+            let entry = reg
+                .skill_tags
+                .entry(source)
+                .or_default()
+                .entry(skill)
+                .or_default();
+            for t in tags {
+                if !entry.contains(&t) {
+                    entry.push(t);
+                }
+            }
+        }
+        reg.version = 2;
+        Ok(reg)
+    }
+
+    /// 技能级标签查询：绑定 (source, skill)，与安装目标无关；无标签返回空切片
+    pub fn tags_of(&self, source: &str, skill: &str) -> &[String] {
+        self.skill_tags
+            .get(source)
+            .and_then(|m| m.get(skill))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn save(&self, layout: &Layout) -> Result<()> {
@@ -127,6 +156,41 @@ impl Registry {
     }
 }
 
+/// 旧版（version 1）标签存在 installs[].tags 上（按副本）；从 JSON 中摘除该字段，
+/// 返回 (source, skill, tags) 列表，由 load 并入技能级 skill_tags。
+fn take_legacy_install_tags(value: &mut serde_json::Value) -> Vec<(String, String, Vec<String>)> {
+    let mut out = Vec::new();
+    let Some(installs) = value.get_mut("installs").and_then(|v| v.as_array_mut()) else {
+        return out;
+    };
+    for inst in installs {
+        let Some(obj) = inst.as_object_mut() else {
+            continue;
+        };
+        let Some(tags) = obj.remove("tags") else {
+            continue;
+        };
+        let (Some(source), Some(skill)) = (
+            obj.get("source").and_then(|v| v.as_str()),
+            obj.get("skill").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let tags: Vec<String> = tags
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !tags.is_empty() {
+            out.push((source.to_string(), skill.to_string(), tags));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,7 +206,6 @@ mod tests {
             },
             method: Method::Copy,
             commit: "a1b2c3d".into(),
-            tags: vec!["frontend".into()],
             auto_update: None,
             installed_at: "2026-08-20T10:00:00Z".into(),
         }
@@ -207,6 +270,53 @@ mod tests {
         let removed = reg.remove("web-design", &t);
         assert!(removed.is_some());
         assert!(reg.installs.is_empty());
+    }
+
+    #[test]
+    fn skill_tags_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::at(tmp.path().to_path_buf());
+        let mut reg = Registry {
+            version: 2,
+            ..Default::default()
+        };
+        reg.skill_tags
+            .entry("github/o/r".into())
+            .or_default()
+            .insert("a".into(), vec!["frontend".into()]);
+        reg.save(&layout).unwrap();
+        let loaded = Registry::load(&layout).unwrap();
+        assert_eq!(loaded.tags_of("github/o/r", "a"), &["frontend"]);
+        assert!(loaded.tags_of("github/o/r", "b").is_empty());
+        assert!(loaded.tags_of("github/x/y", "a").is_empty());
+    }
+
+    #[test]
+    fn legacy_install_tags_migrate_to_skill_tags() {
+        // 旧版（version 1）标签挂在 installs[].tags 上，按副本存；
+        // 加载时迁移为技能级 skill_tags（同技能多副本取并集去重）
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::at(tmp.path().to_path_buf());
+        std::fs::write(
+            layout.registry_path(),
+            r#"{
+  "version": 1,
+  "sources": {},
+  "installs": [
+    {"skill":"a","source":"github/o/r","source_path":"skills/a","target":{"kind":"global","name":"agents"},"method":"copy","commit":"c1","tags":["frontend","ui"],"auto_update":null,"installed_at":"t"},
+    {"skill":"a","source":"github/o/r","source_path":"skills/a","target":{"kind":"global","name":"claude"},"method":"symlink","commit":"c1","tags":["ui"],"auto_update":null,"installed_at":"t"}
+  ]
+}"#,
+        )
+        .unwrap();
+        let reg = Registry::load(&layout).unwrap();
+        assert_eq!(reg.tags_of("github/o/r", "a"), &["frontend", "ui"]);
+        assert_eq!(reg.version, 2);
+        // 迁移后落盘：installs 不再携带 tags，skill_tags 段存在
+        reg.save(&layout).unwrap();
+        let raw = std::fs::read_to_string(layout.registry_path()).unwrap();
+        assert!(raw.contains("\"skill_tags\""));
+        assert!(!raw.contains("\"tags\""));
     }
 
     #[test]

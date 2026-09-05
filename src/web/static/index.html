@@ -71,7 +71,7 @@ function renderInstalls(installs) {
 
     const tagInput = document.createElement('input');
     tagInput.value = i.tags.join(',');
-    tagInput.addEventListener('change', () => setTags(i.skill, i.target.kind, targetRef(i), tagInput.value));
+    tagInput.addEventListener('change', () => setTags(i.skill, i.source, tagInput.value));
     cell(tr, tagInput);
 
     if (i.method === 'copy') {
@@ -262,9 +262,9 @@ async function setSourceAU(key, v) {
   await api('auto-update', {method:'POST', headers:{'content-type':'application/json'},
     body: JSON.stringify({source: key, value: v})});
 }
-async function setTags(skill, kind, ref, v) {
+async function setTags(skill, source, v) {
   await api('tags', {method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({skill, target: targetBody(kind, ref), tags: v.split(',').map(s=>s.trim()).filter(Boolean)})});
+    body: JSON.stringify({skill, source, tags: v.split(',').map(s=>s.trim()).filter(Boolean)})});
 }
 async function rm(skill, kind, ref) {
   if (!confirm(`删除 ${skill}？`)) return;

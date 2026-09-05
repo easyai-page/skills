@@ -35,7 +35,11 @@ pub fn run(cli: Cli) -> Result<()> {
             let rows: Vec<_> = reg
                 .installs
                 .iter()
-                .filter(|i| tag.as_ref().map(|t| i.tags.contains(t)).unwrap_or(true))
+                .filter(|i| {
+                    tag.as_ref()
+                        .map(|t| reg.tags_of(&i.source, &i.skill).contains(t))
+                        .unwrap_or(true)
+                })
                 .filter(|i| match &t {
                     Some(t) => install::to_rec(t) == i.target,
                     None => !global || matches!(i.target, TargetRec::Global { .. }),
@@ -47,7 +51,11 @@ pub fn run(cli: Cli) -> Result<()> {
             for i in rows {
                 println!(
                     "{}\t{:?}\t{:?}\ttags={:?}\tauto_update={:?}",
-                    i.skill, i.method, i.target, i.tags, i.auto_update
+                    i.skill,
+                    i.method,
+                    i.target,
+                    reg.tags_of(&i.source, &i.skill),
+                    i.auto_update
                 );
             }
             Ok(())
@@ -273,13 +281,13 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Tag {
             skill,
             tags: new_tags,
-            target,
+            source,
             remove,
         }) => {
             let mut reg = Registry::load(&layout)?;
-            let rec = install::to_rec(&Target::parse(&target)?);
+            let src = resolve_tag_source(&reg, &skill, source)?;
             let final_tags = if remove { vec![] } else { new_tags };
-            tags::set_tags(&mut reg, &skill, &rec, final_tags)?;
+            tags::set_tags(&mut reg, &src, &skill, final_tags)?;
             reg.save(&layout)
         }
         Some(Cmd::AutoUpdate {
@@ -437,6 +445,36 @@ fn scalar(value: &str) -> toml::Value {
         return toml::Value::Boolean(b);
     }
     toml::Value::String(value.to_string())
+}
+
+/// tag 命令的来源解析：标签绑定 (source, skill)，裸技能名只在来源唯一时可用，
+/// 多来源同名技能必须显式 --source，不做隐晦的"取第一个"。
+fn resolve_tag_source(reg: &Registry, skill: &str, source: Option<String>) -> Result<String> {
+    let mut sources: Vec<&str> = reg
+        .installs
+        .iter()
+        .filter(|i| i.skill == skill)
+        .map(|i| i.source.as_str())
+        .collect();
+    sources.sort();
+    sources.dedup();
+    match source {
+        Some(s) => {
+            if sources.contains(&s.as_str()) {
+                Ok(s)
+            } else {
+                Err(Error::NotInstalled(format!("{skill}（来源 {s}）")))
+            }
+        }
+        None => match sources[..] {
+            [] => Err(Error::NotInstalled(skill.into())),
+            [one] => Ok(one.to_string()),
+            _ => Err(Error::Msg(format!(
+                "技能 {skill} 来自多个来源（{}），请用 --source 指定",
+                sources.join(", ")
+            ))),
+        },
+    }
 }
 
 /// config set 对已知标量键做写入前校验：非法值直接拒绝，

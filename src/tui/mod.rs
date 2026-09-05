@@ -375,7 +375,6 @@ mod tests {
             },
             method: Method::Copy,
             commit: "c1".into(),
-            tags: vec![],
             auto_update: None,
             installed_at: "t".into(),
         });

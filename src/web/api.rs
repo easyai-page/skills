@@ -55,7 +55,14 @@ type S = State<Arc<Mutex<AppState>>>;
 async fn list_installs(State(s): S) -> Json<serde_json::Value> {
     let s = s.lock().unwrap();
     let reg = Registry::load(&s.layout).unwrap_or_default();
-    Json(serde_json::json!(reg.installs))
+    // 标签是技能级数据，不在 install 记录上；为前端展示注入每条 install 的 tags 字段
+    let mut installs = serde_json::to_value(&reg.installs).unwrap_or_default();
+    if let Some(arr) = installs.as_array_mut() {
+        for (jv, inst) in arr.iter_mut().zip(&reg.installs) {
+            jv["tags"] = serde_json::json!(reg.tags_of(&inst.source, &inst.skill));
+        }
+    }
+    Json(installs)
 }
 
 async fn list_sources(State(s): S) -> Json<serde_json::Value> {
@@ -105,7 +112,7 @@ async fn set_auto_update(State(s): S, Json(req): Json<AutoUpdateReq>) -> StatusC
 #[derive(serde::Deserialize)]
 struct TagsReq {
     skill: String,
-    target: TargetRec,
+    source: String,
     tags: Vec<String>,
 }
 
@@ -115,7 +122,7 @@ async fn set_tags(State(s): S, Json(req): Json<TagsReq>) -> StatusCode {
         Ok(r) => r,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
-    match crate::core::tags::set_tags(&mut reg, &req.skill, &req.target, req.tags) {
+    match crate::core::tags::set_tags(&mut reg, &req.source, &req.skill, req.tags) {
         Ok(_) => match reg.save(&s.layout) {
             Ok(_) => StatusCode::OK,
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -389,10 +396,13 @@ mod tests {
             },
             method: Method::Copy,
             commit: "c1".into(),
-            tags: vec!["frontend".into()],
             auto_update: None,
             installed_at: "t".into(),
         });
+        reg.skill_tags
+            .entry("github/o/r".into())
+            .or_default()
+            .insert("alpha".into(), vec!["frontend".into()]);
         reg.save(&layout).unwrap();
         AppState { layout, tmp }
     }
@@ -446,6 +456,37 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let reg = Registry::load(&Layout::at(layout_root)).unwrap();
         assert_eq!(reg.installs[0].auto_update, Some(true));
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn set_tags_binds_to_source_skill() {
+        let state = test_state();
+        let layout_root = state.layout.root.clone();
+        let keep = state.tmp.clone();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/tags")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "skill": "alpha",
+                            "source": "github/o/r",
+                            "tags": ["backend"]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let reg = Registry::load(&Layout::at(layout_root)).unwrap();
+        // 覆盖式写入技能级标签，原有 frontend 被替换
+        assert_eq!(reg.tags_of("github/o/r", "alpha"), &["backend"]);
         drop(keep);
     }
 

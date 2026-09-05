@@ -55,7 +55,6 @@ pub fn install_skill(
         target: to_rec(target),
         method,
         commit: commit.into(),
-        tags: vec![],
         auto_update: None,
         installed_at: chrono::Utc::now().to_rfc3339(),
     };

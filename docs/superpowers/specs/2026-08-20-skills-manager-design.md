@@ -40,7 +40,7 @@
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "sources": {
     "github/mattpocock/skills": {
       "url": "https://github.com/mattpocock/skills",
@@ -48,6 +48,11 @@
       "fetched_at": "2026-08-20T10:00:00Z",
       "auto_update": true            // 包级开关（可选）
     }
+  },
+  "skill_tags": {
+    // 技能级标签：source → skill → 分类。标签是技能的固有属性，
+    // 与装到哪个目标无关；技能的最后一个副本删除时清理
+    "github/mattpocock/skills": { "A": ["frontend"] }
   },
   "installs": [
     {
@@ -58,13 +63,14 @@
       //  或 { "kind": "project", "root": "/abs/path/work" }    // → work/.agents/skills/A
       "method": "copy",
       "commit": "a1b2c3d",           // 安装时版本
-      "tags": ["frontend"],          // 用户自定义分类
       "auto_update": false,          // 副本级开关（可选，缺省跟随包级）
       "installed_at": "..."
     }
   ]
 }
 ```
+
+version 1 的旧文件（标签挂在 installs[].tags 上）加载时自动迁移：同 (source, skill) 多副本的标签取并集并入 skill_tags，落盘即 v2。
 
 registry 写入用临时文件 + rename 原子替换，避免中途失败写脏数据。
 
@@ -88,7 +94,7 @@ registry 写入用临时文件 + rename 原子替换，避免中途失败写脏�
 | `skills list`（ls） | 列出已安装技能 | `--tag`、`--target`、`-g` |
 | `skills remove [skills]` | 按记录删除并核实磁盘实况 | `-t`、`--tag`、`-y` |
 | `skills update [skills]` | 按两级更新模型执行 | `--all`、`-t`、`-s`、`--dry-run` |
-| `skills tag <skill> <tags...>` | 分类管理 | `--remove`、`-t` |
+| `skills tag <skill> <tags...>` | 分类管理（绑定 (source, skill)，与安装目标无关） | `--remove`、`-s/--source`（同名技能多来源时消歧） |
 | `skills auto-update ...` | 升级策略，**只写 registry.json** | `--target`、`-s/--source`、`--on/--off/--inherit` |
 | `skills config ...` | 全局配置，**只写 config.toml** | `get`/`set`/`targets add\|remove` |
 | `skills tui` | 进入 TUI（裸跑 `skills` 同效） | |

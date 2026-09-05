@@ -267,7 +267,6 @@ mod tests {
                 },
                 method,
                 commit: "c1".into(),
-                tags: vec![],
                 auto_update: auto,
                 installed_at: "2026-08-20T00:00:00Z".into(),
             });
