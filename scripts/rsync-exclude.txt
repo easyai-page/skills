@@ -1,0 +1,6 @@
+# rsync 同步到测试机时排除的路径（AGENTS.md 测试机验证工作流引用）
+# 用法：rsync -a --exclude-from=scripts/rsync-exclude.txt ./ <远端>
+/target/
+/.git/
+/dist/
+/stage/
