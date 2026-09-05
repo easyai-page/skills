@@ -30,7 +30,7 @@ bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包�
 
 - **source（技能包）**：git 仓库或本地目录，缓存到 `$SKILLS_HOME`（默认 `~/.skills/`）下 `<host>/<owner>/<repo>/`（GitHub 归到 `github/`，本地路径归到 `local/`）。缓存按来源去重，已缓存则 `add` 复用、`update` 才刷新；git 缓存一律 depth=1 浅克隆。
 - **skill**：含 `SKILL.md` 的目录，名字取 frontmatter 的 `name`；扫描只认根级或两层目录内、frontmatter 完整（name+description）的条目，非法条目跳过并警告。
-- **target**：`global:<name>`（路径由 config.toml 的 `[targets]` 解析，内置 agents/claude/codex）或 `project:<绝对路径>`（固定装到 `<root>/.agents/skills`）。裸 `add` 默认装当前项目，`-g` 才装全局。
+- **target**：`global:<name>`（路径由 config.toml 的 `[targets]` 解析，内置 agents/claude/codex）或 `project:<绝对路径>`（固定装到 `<root>/.agents/skills`）。交互终端下裸 `add` 弹目标多选（默认勾当前项目，空格多选、全不选取消），`-t` 列表或 `-g` 显式指定时不弹；非交互（管道/脚本）保持旧默认装当前项目。
 - **install**：一条「技能 × 目标」记录，方式二选一——`symlink`（默认，指向缓存）或 `copy`（独立副本，根目录带 `.skills-manifest`：sha256 基线，既证明副本归属又用于本地修改检测）。
 
 **状态文件**（都在 `$SKILLS_HOME` 下）：`registry.json`（sources + installs + skill_tags，tmp+rename 原子写）与 `config.toml`（可选，只做覆盖扩展；无配置文件也能工作）。标签绑定 (source, skill)，与安装目标无关；旧版 installs[].tags 加载时自动迁移。

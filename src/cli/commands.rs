@@ -10,6 +10,7 @@ use crate::core::{
     source::parse_source,
     tags, update,
 };
+use std::io::IsTerminal;
 
 pub fn run(cli: Cli) -> Result<()> {
     let layout = Layout::new()?;
@@ -96,6 +97,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 skill
             };
             let targets = resolve_targets(&target, global, &cfg)?;
+            if targets.is_empty() {
+                println!("未选择目标，取消安装");
+                return Ok(());
+            }
             let method = resolve_method(method, &cfg);
             // 全部技能名先校验再开工，避免装到一半才报"仓库中无技能"
             for s in &picked {
@@ -385,6 +390,10 @@ pub fn run(cli: Cli) -> Result<()> {
                         return Ok(());
                     }
                     let targets = resolve_targets(&target, global, &cfg)?;
+                    if targets.is_empty() {
+                        println!("未选择目标，取消安装");
+                        return Ok(());
+                    }
                     let method = resolve_method(method, &cfg);
                     install_loop(
                         &layout,
@@ -607,7 +616,9 @@ fn run_config(layout: &Layout, sub: &ConfigCmd) -> Result<()> {
     }
 }
 
-/// add 与 fav install 共用的目标解析：-t 列表 / -g（配置里第一个 global target）/ 裸默认（当前项目）。
+/// add 与 fav install 共用的目标解析：-t 列表 / -g（配置里第一个 global target）/
+/// 交互终端裸跑弹多选（默认勾当前项目）/ 非交互裸默认（当前项目，兼容脚本与测试）。
+/// 返回空列表 = 用户在多选里一个都没选，调用方视为取消安装。
 fn resolve_targets(target: &[String], global: bool, cfg: &Config) -> Result<Vec<Target>> {
     if !target.is_empty() {
         return target.iter().map(|s| Target::parse(s)).collect();
@@ -616,10 +627,38 @@ fn resolve_targets(target: &[String], global: bool, cfg: &Config) -> Result<Vec<
         // -g：装进配置里第一个可用 global target（内置默认下即 agents）
         return Ok(vec![default_global_target(cfg)?]);
     }
-    // 默认装进当前项目：<cwd>/.agents/skills（-g 才装全局）
+    if std::io::stdin().is_terminal() {
+        return pick_targets_interactive(cfg);
+    }
+    // 非交互（管道/脚本/测试）保持旧默认：装进当前项目 <cwd>/.agents/skills
     Ok(vec![Target::Project {
         root: std::env::current_dir()?,
     }])
+}
+
+/// 交互式目标多选：配置的 global targets + 当前项目（默认勾当前项目，
+/// 直接回车 = 旧的裸 add 默认行为）。空格切换、回车确认；全不选返回空（取消）。
+fn pick_targets_interactive(cfg: &Config) -> Result<Vec<Target>> {
+    let cwd = std::env::current_dir()?;
+    let mut targets: Vec<(String, Target)> = cfg
+        .targets
+        .keys()
+        .map(|n| (format!("global:{n}"), Target::Global { name: n.clone() }))
+        .collect();
+    let mut defaults = vec![false; targets.len()];
+    targets.push((
+        format!("project:{}", cwd.display()),
+        Target::Project { root: cwd },
+    ));
+    defaults.push(true); // 默认勾当前项目，与裸 add 旧默认一致
+    let labels: Vec<&str> = targets.iter().map(|(l, _)| l.as_str()).collect();
+    let idx = dialoguer::MultiSelect::new()
+        .with_prompt("安装到目标（空格多选，回车确认）")
+        .items(&labels)
+        .defaults(&defaults)
+        .interact()
+        .map_err(|e| Error::Msg(e.to_string()))?;
+    Ok(idx.into_iter().map(|i| targets[i].1.clone()).collect())
 }
 
 fn resolve_method(method: Option<MethodArg>, cfg: &Config) -> Method {
