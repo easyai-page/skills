@@ -105,12 +105,13 @@ async fn scan_source(
 struct InstallReq {
     source: String,
     skills: Vec<String>,
-    target: TargetRec,
+    targets: Vec<TargetRec>,
     method: Option<Method>,
     overwrite: Option<bool>,
 }
 
-/// 从仓库批量安装选中的技能。技能存在性校验前置（任一不存在即整体 400，同 CLI add）；
+/// 从仓库批量安装选中的技能，可指定一个或多个目标（技能 × 目标逐个安装）。
+/// 技能存在性校验前置（任一不存在即整体 400，同 CLI add）；
 /// 逐条安装逐条落盘（同 CLI install_loop：中途失败不留孤儿副本）；
 /// 目标已存在 → 409 + 明细，前端确认后带 overwrite=true 重试（同 favorites/install 确认链）。
 async fn install_from_source(
@@ -140,12 +141,14 @@ async fn install_from_source(
     if req.skills.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "未选择技能".into()));
     }
+    if req.targets.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "未选择目标".into()));
+    }
     for name in &req.skills {
         if !all.iter().any(|e| &e.name == name) {
             return Err((StatusCode::BAD_REQUEST, format!("仓库中无技能 {name}")));
         }
     }
-    let target = req.target.to_target();
     let method = req.method.unwrap_or(cfg.default_method);
     let overwrite = req.overwrite.unwrap_or(false);
     reg.sources
@@ -159,64 +162,62 @@ async fn install_from_source(
     let mut installed = Vec::new();
     for name in &req.skills {
         let entry = all.iter().find(|e| &e.name == name).expect("刚校验过存在");
-        let result = crate::core::install::install_skill(
-            &s.layout,
-            &cfg,
-            &mut reg,
-            &spec.key,
-            &entry.name,
-            &entry.rel_path.to_string_lossy(),
-            &target,
-            method,
-            &cached.commit,
-        );
-        match result {
-            Ok(_) => {}
-            Err(crate::core::error::Error::Conflict(p)) => {
-                if !overwrite {
-                    return Err((StatusCode::CONFLICT, format!("{p:?} 已存在")));
-                }
-                // 与 CLI 的覆盖路径一致：先按记录删（无记录则忽略），再重装
-                let _ = crate::core::remove::remove_install(
-                    &s.layout,
-                    &cfg,
-                    &mut reg,
-                    name,
-                    &req.target,
-                );
-                crate::core::install::install_skill(
-                    &s.layout,
-                    &cfg,
-                    &mut reg,
-                    &spec.key,
-                    &entry.name,
-                    &entry.rel_path.to_string_lossy(),
-                    &target,
-                    method,
-                    &cached.commit,
-                )
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("覆盖安装 {name} 失败: {e}"),
+        for trec in &req.targets {
+            let target = trec.to_target();
+            let result = crate::core::install::install_skill(
+                &s.layout,
+                &cfg,
+                &mut reg,
+                &spec.key,
+                &entry.name,
+                &entry.rel_path.to_string_lossy(),
+                &target,
+                method,
+                &cached.commit,
+            );
+            match result {
+                Ok(_) => {}
+                Err(crate::core::error::Error::Conflict(p)) => {
+                    if !overwrite {
+                        return Err((StatusCode::CONFLICT, format!("{p:?} 已存在")));
+                    }
+                    // 与 CLI 的覆盖路径一致：先按记录删（无记录则忽略），再重装
+                    let _ =
+                        crate::core::remove::remove_install(&s.layout, &cfg, &mut reg, name, trec);
+                    crate::core::install::install_skill(
+                        &s.layout,
+                        &cfg,
+                        &mut reg,
+                        &spec.key,
+                        &entry.name,
+                        &entry.rel_path.to_string_lossy(),
+                        &target,
+                        method,
+                        &cached.commit,
                     )
-                })?;
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("覆盖安装 {name} 失败: {e}"),
+                        )
+                    })?;
+                }
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("安装 {name} 失败: {e}"),
+                    ));
+                }
             }
-            Err(e) => {
-                return Err((
+            // 逐条落盘：之后任一技能/目标安装失败提前返回时，registry 与磁盘已写入的副本一致
+            reg.save(&s.layout).map_err(|e| {
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("安装 {name} 失败: {e}"),
-                ));
-            }
+                    format!("保存 registry 失败: {e}"),
+                )
+            })?;
         }
         installed.push(name.clone());
-        // 逐条落盘：之后任一技能安装失败提前返回时，registry 与磁盘已写入的副本一致
-        reg.save(&s.layout).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("保存 registry 失败: {e}"),
-            )
-        })?;
     }
     Ok(Json(serde_json::json!({ "installed": installed })))
 }
@@ -436,12 +437,13 @@ async fn remove_favorite(
 struct FavInstallReq {
     source: String,
     skill: String,
-    target: TargetRec,
+    targets: Vec<TargetRec>,
     method: Option<Method>,
     overwrite: Option<bool>,
 }
 
-/// 从收藏安装。冲突 → 409 + 明细，前端 confirm 后带 overwrite=true 重试（同 run_update 的确认链）。
+/// 从收藏安装，可指定一个或多个目标（逐目标安装逐条落盘）。
+/// 冲突 → 409 + 明细，前端 confirm 后带 overwrite=true 重试（同 run_update 的确认链）。
 async fn install_favorite(
     State(s): S,
     Json(req): Json<FavInstallReq>,
@@ -462,50 +464,49 @@ async fn install_favorite(
     })?;
     let key = crate::core::favorites::resolve_key(&reg, &req.source)
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e}")))?;
-    let target = req.target.to_target();
-    let method = req.method.unwrap_or(cfg.default_method);
-    let do_install = |reg: &mut Registry| {
-        crate::core::favorites::fav_install(&s.layout, &cfg, reg, &key, &req.skill, &target, method)
-    };
-    match do_install(&mut reg) {
-        Ok(_) => {
-            reg.save(&s.layout).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("保存 registry 失败: {e}"),
-                )
-            })?;
-            Ok(Json(serde_json::json!({ "installed": req.skill })))
-        }
-        Err(crate::core::error::Error::Conflict(p)) => {
-            if !req.overwrite.unwrap_or(false) {
-                return Err((StatusCode::CONFLICT, format!("{p:?} 已存在")));
-            }
-            // 与 CLI 的覆盖路径一致：先按记录删（无记录则忽略），再重装
-            let _ = crate::core::remove::remove_install(
-                &s.layout,
-                &cfg,
-                &mut reg,
-                &req.skill,
-                &req.target,
-            );
-            do_install(&mut reg).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("覆盖安装失败: {e}"),
-                )
-            })?;
-            reg.save(&s.layout).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("保存 registry 失败: {e}"),
-                )
-            })?;
-            Ok(Json(serde_json::json!({ "installed": req.skill })))
-        }
-        Err(crate::core::error::Error::NotBookmarked(e)) => Err((StatusCode::NOT_FOUND, e)),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("安装失败: {e}"))),
+    if req.targets.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "未选择目标".into()));
     }
+    let method = req.method.unwrap_or(cfg.default_method);
+    let overwrite = req.overwrite.unwrap_or(false);
+    for trec in &req.targets {
+        let target = trec.to_target();
+        let do_install = |reg: &mut Registry| {
+            crate::core::favorites::fav_install(
+                &s.layout, &cfg, reg, &key, &req.skill, &target, method,
+            )
+        };
+        match do_install(&mut reg) {
+            Ok(_) => {}
+            Err(crate::core::error::Error::Conflict(p)) => {
+                if !overwrite {
+                    return Err((StatusCode::CONFLICT, format!("{p:?} 已存在")));
+                }
+                // 与 CLI 的覆盖路径一致：先按记录删（无记录则忽略），再重装
+                let _ = crate::core::remove::remove_install(
+                    &s.layout, &cfg, &mut reg, &req.skill, trec,
+                );
+                do_install(&mut reg).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("覆盖安装失败: {e}"),
+                    )
+                })?;
+            }
+            Err(crate::core::error::Error::NotBookmarked(e)) => {
+                return Err((StatusCode::NOT_FOUND, e));
+            }
+            Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("安装失败: {e}"))),
+        }
+        // 逐条落盘：之后任一目标安装失败提前返回时，registry 与磁盘已写入的副本一致
+        reg.save(&s.layout).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("保存 registry 失败: {e}"),
+            )
+        })?;
+    }
+    Ok(Json(serde_json::json!({ "installed": req.skill })))
 }
 
 async fn list_targets(State(s): S) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -649,16 +650,18 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
-    /// agents target 重定向到临时目录的 AppState，避免安装测试落盘到真实 home
+    /// agents/claude 两个 target 都重定向到临时目录的 AppState，避免安装测试落盘到真实 home
     fn test_state_with_target() -> AppState {
         let tmp = Arc::new(tempfile::tempdir().unwrap());
         let layout = Layout::at(tmp.path().join(".skills"));
         std::fs::create_dir_all(&layout.root).unwrap();
         let mut targets = toml::value::Table::new();
-        targets.insert(
-            "agents".into(),
-            toml::Value::String(tmp.path().join("agents").to_string_lossy().into_owned()),
-        );
+        for name in ["agents", "claude"] {
+            targets.insert(
+                name.into(),
+                toml::Value::String(tmp.path().join(name).to_string_lossy().into_owned()),
+            );
+        }
         let mut doc = toml::value::Table::new();
         doc.insert("targets".into(), toml::Value::Table(targets));
         std::fs::write(layout.config_path(), toml::to_string(&doc).unwrap()).unwrap();
@@ -724,7 +727,7 @@ mod tests {
                 serde_json::json!({
                     "source": src.to_str().unwrap(),
                     "skills": ["sa"],
-                    "target": {"kind": "global", "name": "agents"},
+                    "targets": [{"kind": "global", "name": "agents"}],
                     "method": "copy",
                 }),
             ))
@@ -756,7 +759,7 @@ mod tests {
                 serde_json::json!({
                     "source": src.to_str().unwrap(),
                     "skills": ["sa", "ghost"],
-                    "target": {"kind": "global", "name": "agents"},
+                    "targets": [{"kind": "global", "name": "agents"}],
                     "method": "copy",
                 }),
             ))
@@ -780,7 +783,7 @@ mod tests {
             serde_json::json!({
                 "source": src.to_str().unwrap(),
                 "skills": ["sa"],
-                "target": {"kind": "global", "name": "agents"},
+                "targets": [{"kind": "global", "name": "agents"}],
                 "method": "copy",
                 "overwrite": overwrite,
             })
@@ -804,6 +807,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn install_to_multiple_targets() {
+        let state = test_state_with_target();
+        let layout_root = state.layout.root.clone();
+        let tmp_root = state.tmp.path().to_path_buf();
+        let keep = state.tmp.clone();
+        let src = make_multi_skill_source(&tmp_root);
+        let app = router(state);
+        let resp = app
+            .oneshot(post_json(
+                "/api/install",
+                serde_json::json!({
+                    "source": src.to_str().unwrap(),
+                    "skills": ["sa"],
+                    "targets": [
+                        {"kind": "global", "name": "agents"},
+                        {"kind": "global", "name": "claude"}
+                    ],
+                    "method": "copy",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // 同一技能装进两个目标：registry 两条记录，两边磁盘都有副本
+        let reg = Registry::load(&Layout::at(layout_root)).unwrap();
+        assert_eq!(reg.installs.len(), 2);
+        assert!(tmp_root.join("agents/sa/SKILL.md").exists());
+        assert!(tmp_root.join("claude/sa/SKILL.md").exists());
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn install_rejects_empty_targets() {
+        let state = test_state_with_target();
+        let tmp_root = state.tmp.path().to_path_buf();
+        let keep = state.tmp.clone();
+        let src = make_multi_skill_source(&tmp_root);
+        let app = router(state);
+        let resp = app
+            .oneshot(post_json(
+                "/api/install",
+                serde_json::json!({
+                    "source": src.to_str().unwrap(),
+                    "skills": ["sa"],
+                    "targets": [],
+                    "method": "copy",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
         drop(keep);
     }
 
@@ -1195,7 +1253,7 @@ mod tests {
                 serde_json::json!({
                     "source": "local/mysrc",
                     "skill": "alpha",
-                    "target": {"kind": "global", "name": "agents"},
+                    "targets": [{"kind": "global", "name": "agents"}],
                     "method": "copy",
                     "overwrite": overwrite
                 }),
@@ -1218,7 +1276,7 @@ mod tests {
                 serde_json::json!({
                     "source": "local/mysrc",
                     "skill": "nope",
-                    "target": {"kind": "global", "name": "agents"}
+                    "targets": [{"kind": "global", "name": "agents"}]
                 }),
             ))
             .await

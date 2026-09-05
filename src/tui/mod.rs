@@ -161,7 +161,11 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
         println!("未选择技能，取消安装");
         return Ok(());
     }
-    let target = pick_target(cfg)?;
+    let targets = pick_targets(cfg)?;
+    if targets.is_empty() {
+        println!("未选择目标，取消安装");
+        return Ok(());
+    }
     let method = cfg.default_method;
 
     // 直接操作 TUI 内存中的 registry：用户在 TUI 内按 a 的 auto_update
@@ -178,51 +182,54 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
         });
     for i in idx {
         let entry = &all[i];
-        match install::install_skill(
-            layout,
-            cfg,
-            reg,
-            &spec.key,
-            &entry.name,
-            &entry.rel_path.to_string_lossy(),
-            &target,
-            method,
-            &cached.commit,
-        ) {
-            Ok(_) => println!("已安装 {} → {target:?} ({method:?})", entry.name),
-            Err(Error::Conflict(p)) => {
-                let overwrite = dialoguer::Confirm::new()
-                    .with_prompt(format!("{p:?} 已存在，覆盖？"))
-                    .interact()
-                    .map_err(|e| Error::Msg(e.to_string()))?;
-                if overwrite {
-                    let rec = install::to_rec(&target);
-                    let _ = remove::remove_install(layout, cfg, reg, &entry.name, &rec);
-                    install::install_skill(
-                        layout,
-                        cfg,
-                        reg,
-                        &spec.key,
-                        &entry.name,
-                        &entry.rel_path.to_string_lossy(),
-                        &target,
-                        method,
-                        &cached.commit,
-                    )?;
-                    println!("已覆盖安装 {} → {target:?} ({method:?})", entry.name);
-                } else {
-                    println!("跳过 {}", entry.name);
+        for target in &targets {
+            match install::install_skill(
+                layout,
+                cfg,
+                reg,
+                &spec.key,
+                &entry.name,
+                &entry.rel_path.to_string_lossy(),
+                target,
+                method,
+                &cached.commit,
+            ) {
+                Ok(_) => println!("已安装 {} → {target:?} ({method:?})", entry.name),
+                Err(Error::Conflict(p)) => {
+                    let overwrite = dialoguer::Confirm::new()
+                        .with_prompt(format!("{p:?} 已存在，覆盖？"))
+                        .interact()
+                        .map_err(|e| Error::Msg(e.to_string()))?;
+                    if overwrite {
+                        let rec = install::to_rec(target);
+                        let _ = remove::remove_install(layout, cfg, reg, &entry.name, &rec);
+                        install::install_skill(
+                            layout,
+                            cfg,
+                            reg,
+                            &spec.key,
+                            &entry.name,
+                            &entry.rel_path.to_string_lossy(),
+                            target,
+                            method,
+                            &cached.commit,
+                        )?;
+                        println!("已覆盖安装 {} → {target:?} ({method:?})", entry.name);
+                    } else {
+                        println!("跳过 {} → {target:?}", entry.name);
+                    }
                 }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
     }
     reg.save(layout)?;
     Ok(())
 }
 
-/// 安装向导共用的目标选择：配置的 global targets + 当前项目（project:<cwd>）。
-fn pick_target(cfg: &Config) -> Result<Target> {
+/// 安装向导共用的目标选择（可多选）：配置的 global targets + 当前项目（project:<cwd>）。
+/// 一个都没选返回空列表，由调用方取消安装。
+fn pick_targets(cfg: &Config) -> Result<Vec<Target>> {
     let mut targets: Vec<(String, Target)> = cfg
         .targets
         .keys()
@@ -235,13 +242,12 @@ fn pick_target(cfg: &Config) -> Result<Target> {
         },
     ));
     let labels: Vec<&str> = targets.iter().map(|(l, _)| l.as_str()).collect();
-    let ti = dialoguer::Select::new()
-        .with_prompt("安装到目标")
+    let idx = dialoguer::MultiSelect::new()
+        .with_prompt("安装到目标（空格多选，回车确认）")
         .items(&labels)
-        .default(0)
         .interact()
         .map_err(|e| Error::Msg(e.to_string()))?;
-    Ok(targets[ti].1.clone())
+    Ok(idx.into_iter().map(|i| targets[i].1.clone()).collect())
 }
 
 /// 收藏向导（已在正常终端模式下运行）：输 source → 扫描 → 多选（默认全选）→ 走 core 收藏。
@@ -317,34 +323,40 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
             }
         }
     };
-    let target = pick_target(cfg)?;
+    let targets = pick_targets(cfg)?;
+    if targets.is_empty() {
+        println!("未选择目标，取消安装");
+        return Ok(());
+    }
     let method = cfg.default_method;
     for s in &picked {
-        match favorites::fav_install(layout, cfg, &mut app.registry, &key, s, &target, method) {
-            Ok(_) => println!("已安装 {s} → {target:?} ({method:?})"),
-            Err(Error::Conflict(p)) => {
-                let overwrite = dialoguer::Confirm::new()
-                    .with_prompt(format!("{p:?} 已存在，覆盖？"))
-                    .interact()
-                    .map_err(|e| Error::Msg(e.to_string()))?;
-                if overwrite {
-                    let rec = install::to_rec(&target);
-                    let _ = remove::remove_install(layout, cfg, &mut app.registry, s, &rec);
-                    favorites::fav_install(
-                        layout,
-                        cfg,
-                        &mut app.registry,
-                        &key,
-                        s,
-                        &target,
-                        method,
-                    )?;
-                    println!("已覆盖安装 {s} → {target:?} ({method:?})");
-                } else {
-                    println!("跳过 {s}");
+        for target in &targets {
+            match favorites::fav_install(layout, cfg, &mut app.registry, &key, s, target, method) {
+                Ok(_) => println!("已安装 {s} → {target:?} ({method:?})"),
+                Err(Error::Conflict(p)) => {
+                    let overwrite = dialoguer::Confirm::new()
+                        .with_prompt(format!("{p:?} 已存在，覆盖？"))
+                        .interact()
+                        .map_err(|e| Error::Msg(e.to_string()))?;
+                    if overwrite {
+                        let rec = install::to_rec(target);
+                        let _ = remove::remove_install(layout, cfg, &mut app.registry, s, &rec);
+                        favorites::fav_install(
+                            layout,
+                            cfg,
+                            &mut app.registry,
+                            &key,
+                            s,
+                            target,
+                            method,
+                        )?;
+                        println!("已覆盖安装 {s} → {target:?} ({method:?})");
+                    } else {
+                        println!("跳过 {s} → {target:?}");
+                    }
                 }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
     }
     app.registry.save(layout)?;
