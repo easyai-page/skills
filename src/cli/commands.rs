@@ -1,6 +1,6 @@
 use super::{Cli, Cmd, ConfigCmd, FavSub, MethodArg, TargetsCmd};
 use crate::core::{
-    cache,
+    agents, cache,
     config::Config,
     error::{Error, Result},
     favorites, install,
@@ -10,6 +10,7 @@ use crate::core::{
     source::parse_source,
     tags, update,
 };
+use crate::wizard;
 use std::io::IsTerminal;
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -64,10 +65,12 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Add {
             source,
             skill,
+            agent,
             target,
             global,
             method,
             yes,
+            all,
         }) => {
             let mut reg = Registry::load(&layout)?;
             let spec = parse_source(&source)?;
@@ -83,31 +86,42 @@ pub fn run(cli: Cli) -> Result<()> {
                     fetched_at: chrono::Utc::now().to_rfc3339(),
                     auto_update: None,
                 });
-            let all = cache::scan_skills(&cached.path)?;
-            let picked: Vec<_> = if skill.is_empty() {
-                // 交互多选
-                let names: Vec<String> = all.iter().map(|s| s.name.clone()).collect();
-                let idx = dialoguer::MultiSelect::new()
-                    .with_prompt("选择要安装的技能")
-                    .items(&names)
-                    .interact()
-                    .map_err(|e| Error::Msg(e.to_string()))?;
-                idx.into_iter().map(|i| all[i].name.clone()).collect()
+            let all_skills = cache::scan_skills(&cached.path)?;
+            if all_skills.is_empty() {
+                return Err(Error::Msg("仓库中没有可安装的技能".into()));
+            }
+            let all_names: Vec<String> = all_skills.iter().map(|s| s.name.clone()).collect();
+            // 第 1 步：技能。--all / -s '*' → 全部；-s 列表 → 校验后用之（显式 -s 优先于 -y 默认）；
+            // 否则 TTY 弹 pick_skills（空选 = 取消），非 TTY → 全部（修掉旧版管道下弹窗报错的不对称）
+            let picked: Vec<String> = if all || skill.iter().any(|s| s == "*") {
+                all_names.clone()
+            } else if !skill.is_empty() {
+                resolve_skill_flag(&skill, &all_names)?
+            } else if yes {
+                all_names.clone()
+            } else if std::io::stdin().is_terminal() {
+                match wizard::pick_skills(&all_names)? {
+                    Some(p) => p,
+                    None => {
+                        println!("未选择技能，取消安装");
+                        return Ok(());
+                    }
+                }
             } else {
-                skill
+                all_names.clone()
             };
-            let targets = resolve_targets(&target, global, &cfg)?;
+            // 第 2~4 步：agent → scope → method（与 fav install 共用）
+            let (targets, method) =
+                resolve_install_plan(&agent, &target, global, all, yes, method, &cfg)?;
             if targets.is_empty() {
                 println!("未选择目标，取消安装");
                 return Ok(());
             }
-            let method = resolve_method(method, &cfg);
-            // 全部技能名先校验再开工，避免装到一半才报"仓库中无技能"
-            for s in &picked {
-                if !all.iter().any(|e| &e.name == s) {
-                    return Err(Error::Msg(format!("仓库中无技能 {s}")));
-                }
-            }
+            println!(
+                "将安装 {} 个技能 → {} 个目标（{method:?}）",
+                picked.len(),
+                targets.len()
+            );
             install_loop(
                 &layout,
                 &cfg,
@@ -115,9 +129,13 @@ pub fn run(cli: Cli) -> Result<()> {
                 &picked,
                 &targets,
                 method,
-                yes,
+                // --all 隐含 -y 语义：冲突跳过，不弹确认
+                yes || all,
                 &|reg: &mut Registry, s: &str, t: &Target| {
-                    let entry = all.iter().find(|e| e.name == s).expect("刚校验过存在");
+                    let entry = all_skills
+                        .iter()
+                        .find(|e| e.name == s)
+                        .expect("刚校验过存在");
                     install::install_skill(
                         &layout,
                         &cfg,
@@ -361,42 +379,55 @@ pub fn run(cli: Cli) -> Result<()> {
                     Some(FavSub::Install {
                         source,
                         skill,
+                        agent,
                         target,
                         global,
                         method,
                         yes,
+                        all,
                     }),
                     _,
                 ) => {
                     let key = favorites::resolve_key(&reg, &source)?;
-                    let picked: Vec<String> = if skill.is_empty() {
-                        let fav = &reg.favorites[&key];
-                        if fav.skills.len() == 1 {
-                            vec![fav.skills[0].name.clone()]
-                        } else {
-                            // 从收藏的技能集里选（不重扫全仓）
-                            let names: Vec<String> =
-                                fav.skills.iter().map(|s| s.name.clone()).collect();
-                            let idx = dialoguer::MultiSelect::new()
-                                .with_prompt("选择要安装的技能")
-                                .items(&names)
-                                .interact()
-                                .map_err(|e| Error::Msg(e.to_string()))?;
-                            idx.into_iter().map(|i| names[i].clone()).collect()
-                        }
-                    } else {
+                    // 第 1 步：技能（候选 = 收藏集，不重扫全仓）。--all / -s '*' → 全部；
+                    // 显式 -s 列表用之（未收藏名由 fav_install 的 NotBookmarked 在逐条循环里拦截）；
+                    // 否则 TTY 弹 pick_skills（单技能直接装，不弹窗），非 TTY → 全部
+                    let fav_names: Vec<String> = reg.favorites[&key]
+                        .skills
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .collect();
+                    let picked: Vec<String> = if all || skill.iter().any(|s| s == "*") {
+                        fav_names.clone()
+                    } else if !skill.is_empty() {
                         skill
+                    } else if yes || !std::io::stdin().is_terminal() {
+                        fav_names.clone()
+                    } else {
+                        match wizard::pick_skills(&fav_names)? {
+                            Some(p) => p,
+                            None => {
+                                println!("未选择技能，取消安装");
+                                return Ok(());
+                            }
+                        }
                     };
                     if picked.is_empty() {
                         println!("未选择技能，取消安装");
                         return Ok(());
                     }
-                    let targets = resolve_targets(&target, global, &cfg)?;
+                    // 第 2~4 步：agent → scope → method（与 add 共用）
+                    let (targets, method) =
+                        resolve_install_plan(&agent, &target, global, all, yes, method, &cfg)?;
                     if targets.is_empty() {
                         println!("未选择目标，取消安装");
                         return Ok(());
                     }
-                    let method = resolve_method(method, &cfg);
+                    println!(
+                        "将安装 {} 个技能 → {} 个目标（{method:?}）",
+                        picked.len(),
+                        targets.len()
+                    );
                     install_loop(
                         &layout,
                         &cfg,
@@ -404,7 +435,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         &picked,
                         &targets,
                         method,
-                        yes,
+                        yes || all,
                         &|reg: &mut Registry, s: &str, t: &Target| {
                             favorites::fav_install(&layout, &cfg, reg, &key, s, t, method)?;
                             Ok(())
@@ -606,64 +637,93 @@ fn run_config(layout: &Layout, sub: &ConfigCmd) -> Result<()> {
     }
 }
 
-/// add 与 fav install 共用的目标解析：-t 列表 / -g（配置里第一个 global target）/
-/// 交互终端裸跑弹多选（默认勾当前项目）/ 非交互裸默认（当前项目，兼容脚本与测试）。
-/// 返回空列表 = 用户在多选里一个都没选，调用方视为取消安装。
-fn resolve_targets(target: &[String], global: bool, cfg: &Config) -> Result<Vec<Target>> {
-    if !target.is_empty() {
-        return target.iter().map(|s| Target::parse(s)).collect();
+/// -s/--skill 列表解析：'*' = 全部；其余名字逐一预校验，任一不存在即报错
+/// （保持「全部技能名先校验再开工」语义，避免装到一半才报"仓库中无技能"）。
+fn resolve_skill_flag(flag: &[String], all_names: &[String]) -> Result<Vec<String>> {
+    if flag.iter().any(|s| s == "*") {
+        return Ok(all_names.to_vec());
     }
-    if global {
-        // 临时：-g 暂等价 agents@global，任务 5 会重写 add 向导（按 agent 多选）
-        return Ok(vec![Target {
-            agent: "agents".into(),
-            scope: Scope::Global,
-        }]);
+    for s in flag {
+        if !all_names.contains(s) {
+            return Err(Error::Msg(format!("仓库中无技能 {s}")));
+        }
     }
-    if std::io::stdin().is_terminal() {
-        return pick_targets_interactive(cfg);
-    }
-    // 非交互（管道/脚本/测试）保持旧默认：装进当前项目 <cwd>/.agents/skills
-    Ok(vec![Target {
-        agent: "agents".into(),
-        scope: Scope::Project(std::env::current_dir()?),
-    }])
+    Ok(flag.to_vec())
 }
 
-/// 交互式目标多选：配置的 global targets + 当前项目（默认勾当前项目，
-/// 直接回车 = 旧的裸 add 默认行为）。空格切换、回车确认；全不选返回空（取消）。
-fn pick_targets_interactive(cfg: &Config) -> Result<Vec<Target>> {
-    let cwd = std::env::current_dir()?;
-    let mut targets: Vec<(String, Target)> = cfg
-        .targets
-        .keys()
-        .map(|n| {
-            (
-                format!("global:{n}"),
-                Target {
-                    agent: n.clone(),
-                    scope: Scope::Global,
-                },
-            )
-        })
-        .collect();
-    let mut defaults = vec![false; targets.len()];
-    targets.push((
-        format!("project:{}", cwd.display()),
-        Target {
-            agent: "agents".into(),
-            scope: Scope::Project(cwd),
-        },
-    ));
-    defaults.push(true); // 默认勾当前项目，与裸 add 旧默认一致
-    let labels: Vec<&str> = targets.iter().map(|(l, _)| l.as_str()).collect();
-    let idx = dialoguer::MultiSelect::new()
-        .with_prompt("安装到目标（空格多选，回车确认）")
-        .items(&labels)
-        .defaults(&defaults)
-        .interact()
-        .map_err(|e| Error::Msg(e.to_string()))?;
-    Ok(idx.into_iter().map(|i| targets[i].1.clone()).collect())
+/// -y 的 agent 默认：检测到的内置 agent；一个都检测不到时退回 ["agents"]
+fn yes_agents(detected: &[&str]) -> Vec<String> {
+    if detected.is_empty() {
+        vec!["agents".to_string()]
+    } else {
+        detected.iter().map(|s| s.to_string()).collect()
+    }
+}
+
+/// add 与 fav install 共用的第 2~4 步：agent → scope → method，返回展开去重后的
+/// 目标列表与安装方式。返回空目标列表 = 用户在弹窗里空选取消，调用方视为取消安装。
+/// -t 旧写法直达 targets，不弹 agent/scope/method；--all / -y / 非 TTY 一律不弹窗。
+// 参数即一次安装决策的全部输入（agent/target 列表、三个开关、--method、配置），
+// 打包成结构体只是挪位置，保留平铺签名。
+#[allow(clippy::too_many_arguments)]
+fn resolve_install_plan(
+    agent: &[String],
+    target: &[String],
+    global: bool,
+    all: bool,
+    yes: bool,
+    method: Option<MethodArg>,
+    cfg: &Config,
+) -> Result<(Vec<Target>, Method)> {
+    if !target.is_empty() && !agent.is_empty() {
+        return Err(Error::Msg("-t 与 -a 只能给一个".into()));
+    }
+    // -t 兼容旧写法：直接 parse 成 targets 跳到安装，后续步骤不弹窗
+    if !target.is_empty() {
+        let targets = target
+            .iter()
+            .map(|s| Target::parse(s))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok((targets, resolve_method(method, cfg)));
+    }
+    let no_prompt = all || yes || !std::io::stdin().is_terminal();
+    // 第 2 步：agent。--all / -a '*' → 全内置 agent；-a 列表 → 全部先校验再开工；
+    // -y → 检测到的（检测不到退回 agents）；否则 TTY 弹 pick_agents（detected 预选），非 TTY → agents
+    let agent_ids: Vec<String> = if all || agent.iter().any(|a| a == "*") {
+        agents::all().iter().map(|a| a.id.to_string()).collect()
+    } else if !agent.is_empty() {
+        for id in agent {
+            agents::resolve(id, &cfg.targets)
+                .map_err(|_| Error::Msg(format!("未知 agent {id}")))?;
+        }
+        agent.to_vec()
+    } else if yes {
+        yes_agents(&agents::detect_installed())
+    } else if no_prompt {
+        vec!["agents".to_string()]
+    } else {
+        match wizard::pick_agents(&agents::detect_installed())? {
+            Some(ids) => ids,
+            None => return Ok((vec![], cfg.default_method)), // 空选取消
+        }
+    };
+    // 第 3 步：scope。-g → Global；不弹窗路径 → 项目（cwd）；
+    // 否则 pick_scope（内部对全不支持全局的 agent 组合直接返回项目，不弹窗）
+    let scope = if global {
+        Scope::Global
+    } else if no_prompt {
+        Scope::Project(std::env::current_dir()?)
+    } else {
+        wizard::pick_scope(&agent_ids)?
+    };
+    // 第 4 步：method。--method → 用之；不弹窗路径 → cfg.default_method；否则 pick_method
+    let method = match method {
+        Some(m) => resolve_method(Some(m), cfg),
+        None if no_prompt => cfg.default_method,
+        None => wizard::pick_method()?,
+    };
+    let targets = wizard::expand_targets(&agent_ids, &scope, cfg)?;
+    Ok((targets, method))
 }
 
 fn resolve_method(method: Option<MethodArg>, cfg: &Config) -> Method {
@@ -732,6 +792,24 @@ fn install_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_skill_picks_star_and_flag() {
+        let all = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(resolve_skill_flag(&["*".into()], &all).unwrap(), all);
+        assert_eq!(
+            resolve_skill_flag(&["a".into()], &all).unwrap(),
+            vec!["a".to_string()]
+        );
+        assert!(resolve_skill_flag(&["nope".into()], &all).is_err());
+    }
+
+    #[test]
+    fn yes_defaults_skills_all_agents_detected_or_universal() {
+        // -y 无 -a：检测到的；检测不到 → ["agents"]
+        assert_eq!(yes_agents(&["codex"]), vec!["codex".to_string()]);
+        assert_eq!(yes_agents(&[]), vec!["agents".to_string()]);
+    }
 
     #[test]
     fn validate_config_set_rejects_bad_known_scalars() {

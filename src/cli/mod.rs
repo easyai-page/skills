@@ -20,16 +20,26 @@ pub enum Cmd {
     /// 下载并安装技能（source 已缓存则复用）
     Add {
         source: String,
+        /// 指定技能名（可多次）；'*' = 全部
         #[arg(short, long)]
         skill: Vec<String>,
+        /// 指定 agent id（可多次）；'*' = 全部
         #[arg(short, long)]
-        target: Vec<String>, // global:<name> | project:<abs路径>
+        agent: Vec<String>,
+        /// 兼容旧写法：global:<agent> | project:<abs路径>（= universal + 项目根）
+        #[arg(short, long)]
+        target: Vec<String>,
+        /// 全局安装（默认项目级）
         #[arg(short = 'g', long)]
-        global: bool, // 等价 --target global:agents
+        global: bool,
         #[arg(long, value_enum)]
         method: Option<MethodArg>,
+        /// 跳过全部交互：全技能 + 检测到的 agent + 项目 scope + 默认方式
         #[arg(short = 'y', long)]
         yes: bool,
+        /// 全技能 + 全 agent + 跳过交互
+        #[arg(long)]
+        all: bool,
     },
     /// 列出已安装技能
     #[command(alias = "ls")]
@@ -147,8 +157,12 @@ pub enum FavSub {
     /// 从收藏安装（--skill 装指定技能，多技能收藏缺省时交互选择）
     Install {
         source: String,
+        /// 指定技能名（可多次）；'*' = 全部
         #[arg(short, long)]
         skill: Vec<String>,
+        /// 指定 agent id（可多次）；'*' = 全部
+        #[arg(short, long)]
+        agent: Vec<String>,
         #[arg(short, long)]
         target: Vec<String>,
         #[arg(short = 'g', long)]
@@ -157,5 +171,8 @@ pub enum FavSub {
         method: Option<MethodArg>,
         #[arg(short = 'y', long)]
         yes: bool,
+        /// 全技能 + 全 agent + 跳过交互
+        #[arg(long)]
+        all: bool,
     },
 }

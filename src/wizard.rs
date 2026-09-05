@@ -2,9 +2,6 @@
 //! CLI 与 TUI 共用（两者都在普通终端模式下用 dialoguer）；Web 无弹窗，走 /api 参数。
 //! 纯决策函数（expand_targets 等）与弹窗函数分离，前者可单测。
 
-// 任务 5 才接线到 CLI/TUI，之前暂允许 dead_code
-#![allow(dead_code)]
-
 use crate::core::agents;
 use crate::core::config::Config;
 use crate::core::error::{Error, Result};
@@ -133,7 +130,9 @@ pub fn expand_targets(agent_ids: &[String], scope: &Scope, cfg: &Config) -> Resu
 }
 
 /// 是否需要弹 scope：至少一个选中 agent 支持全局。
-/// 未知 / 仅 config 自定义的 id 视为不支持全局（自定义 target 的弹窗由任务 5 处理）。
+/// 用空 overrides 判断：仅 config 自定义 target 的 id 在此视为不支持全局——这是已知
+/// 可接受边界：不弹窗的路径（-g/-t/-y/非交互）都显式给了 scope，自定义 agent（本就
+/// 只支持全局）的用户可用 -t 或 -a + -g 到达全局安装。
 pub fn needs_scope_prompt(agent_ids: &[&str]) -> bool {
     agent_ids.iter().any(|id| {
         agents::resolve(id, &Default::default())
