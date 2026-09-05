@@ -34,7 +34,7 @@ pub enum Cmd {
         global: bool,
         #[arg(long, value_enum)]
         method: Option<MethodArg>,
-        /// 跳过全部交互：全技能 + 检测到的 agent + 项目 scope + 默认方式
+        /// 跳过全部交互：全技能 + 检测到的 agent + 项目 scope + 默认方式（显式 -s 优先于全技能默认）
         #[arg(short = 'y', long)]
         yes: bool,
         /// 全技能 + 全 agent + 跳过交互
@@ -169,6 +169,7 @@ pub enum FavSub {
         global: bool,
         #[arg(long, value_enum)]
         method: Option<MethodArg>,
+        /// 跳过全部交互：全技能 + 检测到的 agent + 项目 scope + 默认方式（显式 -s 优先于全技能默认）
         #[arg(short = 'y', long)]
         yes: bool,
         /// 全技能 + 全 agent + 跳过交互

@@ -224,7 +224,7 @@ fn config_subcommand_survives_and_heals_corrupt_config() {
 // ---- 审查发现 2：add 的 -g 真实语义 ----
 
 #[test]
-fn add_global_flag_uses_first_configured_target_and_bare_add_uses_project() {
+fn add_global_flag_uses_agents_global_scope_and_bare_add_uses_project() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let agents = tmp.path().join("g/agents");
@@ -240,7 +240,7 @@ fn add_global_flag_uses_first_configured_target_and_bare_add_uses_project() {
         ],
     );
     let src = make_local_source(tmp.path());
-    // -g 且无显式 --target：装进配置里第一个可用 global target（此处即 agents）
+    // -g 且无显式 --target：默认 agent=agents + 全局 scope（此处 agents 已被重定向到隔离目录）
     let out = run(&home, &["add", src.to_str().unwrap(), "-s", "alpha", "-g"]);
     assert!(
         out.status.success(),

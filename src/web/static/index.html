@@ -89,14 +89,14 @@ function renderInstalls(installs) {
         opt.selected = v === '' ? i.auto_update === null : i.auto_update === (v === 'true');
         sel.appendChild(opt);
       }
-      sel.addEventListener('change', () => setAU(i.skill, i.target.scope, targetRef(i), sel.value));
+      sel.addEventListener('change', () => setAU(i.skill, i.target.scope, targetRef(i), i.target.agent, sel.value));
       cell(tr, sel);
     } else {
       tr.appendChild(el('td', '跟随包级'));
     }
 
     const rmBtn = el('button', '删除');
-    rmBtn.addEventListener('click', () => rm(i.skill, i.target.scope, targetRef(i)));
+    rmBtn.addEventListener('click', () => rm(i.skill, i.target.scope, targetRef(i), i.target.agent));
     cell(tr, rmBtn);
     table.appendChild(tr);
   }
@@ -194,11 +194,13 @@ async function targetMethodPicker() {
   allLabel.appendChild(allCb);
   allLabel.appendChild(el('span', ' 全选 '));
   container.appendChild(allLabel);
+  // 检测到的 agent 默认勾；一个都没检测到时预选 universal 的 agents（与 CLI/TUI 默认一致）
+  const noneDetected = !data.agents.some(a => a.detected);
   for (const a of data.agents) {
     const label = el('label');
     const cb = document.createElement('input');
     cb.type = 'checkbox';
-    cb.checked = a.detected; // 检测到的 agent 默认勾
+    cb.checked = a.detected || (noneDetected && a.id === 'agents');
     cb.value = a.id;
     cb.dataset.global = a.global_supported ? '1' : '';
     boxes.push(cb);
@@ -402,10 +404,11 @@ async function refresh() {
   const favs = await api('favorites');
   document.getElementById('fav-list').replaceChildren(renderFavorites(favs));
 }
-function targetBody(kind, ref) { return kind==='global' ? {scope:'global',agent:ref} : {scope:'project',agent:'agents',root:ref}; }
-async function setAU(skill, kind, ref, v) {
+// agent 必须取安装记录里的真实值：project scope 硬编码 'agents' 会让非 universal agent 的记录 404
+function targetBody(kind, ref, agent) { return kind==='global' ? {scope:'global',agent} : {scope:'project',agent,root:ref}; }
+async function setAU(skill, kind, ref, agent, v) {
   await api('auto-update', {method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({skill, target: targetBody(kind, ref), value: v===''?null:v==='true'})});
+    body: JSON.stringify({skill, target: targetBody(kind, ref, agent), value: v===''?null:v==='true'})});
 }
 async function setSourceAU(key, v) {
   await api('auto-update', {method:'POST', headers:{'content-type':'application/json'},
@@ -415,10 +418,10 @@ async function setTags(skill, source, v) {
   await api('tags', {method:'POST', headers:{'content-type':'application/json'},
     body: JSON.stringify({skill, source, tags: v.split(',').map(s=>s.trim()).filter(Boolean)})});
 }
-async function rm(skill, kind, ref) {
+async function rm(skill, kind, ref, agent) {
   if (!confirm(`删除 ${skill}？`)) return;
   await api('remove', {method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({skill, target: targetBody(kind, ref)})});
+    body: JSON.stringify({skill, target: targetBody(kind, ref, agent)})});
   refresh();
 }
 async function runUpdate() {

@@ -679,7 +679,7 @@ fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// 解析 agent：内置表命中 → 应用 config 覆盖；否则 config 自定义（仅全局）；否则 None。
+/// 解析 agent：内置表命中 → 应用 config 覆盖；否则 config 自定义（仅全局）；都不命中返回 Err(UnknownTarget)。
 /// overrides 即 Config::targets（文件里的 [targets] 条目，已展开 ~）。
 pub fn resolve(id: &str, overrides: &BTreeMap<String, PathBuf>) -> Result<ResolvedAgent> {
     if let Some(spec) = AGENTS.iter().find(|a| a.id == id) {
