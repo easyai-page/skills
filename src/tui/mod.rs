@@ -6,15 +6,16 @@ use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 
 use crate::core::{
-    cache,
+    agents, cache,
     config::Config,
     error::{Error, Result},
     favorites, install,
-    paths::{Layout, Scope, Target},
+    paths::Layout,
     registry::Registry,
     remove,
     source::parse_source,
 };
+use crate::wizard;
 use app::{Action, AppState, FavRow, View};
 
 /// RAII 终端守卫：进入 raw mode + Alternate Screen，
@@ -139,7 +140,7 @@ fn event_loop(
     Ok(())
 }
 
-/// 安装向导（已在正常终端模式下运行）：选 source → 选技能 → 选目标 → 走 core 安装。
+/// 安装向导（已在正常终端模式下运行）：选 source → 共享四步向导（技能 → agent → scope → 方式）→ 走 core 安装。
 fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<()> {
     let source: String = dialoguer::Input::new()
         .with_prompt("source（github:owner/repo、URL 或本地路径）")
@@ -151,22 +152,33 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
         println!("已缓存 {}，复用（skills update 可更新）", spec.key);
     }
     let all = cache::scan_skills(&cached.path)?;
+    if all.is_empty() {
+        return Err(Error::Msg("仓库中没有可安装的技能".into()));
+    }
     let names: Vec<String> = all.iter().map(|s| s.name.clone()).collect();
-    let idx = dialoguer::MultiSelect::new()
-        .with_prompt("选择要安装的技能")
-        .items(&names)
-        .interact()
-        .map_err(|e| Error::Msg(e.to_string()))?;
-    if idx.is_empty() {
+    // 第 1 步：技能（空选 = 取消）
+    let Some(picked) = wizard::pick_skills(&names)? else {
         println!("未选择技能，取消安装");
         return Ok(());
-    }
-    let targets = pick_targets(cfg)?;
+    };
+    // 第 2 步：agent（空选 = 取消）
+    let Some(agent_ids) = wizard::pick_agents(&agents::detect_installed())? else {
+        println!("未选择目标，取消安装");
+        return Ok(());
+    };
+    // 第 3~4 步：scope → method，展开去重为 targets
+    let scope = wizard::pick_scope(&agent_ids)?;
+    let method = wizard::pick_method()?;
+    let targets = wizard::expand_targets(&agent_ids, &scope, cfg)?;
     if targets.is_empty() {
         println!("未选择目标，取消安装");
         return Ok(());
     }
-    let method = cfg.default_method;
+    println!(
+        "将安装 {} 个技能 → {} 个目标（{method:?}）",
+        picked.len(),
+        targets.len()
+    );
 
     // 直接操作 TUI 内存中的 registry：用户在 TUI 内按 a 的 auto_update
     // 切换只存在于 app.registry，若从磁盘 load 全新副本再覆盖回去，
@@ -180,8 +192,8 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
             fetched_at: chrono::Utc::now().to_rfc3339(),
             auto_update: None,
         });
-    for i in idx {
-        let entry = &all[i];
+    for s in &picked {
+        let entry = all.iter().find(|e| &e.name == s).expect("刚校验过存在");
         for target in &targets {
             match install::install_skill(
                 layout,
@@ -227,38 +239,6 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
     Ok(())
 }
 
-/// 安装向导共用的目标选择（可多选）：配置的 global targets + 当前项目（project:<cwd>）。
-/// 一个都没选返回空列表，由调用方取消安装。
-fn pick_targets(cfg: &Config) -> Result<Vec<Target>> {
-    let mut targets: Vec<(String, Target)> = cfg
-        .targets
-        .keys()
-        .map(|n| {
-            (
-                format!("global:{n}"),
-                Target {
-                    agent: n.clone(),
-                    scope: Scope::Global,
-                },
-            )
-        })
-        .collect();
-    targets.push((
-        format!("project:{}", std::env::current_dir()?.display()),
-        Target {
-            agent: "agents".into(),
-            scope: Scope::Project(std::env::current_dir()?),
-        },
-    ));
-    let labels: Vec<&str> = targets.iter().map(|(l, _)| l.as_str()).collect();
-    let idx = dialoguer::MultiSelect::new()
-        .with_prompt("安装到目标（空格多选，回车确认）")
-        .items(&labels)
-        .interact()
-        .map_err(|e| Error::Msg(e.to_string()))?;
-    Ok(idx.into_iter().map(|i| targets[i].1.clone()).collect())
-}
-
 /// 收藏向导（已在正常终端模式下运行）：输 source → 扫描 → 多选（默认全选）→ 走 core 收藏。
 /// 直接操作并落盘内存 registry（与 install_wizard 同因：TUI 内未落盘的 auto_update 切换不得丢失）。
 fn fav_wizard(layout: &Layout, app: &mut AppState) -> Result<()> {
@@ -298,13 +278,15 @@ fn fav_wizard(layout: &Layout, app: &mut AppState) -> Result<()> {
     Ok(())
 }
 
-/// 从收藏安装（已在正常终端模式下运行）：当前行定技能集 → 选目标 → 走 core 安装。
+/// 从收藏安装（已在正常终端模式下运行）：当前行定技能集 → 共享四步向导（agent → scope → 方式）→ 走 core 安装。
 fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<()> {
     let rows = app.fav_rows();
     let Some(row) = rows.get(app.selected) else {
         println!("（无收藏）");
         return Ok(());
     };
+    // 第 1 步：技能集由当前行决定——技能行单技能；Source 行单技能仓直接取，
+    // 多技能仓弹 pick_skills（空选 = 取消）
     let (key, picked) = match row {
         FavRow::Skill(key, i) => (
             key.clone(),
@@ -316,28 +298,31 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
                 (key.clone(), vec![fav.skills[0].name.clone()])
             } else {
                 let names: Vec<String> = fav.skills.iter().map(|s| s.name.clone()).collect();
-                let idx = dialoguer::MultiSelect::new()
-                    .with_prompt("选择要安装的技能")
-                    .items(&names)
-                    .interact()
-                    .map_err(|e| Error::Msg(e.to_string()))?;
-                if idx.is_empty() {
+                let Some(p) = wizard::pick_skills(&names)? else {
                     println!("未选择技能，取消安装");
                     return Ok(());
-                }
-                (
-                    key.clone(),
-                    idx.into_iter().map(|i| names[i].clone()).collect(),
-                )
+                };
+                (key.clone(), p)
             }
         }
     };
-    let targets = pick_targets(cfg)?;
+    // 第 2~4 步：agent（空选 = 取消）→ scope → method，展开去重为 targets
+    let Some(agent_ids) = wizard::pick_agents(&agents::detect_installed())? else {
+        println!("未选择目标，取消安装");
+        return Ok(());
+    };
+    let scope = wizard::pick_scope(&agent_ids)?;
+    let method = wizard::pick_method()?;
+    let targets = wizard::expand_targets(&agent_ids, &scope, cfg)?;
     if targets.is_empty() {
         println!("未选择目标，取消安装");
         return Ok(());
     }
-    let method = cfg.default_method;
+    println!(
+        "将安装 {} 个技能 → {} 个目标（{method:?}）",
+        picked.len(),
+        targets.len()
+    );
     for s in &picked {
         for target in &targets {
             match favorites::fav_install(layout, cfg, &mut app.registry, &key, s, target, method) {
