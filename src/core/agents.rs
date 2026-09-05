@@ -20,11 +20,10 @@ pub struct AgentSpec {
     pub universal: bool,
 }
 
-/// 运行形态：内置条目经 config 覆盖后的解析结果
+/// 运行形态：内置条目经 config 覆盖后的解析结果。
+/// 只保留安装路径解析需要的字段；展示名走 AgentSpec.name（wizard/web 均直接列注册表）。
 #[derive(Clone, Debug)]
 pub struct ResolvedAgent {
-    pub id: String,
-    pub name: String,
     pub project_dir: Option<PathBuf>, // 自定义 agent（仅 config 定义）没有项目路径
     pub global_dir: Option<PathBuf>,  // 已展开 ~；已被 [targets] 同名覆盖
 }
@@ -689,16 +688,12 @@ pub fn resolve(id: &str, overrides: &BTreeMap<String, PathBuf>) -> Result<Resolv
             .cloned()
             .or_else(|| spec.global_dir.map(expand_tilde));
         return Ok(ResolvedAgent {
-            id: spec.id.to_string(),
-            name: spec.name.to_string(),
             project_dir: Some(PathBuf::from(spec.project_dir)),
             global_dir,
         });
     }
     if let Some(p) = overrides.get(id) {
         return Ok(ResolvedAgent {
-            id: id.to_string(),
-            name: id.to_string(),
             project_dir: None,
             global_dir: Some(p.clone()),
         });
