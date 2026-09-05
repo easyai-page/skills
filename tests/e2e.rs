@@ -495,3 +495,218 @@ fn fav_install_partial_failure_keeps_registry_consistent() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("alpha"), "{stdout}");
 }
+
+// ---------- 四步安装向导新链路（agent×scope 目标模型，registry v3） ----------
+
+/// 读取 registry.json 为 JSON（断言 v3 target 结构与安装条数用）
+fn read_registry(home: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(home.join("registry.json")).unwrap()).unwrap()
+}
+
+/// 造一个空项目目录作为 add 的 cwd，返回其路径
+fn project_dir(base: &Path) -> std::path::PathBuf {
+    let proj = base.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    proj
+}
+
+#[test]
+fn add_with_agent_installs_to_agent_project_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let proj = project_dir(tmp.path());
+    let (bare, _work) = fixture_repo(tmp.path());
+    // -a claude-code（默认项目级 scope）→ <cwd>/.claude/skills/<skill>
+    skills(&home)
+        .args([
+            "add",
+            &format!("file://{}", bare.display()),
+            "-s",
+            "alpha",
+            "-a",
+            "claude-code",
+            "--method",
+            "copy",
+        ])
+        .current_dir(&proj)
+        .assert()
+        .success();
+    assert!(proj.join(".claude/skills/alpha/SKILL.md").exists());
+    // registry v3 target：{"scope":"project","agent":"claude-code","root":<cwd>}
+    // 子进程 cwd 经 getcwd 取物理路径，与 canonicalize 后的 proj 一致
+    let reg = read_registry(&home);
+    assert_eq!(
+        reg["installs"][0]["target"],
+        serde_json::json!({
+            "scope": "project",
+            "agent": "claude-code",
+            "root": proj.canonicalize().unwrap().display().to_string(),
+        })
+    );
+}
+
+#[test]
+fn add_multiple_universal_agents_dedup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let proj = project_dir(tmp.path());
+    let (bare, _work) = fixture_repo(tmp.path());
+    // agents 与 cline 都是 universal（.agents/skills）：按安装目录去重，
+    // 磁盘只装一份，registry 只记一条（保留排序最前的 id）
+    skills(&home)
+        .args([
+            "add",
+            &format!("file://{}", bare.display()),
+            "-s",
+            "alpha",
+            "-a",
+            "agents",
+            "-a",
+            "cline",
+            "--method",
+            "copy",
+        ])
+        .current_dir(&proj)
+        .assert()
+        .success();
+    assert!(proj.join(".agents/skills/alpha/SKILL.md").exists());
+    let reg = read_registry(&home);
+    let installs = reg["installs"].as_array().unwrap();
+    assert_eq!(
+        installs.len(),
+        1,
+        "同目录多 universal 只记一条: {installs:?}"
+    );
+    assert_eq!(installs[0]["target"]["agent"], "agents");
+    assert_eq!(installs[0]["target"]["scope"], "project");
+}
+
+#[test]
+fn add_global_agent_installs_to_global_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (bare, _work) = fixture_repo(tmp.path());
+    // SKILLS_HOME 只隔离缓存与 registry，全局目录默认在真实 home；
+    // 用 config.toml [targets] 覆盖把 codex 全局路径指进临时目录，绝不写真实 home
+    let codex_dir = tmp.path().join("codex-skills");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "[targets]\ncodex = \"{}\"\n",
+            codex_dir.display().to_string().replace('\\', "\\\\")
+        ),
+    )
+    .unwrap();
+    skills(&home)
+        .args([
+            "add",
+            &format!("file://{}", bare.display()),
+            "-s",
+            "alpha",
+            "-g",
+            "-a",
+            "codex",
+            "--method",
+            "copy",
+        ])
+        .assert()
+        .success();
+    assert!(codex_dir.join("alpha/SKILL.md").exists());
+    let reg = read_registry(&home);
+    assert_eq!(
+        reg["installs"][0]["target"],
+        serde_json::json!({"scope": "global", "agent": "codex"})
+    );
+}
+
+/// 行为修复回归：旧版管道下裸 add 会弹窗报错；现在非 TTY 默认全技能 → universal + 项目。
+#[test]
+fn non_tty_bare_add_defaults_all_skills_to_project_universal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let proj = project_dir(tmp.path());
+    let (bare, _work) = fixture_repo(tmp.path());
+    // assert_cmd 的 stdin 非 TTY；不带 -s/-a/-y，直接裸 add
+    skills(&home)
+        .args([
+            "add",
+            &format!("file://{}", bare.display()),
+            "--method",
+            "copy",
+        ])
+        .current_dir(&proj)
+        .assert()
+        .success();
+    assert!(proj.join(".agents/skills/alpha/SKILL.md").exists());
+    assert!(proj.join(".agents/skills/beta/SKILL.md").exists());
+    let reg = read_registry(&home);
+    let installs = reg["installs"].as_array().unwrap();
+    assert_eq!(installs.len(), 2);
+    assert!(
+        installs
+            .iter()
+            .all(|i| i["target"]["agent"] == "agents" && i["target"]["scope"] == "project"),
+        "{installs:?}"
+    );
+}
+
+#[test]
+fn add_yes_and_all_flags() {
+    // -y：全技能 + agent 默认取本机检测到的，检测不到时退回 universal + 项目。
+    // HOME 指到空目录保证检测为空（dirs::home_dir 读 HOME 环境变量；Windows 上忽略
+    // HOME，但 CI runner 用户目录下不会有 agent 配置目录，行为一致）。
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let proj = project_dir(tmp.path());
+    let fake_home = tmp.path().join("fake-home");
+    std::fs::create_dir_all(&fake_home).unwrap();
+    let (bare, _work) = fixture_repo(tmp.path());
+    let url = format!("file://{}", bare.display());
+    skills(&home)
+        .args(["add", &url, "-y", "--method", "copy"])
+        .current_dir(&proj)
+        .env("HOME", &fake_home)
+        .assert()
+        .success();
+    assert!(proj.join(".agents/skills/alpha/SKILL.md").exists());
+    assert!(proj.join(".agents/skills/beta/SKILL.md").exists());
+
+    // --all：全技能 + 注册表全 agent 项目级，按目录去重后仍远不止 1 个目标
+    //（含 .claude/.agents 等多个目录）。仅断言成功与目标数 > 1。
+    let home2 = tmp.path().join("home2");
+    let proj2 = tmp.path().join("proj2");
+    std::fs::create_dir_all(&proj2).unwrap();
+    skills(&home2)
+        .args(["add", &url, "--all", "--method", "copy"])
+        .current_dir(&proj2)
+        .assert()
+        .success();
+    assert!(proj2.join(".claude/skills/alpha/SKILL.md").exists());
+    assert!(proj2.join(".agents/skills/alpha/SKILL.md").exists());
+    let reg = read_registry(&home2);
+    let installs = reg["installs"].as_array().unwrap();
+    assert!(
+        installs.len() > 1,
+        "--all 应装到多个目标: {} 条",
+        installs.len()
+    );
+}
+
+#[test]
+fn legacy_registry_v2_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    // v3 起 target 改为 agent×scope 不做迁移；手放一个 v2 文件（旧 {"kind":"global"} 格式）
+    std::fs::write(
+        home.join("registry.json"),
+        r#"{"version":2,"sources":{},"installs":[{"skill":"a","source":"s","source_path":"s","target":{"kind":"global","name":"agents"},"method":"copy","commit":"c","installed_at":"t"}]}"#,
+    )
+    .unwrap();
+    // 任意命令都应拒绝加载并给出处置指引
+    let out = skills(&home).args(["list"]).output().unwrap();
+    assert!(!out.status.success(), "v2 registry 应报错退出");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("备份后删除"), "报错需含处置指引: {stderr}");
+}
