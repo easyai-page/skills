@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::cache::copy_dir;
 use super::config::Config;
 use super::error::{Error, Result};
-use super::paths::{Layout, Target};
+use super::paths::{Layout, Scope, Target};
 use super::registry::{Install, Method, Registry, TargetRec};
 
 static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -321,9 +321,14 @@ fn remove_install_path(path: &Path) -> std::io::Result<()> {
 }
 
 pub fn to_rec(target: &Target) -> TargetRec {
-    match target {
-        Target::Global { name } => TargetRec::Global { name: name.clone() },
-        Target::Project { root } => TargetRec::Project { root: root.clone() },
+    match &target.scope {
+        Scope::Global => TargetRec::Global {
+            agent: target.agent.clone(),
+        },
+        Scope::Project(root) => TargetRec::Project {
+            agent: target.agent.clone(),
+            root: root.clone(),
+        },
     }
 }
 
@@ -382,7 +387,7 @@ mod tests {
             layout,
             cfg,
             Registry {
-                version: 1,
+                version: 3,
                 ..Default::default()
             },
         )
@@ -391,8 +396,9 @@ mod tests {
     #[test]
     fn copy_install_creates_independent_copy_and_record() {
         let (_t, layout, cfg, mut reg) = setup();
-        let target = Target::Global {
-            name: "agents".into(),
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
         };
         let recs = install_skill(
             &layout,
@@ -414,7 +420,7 @@ mod tests {
         assert_eq!(
             reg.installs[0].target,
             TargetRec::Global {
-                name: "agents".into()
+                agent: "agents".into()
             }
         );
     }
@@ -423,8 +429,9 @@ mod tests {
     fn project_target_installs_under_dot_agents_skills() {
         let (tmp, layout, cfg, mut reg) = setup();
         let project_root = tmp.path().join("project");
-        let target = Target::Project {
-            root: project_root.clone(),
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Project(project_root.clone()),
         };
 
         let rec = install_skill(
@@ -441,15 +448,22 @@ mod tests {
         .unwrap();
 
         assert!(project_root.join(".agents/skills/alpha/SKILL.md").is_file());
-        assert_eq!(rec.target, TargetRec::Project { root: project_root });
+        assert_eq!(
+            rec.target,
+            TargetRec::Project {
+                agent: "agents".into(),
+                root: project_root
+            }
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn symlink_install_points_into_cache() {
         let (_t, layout, cfg, mut reg) = setup();
-        let target = Target::Global {
-            name: "agents".into(),
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
         };
         install_skill(
             &layout,
@@ -472,8 +486,9 @@ mod tests {
     #[test]
     fn conflict_returns_decision_request() {
         let (_t, layout, cfg, mut reg) = setup();
-        let target = Target::Global {
-            name: "agents".into(),
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
         };
         install_skill(
             &layout,
@@ -516,7 +531,10 @@ mod tests {
                 "github/o/r",
                 "alpha",
                 "skills/alpha",
-                &Target::Global { name: name.into() },
+                &Target {
+                    agent: name.into(),
+                    scope: Scope::Global,
+                },
                 Method::Copy,
                 "c1",
             )
@@ -656,8 +674,9 @@ mod tests {
     #[test]
     fn rejects_skill_names_that_are_not_one_normal_component() {
         let (tmp, layout, cfg, mut reg) = setup();
-        let target = Target::Global {
-            name: "agents".into(),
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
         };
         let absolute = tmp.path().join("escaped").to_string_lossy().into_owned();
 
@@ -687,8 +706,9 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         let absolute = outside.to_string_lossy().into_owned();
-        let target = Target::Global {
-            name: "agents".into(),
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
         };
 
         for source_path in ["../outside", &absolute] {
@@ -730,8 +750,9 @@ mod tests {
             "github/o/r",
             "alpha",
             "escape",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Copy,
             "c1",
@@ -753,8 +774,9 @@ mod tests {
             "github/o/r",
             "missing",
             "skills/missing",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Symlink,
             "c1",
@@ -779,8 +801,9 @@ mod tests {
             "github/o/r",
             "not-a-directory",
             "not-a-directory",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Copy,
             "c1",
@@ -806,8 +829,9 @@ mod tests {
             "github/o/r",
             "dangling",
             "dangling",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Symlink,
             "c1",
@@ -829,8 +853,9 @@ mod tests {
             "github/o/r",
             "alpha",
             "skills/alpha",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Copy,
             "c1",
@@ -858,8 +883,9 @@ mod tests {
             "github/o/r",
             "alpha",
             "skills/alpha",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Copy,
             "c1",
@@ -894,8 +920,9 @@ mod tests {
             "github/o/r",
             "alpha",
             "skills/alpha",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Symlink,
             "c1",
@@ -928,8 +955,9 @@ mod tests {
             "github/o/r",
             "alpha",
             "skills/alpha",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Copy,
             "c1",

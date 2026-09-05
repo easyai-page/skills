@@ -4,7 +4,7 @@ use crate::core::{
     config::Config,
     error::{Error, Result},
     favorites, install,
-    paths::{Layout, Target},
+    paths::{Layout, Scope, Target},
     registry::{Method, Registry, TargetRec},
     remove,
     source::parse_source,
@@ -438,7 +438,10 @@ fn default_global_target(cfg: &Config) -> Result<Target> {
     cfg.targets
         .keys()
         .next()
-        .map(|name| Target::Global { name: name.clone() })
+        .map(|name| Target {
+            agent: name.clone(),
+            scope: Scope::Global,
+        })
         .ok_or_else(|| {
             Error::Msg("没有可用的全局 target：请先 skills config targets add <name> <路径>".into())
         })
@@ -631,8 +634,9 @@ fn resolve_targets(target: &[String], global: bool, cfg: &Config) -> Result<Vec<
         return pick_targets_interactive(cfg);
     }
     // 非交互（管道/脚本/测试）保持旧默认：装进当前项目 <cwd>/.agents/skills
-    Ok(vec![Target::Project {
-        root: std::env::current_dir()?,
+    Ok(vec![Target {
+        agent: "agents".into(),
+        scope: Scope::Project(std::env::current_dir()?),
     }])
 }
 
@@ -643,12 +647,23 @@ fn pick_targets_interactive(cfg: &Config) -> Result<Vec<Target>> {
     let mut targets: Vec<(String, Target)> = cfg
         .targets
         .keys()
-        .map(|n| (format!("global:{n}"), Target::Global { name: n.clone() }))
+        .map(|n| {
+            (
+                format!("global:{n}"),
+                Target {
+                    agent: n.clone(),
+                    scope: Scope::Global,
+                },
+            )
+        })
         .collect();
     let mut defaults = vec![false; targets.len()];
     targets.push((
         format!("project:{}", cwd.display()),
-        Target::Project { root: cwd },
+        Target {
+            agent: "agents".into(),
+            scope: Scope::Project(cwd),
+        },
     ));
     defaults.push(true); // 默认勾当前项目，与裸 add 旧默认一致
     let labels: Vec<&str> = targets.iter().map(|(l, _)| l.as_str()).collect();
@@ -735,8 +750,9 @@ mod tests {
         let t = default_global_target(&cfg).unwrap();
         assert_eq!(
             t,
-            Target::Global {
-                name: "agents".into()
+            Target {
+                agent: "agents".into(),
+                scope: Scope::Global
             }
         );
     }

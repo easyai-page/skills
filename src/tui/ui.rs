@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn draw_all_views_smoke() {
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         reg.installs.push(Install {
@@ -175,7 +175,7 @@ mod tests {
             source: "github/o/r".into(),
             source_path: "skills/web-design".into(),
             target: TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
             method: Method::Copy,
             commit: "c1".into(),

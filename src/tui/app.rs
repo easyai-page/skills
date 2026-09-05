@@ -150,7 +150,7 @@ mod tests {
 
     fn app_with(items: usize) -> AppState {
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         for i in 0..items {
@@ -159,7 +159,7 @@ mod tests {
                 source: "github/o/r".into(),
                 source_path: format!("skills/s{i}").into(),
                 target: TargetRec::Global {
-                    name: "agents".into(),
+                    agent: "agents".into(),
                 },
                 method: Method::Copy,
                 commit: "c1".into(),
@@ -172,7 +172,7 @@ mod tests {
 
     fn app_with_favorites() -> AppState {
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         reg.favorites.insert(

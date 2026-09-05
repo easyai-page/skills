@@ -34,7 +34,7 @@ fn write_registry_fixture(home: &std::path::Path) {
     std::fs::write(
         home.join("registry.json"),
         r#"{
-  "version": 2,
+  "version": 3,
   "sources": {
     "local/src": {
       "url": "",
@@ -51,7 +51,7 @@ fn write_registry_fixture(home: &std::path::Path) {
       "skill": "alpha",
       "source": "local/src",
       "source_path": "skills/alpha",
-      "target": {"kind": "global", "name": "agents"},
+      "target": {"scope": "global", "agent": "agents"},
       "method": "copy",
       "commit": "c1",
       "auto_update": null,
@@ -61,7 +61,7 @@ fn write_registry_fixture(home: &std::path::Path) {
       "skill": "beta",
       "source": "local/src",
       "source_path": "skills/beta",
-      "target": {"kind": "global", "name": "agents"},
+      "target": {"scope": "global", "agent": "agents"},
       "method": "copy",
       "commit": "c1",
       "auto_update": null,
@@ -149,11 +149,11 @@ fn tag_command_requires_source_when_skill_name_ambiguous() {
     std::fs::write(
         home.join("registry.json"),
         r#"{
-  "version": 2,
+  "version": 3,
   "sources": {},
   "installs": [
-    {"skill":"alpha","source":"local/a","source_path":"skills/alpha","target":{"kind":"global","name":"agents"},"method":"copy","commit":"c1","auto_update":null,"installed_at":"t"},
-    {"skill":"alpha","source":"local/b","source_path":"skills/alpha","target":{"kind":"global","name":"agents"},"method":"copy","commit":"c1","auto_update":null,"installed_at":"t"}
+    {"skill":"alpha","source":"local/a","source_path":"skills/alpha","target":{"scope":"global","agent":"agents"},"method":"copy","commit":"c1","auto_update":null,"installed_at":"t"},
+    {"skill":"alpha","source":"local/b","source_path":"skills/alpha","target":{"scope":"global","agent":"agents"},"method":"copy","commit":"c1","auto_update":null,"installed_at":"t"}
   ]
 }"#,
     )

@@ -79,7 +79,7 @@ pub(crate) fn validate_record(rec: &Install) -> Result<()> {
             rec.skill
         ))
     })?;
-    if let TargetRec::Project { root } = &rec.target
+    if let TargetRec::Project { root, .. } = &rec.target
         && !root.is_absolute()
     {
         return Err(Error::Mismatch(format!(
@@ -202,7 +202,7 @@ fn remove_link_itself(dest: &Path, _meta: &std::fs::Metadata) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::paths::Target;
+    use crate::core::paths::{Scope, Target};
 
     fn setup_installed(method: Method) -> (tempfile::TempDir, Layout, Config, Registry) {
         let tmp = tempfile::tempdir().unwrap();
@@ -218,7 +218,7 @@ mod tests {
         cfg.targets
             .insert("agents".into(), tmp.path().join("g/agents"));
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         crate::core::install::install_skill(
@@ -228,8 +228,9 @@ mod tests {
             "github/o/r",
             "alpha",
             "skills/alpha",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             method,
             "c1",
@@ -248,7 +249,7 @@ mod tests {
             &mut reg,
             "alpha",
             &TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         )
         .unwrap();
@@ -270,7 +271,7 @@ mod tests {
             &mut reg,
             "alpha",
             &TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         )
         .unwrap();
@@ -287,7 +288,7 @@ mod tests {
             source: "github/o/r".into(),
             source_path: "skills/alpha".into(),
             target: TargetRec::Global {
-                name: "claude".into(),
+                agent: "claude".into(),
             },
             method: Method::Symlink,
             commit: "c1".into(),
@@ -304,7 +305,7 @@ mod tests {
             &mut reg,
             "alpha",
             &TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         )
         .unwrap();
@@ -323,7 +324,7 @@ mod tests {
             &mut reg,
             "alpha",
             &TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         )
         .unwrap();
@@ -345,7 +346,7 @@ mod tests {
             &mut reg,
             "alpha",
             &TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         )
         .unwrap();
@@ -362,7 +363,7 @@ mod tests {
             &mut reg,
             "nope",
             &TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         )
         .unwrap_err();
@@ -397,7 +398,7 @@ mod tests {
             &mut reg,
             "alpha",
             &TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         )
         .unwrap_err();
@@ -424,7 +425,7 @@ mod tests {
             &mut reg,
             "alpha",
             &TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         )
         .unwrap_err();
@@ -442,7 +443,7 @@ mod tests {
         reg.installs.push(corrupt_install(
             "../escaped",
             TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         ));
 
@@ -452,7 +453,7 @@ mod tests {
             &mut reg,
             "../escaped",
             &TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         )
         .unwrap_err();
@@ -469,6 +470,7 @@ mod tests {
         reg.installs.push(corrupt_install(
             "alpha",
             TargetRec::Project {
+                agent: "agents".into(),
                 root: "relative/root".into(),
             },
         ));
@@ -479,6 +481,7 @@ mod tests {
             &mut reg,
             "alpha",
             &TargetRec::Project {
+                agent: "agents".into(),
                 root: "relative/root".into(),
             },
         )
@@ -503,7 +506,7 @@ mod tests {
                 &mut reg,
                 "alpha",
                 &TargetRec::Global {
-                    name: "agents".into(),
+                    agent: "agents".into(),
                 },
             )
             .unwrap_err();

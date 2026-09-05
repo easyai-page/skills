@@ -231,7 +231,7 @@ mod tests {
     use super::*;
     use crate::core::config::Config;
     use crate::core::install::{self, COPY_MANIFEST};
-    use crate::core::paths::{Layout, Target};
+    use crate::core::paths::{Layout, Scope, Target};
     use crate::core::remove::{self, RemoveOutcome};
     use std::path::Path;
 
@@ -245,7 +245,7 @@ mod tests {
     }
     fn reg_with(source_auto: Option<bool>, installs: Vec<(Method, Option<bool>)>) -> Registry {
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         reg.sources.insert(
@@ -263,7 +263,7 @@ mod tests {
                 source: "github/o/r".into(),
                 source_path: format!("skills/s{i}").into(),
                 target: TargetRec::Global {
-                    name: "agents".into(),
+                    agent: "agents".into(),
                 },
                 method,
                 commit: "c1".into(),
@@ -336,7 +336,7 @@ mod tests {
         let sel = Selection {
             skill: "s0".into(),
             target: TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         };
         let plan = build_plan(&reg, Some(&sel));
@@ -359,7 +359,7 @@ mod tests {
         cfg.targets
             .insert("agents".into(), tmp.path().join("g/agents"));
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         reg.sources.insert(
@@ -378,8 +378,9 @@ mod tests {
             "github/o/r",
             "alpha",
             "skills/alpha",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             method,
             "c1",
@@ -425,7 +426,7 @@ mod tests {
         cfg.targets
             .insert("agents".into(), tmp.path().join("g/agents"));
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         reg.sources.insert(
@@ -444,8 +445,9 @@ mod tests {
             "github/o/r",
             "alpha",
             "skills/alpha",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             method,
             &c1,
@@ -459,7 +461,7 @@ mod tests {
             copies: vec![CopyDecision {
                 skill: "alpha".into(),
                 target: TargetRec::Global {
-                    name: "agents".into(),
+                    agent: "agents".into(),
                 },
                 update: true,
                 reason: "测试".into(),
@@ -504,7 +506,7 @@ mod tests {
             &mut reg,
             "alpha",
             &TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         )
         .unwrap();
@@ -559,7 +561,7 @@ mod tests {
             copies: vec![CopyDecision {
                 skill: "alpha".into(),
                 target: TargetRec::Global {
-                    name: "claude".into(),
+                    agent: "claude".into(),
                 },
                 update: true,
                 reason: "测试".into(),
@@ -577,7 +579,7 @@ mod tests {
         let sel = Selection {
             skill: "nope".into(),
             target: TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
         };
         let plan = build_plan(&reg, Some(&sel));
@@ -626,7 +628,7 @@ mod tests {
             let sel = Selection {
                 skill: "alpha".into(),
                 target: TargetRec::Global {
-                    name: "agents".into(),
+                    agent: "agents".into(),
                 },
             };
             let plan = build_plan(&reg, Some(&sel)); // auto_update 全为 None，显式强制

@@ -1,40 +1,96 @@
+use super::agents;
 use super::config::Config;
 use super::error::{Error, Result};
+use std::fmt;
 use std::path::PathBuf;
 
 #[derive(Clone, PartialEq, Debug)]
-pub enum Target {
-    Global { name: String },
-    Project { root: PathBuf },
+pub enum Scope {
+    /// 项目级：值为项目根，最终目录 = <root>/<agent.project_dir>
+    Project(PathBuf),
+    Global,
+}
+
+/// 安装目标 = agent × scope。agent 为内置注册表 id 或 config 自定义名。
+#[derive(Clone, PartialEq, Debug)]
+pub struct Target {
+    pub agent: String,
+    pub scope: Scope,
 }
 
 impl Target {
+    /// 支持新语法 `<agent>@global` / `<agent>@project:<abs路径>`，
+    /// 兼容旧 -t 写法 `global:<agent>` 与 `project:<abs>`（= universal agents + 项目根）。
     pub fn parse(s: &str) -> Result<Target> {
-        let (kind, rest) = s
-            .split_once(':')
-            .ok_or_else(|| Error::BadTarget(s.into()))?;
-        match kind {
-            "global" if !rest.is_empty() => Ok(Target::Global { name: rest.into() }),
-            "project" => {
-                let p = PathBuf::from(rest);
-                if p.is_absolute() {
-                    Ok(Target::Project { root: p })
-                } else {
-                    Err(Error::BadTarget(s.into()))
-                }
+        if let Some(rest) = s.strip_prefix("global:") {
+            if rest.is_empty() {
+                return Err(Error::BadTarget(s.into()));
             }
-            _ => Err(Error::BadTarget(s.into())),
+            return Ok(Target {
+                agent: rest.into(),
+                scope: Scope::Global,
+            });
+        }
+        if let Some(rest) = s.strip_prefix("project:") {
+            let p = PathBuf::from(rest);
+            if !p.is_absolute() {
+                return Err(Error::BadTarget(s.into()));
+            }
+            return Ok(Target {
+                agent: "agents".into(),
+                scope: Scope::Project(p),
+            });
+        }
+        let (agent, rest) = s
+            .split_once('@')
+            .ok_or_else(|| Error::BadTarget(s.into()))?;
+        if agent.is_empty() {
+            return Err(Error::BadTarget(s.into()));
+        }
+        match rest {
+            "global" => Ok(Target {
+                agent: agent.into(),
+                scope: Scope::Global,
+            }),
+            _ => {
+                let p = PathBuf::from(
+                    rest.strip_prefix("project:")
+                        .ok_or_else(|| Error::BadTarget(s.into()))?,
+                );
+                if !p.is_absolute() {
+                    return Err(Error::BadTarget(s.into()));
+                }
+                Ok(Target {
+                    agent: agent.into(),
+                    scope: Scope::Project(p),
+                })
+            }
         }
     }
 
     pub fn install_dir(&self, cfg: &Config) -> Result<PathBuf> {
-        match self {
-            Target::Global { name } => cfg
-                .targets
-                .get(name)
-                .cloned()
-                .ok_or_else(|| Error::UnknownTarget(name.clone())),
-            Target::Project { root } => Ok(root.join(".agents").join("skills")),
+        // resolve 的 Err 即 UnknownTarget(self.agent)，直接透传
+        let spec = agents::resolve(&self.agent, &cfg.targets)?;
+        match &self.scope {
+            Scope::Global => spec
+                .global_dir
+                .clone()
+                .ok_or_else(|| Error::Msg(format!("agent {} 不支持全局安装", self.agent))),
+            Scope::Project(root) => spec.project_dir.map(|rel| root.join(rel)).ok_or_else(|| {
+                Error::Msg(format!(
+                    "agent {} 没有项目安装目录（自定义 target 仅支持全局）",
+                    self.agent
+                ))
+            }),
+        }
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.scope {
+            Scope::Global => write!(f, "{}@global", self.agent),
+            Scope::Project(root) => write!(f, "{}@project:{}", self.agent, root.display()),
         }
     }
 }
@@ -78,53 +134,107 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_global_target() {
-        let t = Target::parse("global:agents").unwrap();
+    fn parse_new_syntax() {
         assert_eq!(
-            t,
-            Target::Global {
-                name: "agents".into()
+            Target::parse("claude-code@global").unwrap(),
+            Target {
+                agent: "claude-code".into(),
+                scope: Scope::Global
             }
         );
+        let abs = if cfg!(windows) {
+            "codex@project:C:\\work"
+        } else {
+            "codex@project:/work"
+        };
+        assert!(matches!(
+            Target::parse(abs).unwrap().scope,
+            Scope::Project(_)
+        ));
     }
 
     #[test]
-    fn parse_project_target_requires_absolute() {
-        assert!(Target::parse("project:./rel").is_err());
-        let abs = if cfg!(windows) {
+    fn parse_legacy_syntax_maps_to_universal() {
+        // 旧 -t 写法兼容：project:<abs> = universal agent + 项目根
+        assert_eq!(
+            Target::parse("global:claude-code").unwrap(),
+            Target {
+                agent: "claude-code".into(),
+                scope: Scope::Global
+            }
+        );
+        let t = Target::parse(if cfg!(windows) {
             "project:C:\\work"
         } else {
             "project:/work"
-        };
-        assert!(Target::parse(abs).is_ok());
+        })
+        .unwrap();
+        assert_eq!(t.agent, "agents");
+        assert!(matches!(t.scope, Scope::Project(_)));
     }
 
     #[test]
     fn parse_rejects_garbage() {
         assert!(Target::parse("agents").is_err());
         assert!(Target::parse("global:").is_err());
+        assert!(Target::parse("@global").is_err());
+        assert!(Target::parse("claude-code@project:./rel").is_err());
     }
 
     #[test]
-    fn project_install_dir_is_dot_agents_skills() {
+    fn display_roundtrip() {
+        let t = Target {
+            agent: "codex".into(),
+            scope: Scope::Global,
+        };
+        assert_eq!(Target::parse(&t.to_string()).unwrap(), t);
+    }
+
+    #[test]
+    fn install_dir_project_per_agent() {
         let cfg = crate::core::config::Config::default();
-        let t = Target::Project {
-            root: PathBuf::from("/tmp/proj"),
+        let t = Target {
+            agent: "claude-code".into(),
+            scope: Scope::Project(PathBuf::from("/tmp/proj")),
         };
         assert_eq!(
             t.install_dir(&cfg).unwrap(),
-            PathBuf::from("/tmp/proj").join(".agents").join("skills")
+            PathBuf::from("/tmp/proj/.claude/skills")
+        );
+        let u = Target {
+            agent: "agents".into(),
+            scope: Scope::Project(PathBuf::from("/tmp/proj")),
+        };
+        assert_eq!(
+            u.install_dir(&cfg).unwrap(),
+            PathBuf::from("/tmp/proj/.agents/skills")
         );
     }
 
     #[test]
-    fn global_install_dir_resolves_via_config() {
+    fn install_dir_global_and_errors() {
         let cfg = crate::core::config::Config::default();
-        let t = Target::Global {
-            name: "agents".into(),
+        let g = Target {
+            agent: "codex".into(),
+            scope: Scope::Global,
         };
-        let dir = t.install_dir(&cfg).unwrap();
-        assert!(dir.ends_with(".agents/skills") || dir.ends_with(".agents\\skills"));
+        let dir = g.install_dir(&cfg).unwrap();
+        assert!(dir.ends_with(".codex/skills") || dir.ends_with(".codex\\skills"));
+        // 不支持全局的 agent（eve 无 global_dir）
+        let eve = Target {
+            agent: "eve".into(),
+            scope: Scope::Global,
+        };
+        assert!(eve.install_dir(&cfg).is_err());
+        // 未知 agent
+        assert!(
+            Target {
+                agent: "nope".into(),
+                scope: Scope::Global
+            }
+            .install_dir(&cfg)
+            .is_err()
+        );
     }
 
     #[test]

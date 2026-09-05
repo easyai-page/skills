@@ -10,7 +10,7 @@ use crate::core::{
     config::Config,
     error::{Error, Result},
     favorites, install,
-    paths::{Layout, Target},
+    paths::{Layout, Scope, Target},
     registry::Registry,
     remove,
     source::parse_source,
@@ -233,12 +233,21 @@ fn pick_targets(cfg: &Config) -> Result<Vec<Target>> {
     let mut targets: Vec<(String, Target)> = cfg
         .targets
         .keys()
-        .map(|n| (format!("global:{n}"), Target::Global { name: n.clone() }))
+        .map(|n| {
+            (
+                format!("global:{n}"),
+                Target {
+                    agent: n.clone(),
+                    scope: Scope::Global,
+                },
+            )
+        })
         .collect();
     targets.push((
         format!("project:{}", std::env::current_dir()?.display()),
-        Target::Project {
-            root: std::env::current_dir()?,
+        Target {
+            agent: "agents".into(),
+            scope: Scope::Project(std::env::current_dir()?),
         },
     ));
     let labels: Vec<&str> = targets.iter().map(|(l, _)| l.as_str()).collect();
@@ -375,7 +384,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = Layout::at(tmp.path().to_path_buf());
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         reg.installs.push(Install {
@@ -383,7 +392,7 @@ mod tests {
             source: "github/o/r".into(),
             source_path: "skills/s0".into(),
             target: TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
             method: Method::Copy,
             commit: "c1".into(),

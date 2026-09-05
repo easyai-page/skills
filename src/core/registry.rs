@@ -2,14 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use super::error::Result;
+use super::error::{Error, Result};
 use super::paths::Layout;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "scope", rename_all = "lowercase")]
 pub enum TargetRec {
-    Global { name: String },
-    Project { root: PathBuf },
+    Global { agent: String },
+    Project { agent: String, root: PathBuf },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,10 +65,14 @@ impl TargetRec {
     /// 转换逻辑收敛到这里，避免各调用点重复手写 match。
     pub fn to_target(&self) -> crate::core::paths::Target {
         match self {
-            TargetRec::Global { name } => crate::core::paths::Target::Global { name: name.clone() },
-            TargetRec::Project { root } => {
-                crate::core::paths::Target::Project { root: root.clone() }
-            }
+            TargetRec::Global { agent } => crate::core::paths::Target {
+                agent: agent.clone(),
+                scope: crate::core::paths::Scope::Global,
+            },
+            TargetRec::Project { agent, root } => crate::core::paths::Target {
+                agent: agent.clone(),
+                scope: crate::core::paths::Scope::Project(root.clone()),
+            },
         }
     }
 }
@@ -85,7 +89,7 @@ pub struct Registry {
     #[serde(default)]
     pub favorites: BTreeMap<String, Favorite>,
     // 技能级标签：source → skill → tags。标签是技能的固有属性，与装到哪个目标
-    // 无关，不存 install 记录；旧版 installs[].tags 在 load 时迁移至此
+    // 无关，不存 install 记录
     #[serde(default)]
     pub skill_tags: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
@@ -95,29 +99,23 @@ impl Registry {
         let path = layout.registry_path();
         if !path.exists() {
             return Ok(Registry {
-                version: 2,
+                version: 3,
                 ..Default::default()
             });
         }
         let raw = std::fs::read_to_string(&path)?;
-        let mut value: serde_json::Value = serde_json::from_str(&raw)?;
-        let legacy = take_legacy_install_tags(&mut value);
-        let mut reg: Registry = serde_json::from_value(value)?;
-        // 旧版按副本存的标签并入技能级：同 (source, skill) 多副本取并集去重
-        for (source, skill, tags) in legacy {
-            let entry = reg
-                .skill_tags
-                .entry(source)
-                .or_default()
-                .entry(skill)
-                .or_default();
-            for t in tags {
-                if !entry.contains(&t) {
-                    entry.push(t);
-                }
-            }
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        // v3 起 target 改为 agent×scope 格式，旧版文件不做迁移，直接报错给出处置指引
+        let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+        if version != 3 {
+            return Err(Error::Msg(format!(
+                "registry.json 版本过旧（v{version}）：v3 起 target 改为 agent×scope 格式不做迁移，\
+                 请备份后删除 {} 再重装技能",
+                path.display()
+            )));
         }
-        reg.version = 2;
+        let mut reg: Registry = serde_json::from_value(value)?;
+        reg.version = 3;
         Ok(reg)
     }
 
@@ -156,41 +154,6 @@ impl Registry {
     }
 }
 
-/// 旧版（version 1）标签存在 installs[].tags 上（按副本）；从 JSON 中摘除该字段，
-/// 返回 (source, skill, tags) 列表，由 load 并入技能级 skill_tags。
-fn take_legacy_install_tags(value: &mut serde_json::Value) -> Vec<(String, String, Vec<String>)> {
-    let mut out = Vec::new();
-    let Some(installs) = value.get_mut("installs").and_then(|v| v.as_array_mut()) else {
-        return out;
-    };
-    for inst in installs {
-        let Some(obj) = inst.as_object_mut() else {
-            continue;
-        };
-        let Some(tags) = obj.remove("tags") else {
-            continue;
-        };
-        let (Some(source), Some(skill)) = (
-            obj.get("source").and_then(|v| v.as_str()),
-            obj.get("skill").and_then(|v| v.as_str()),
-        ) else {
-            continue;
-        };
-        let tags: Vec<String> = tags
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|t| t.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !tags.is_empty() {
-            out.push((source.to_string(), skill.to_string(), tags));
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,7 +165,7 @@ mod tests {
             source: "github/mattpocock/skills".into(),
             source_path: "skills/web-design".into(),
             target: TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
             method: Method::Copy,
             commit: "a1b2c3d".into(),
@@ -223,7 +186,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = Layout::at(tmp.path().to_path_buf());
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         reg.sources.insert(
@@ -243,26 +206,26 @@ mod tests {
         assert_eq!(loaded.sources["github/a/b"].commit, "deadbeef");
         // 落盘 JSON 与规格字段一致
         let raw = std::fs::read_to_string(layout.registry_path()).unwrap();
-        assert!(raw.contains("\"kind\": \"global\""));
+        assert!(raw.contains("\"scope\": \"global\""));
         assert!(raw.contains("\"method\": \"copy\""));
     }
 
     #[test]
     fn find_and_remove_by_skill_and_target() {
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         reg.installs.push(sample_install());
         let t = TargetRec::Global {
-            name: "agents".into(),
+            agent: "agents".into(),
         };
         assert!(reg.find("web-design", &t).is_some());
         assert!(
             reg.find(
                 "web-design",
                 &TargetRec::Global {
-                    name: "claude".into()
+                    agent: "claude".into()
                 }
             )
             .is_none()
@@ -277,7 +240,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = Layout::at(tmp.path().to_path_buf());
         let mut reg = Registry {
-            version: 2,
+            version: 3,
             ..Default::default()
         };
         reg.skill_tags
@@ -292,56 +255,33 @@ mod tests {
     }
 
     #[test]
-    fn legacy_install_tags_migrate_to_skill_tags() {
-        // 旧版（version 1）标签挂在 installs[].tags 上，按副本存；
-        // 加载时迁移为技能级 skill_tags（同技能多副本取并集去重）
-        let tmp = tempfile::tempdir().unwrap();
-        let layout = Layout::at(tmp.path().to_path_buf());
-        std::fs::write(
-            layout.registry_path(),
-            r#"{
-  "version": 1,
-  "sources": {},
-  "installs": [
-    {"skill":"a","source":"github/o/r","source_path":"skills/a","target":{"kind":"global","name":"agents"},"method":"copy","commit":"c1","tags":["frontend","ui"],"auto_update":null,"installed_at":"t"},
-    {"skill":"a","source":"github/o/r","source_path":"skills/a","target":{"kind":"global","name":"claude"},"method":"symlink","commit":"c1","tags":["ui"],"auto_update":null,"installed_at":"t"}
-  ]
-}"#,
-        )
-        .unwrap();
-        let reg = Registry::load(&layout).unwrap();
-        assert_eq!(reg.tags_of("github/o/r", "a"), &["frontend", "ui"]);
-        assert_eq!(reg.version, 2);
-        // 迁移后落盘：installs 不再携带 tags，skill_tags 段存在
-        reg.save(&layout).unwrap();
-        let raw = std::fs::read_to_string(layout.registry_path()).unwrap();
-        assert!(raw.contains("\"skill_tags\""));
-        assert!(!raw.contains("\"tags\""));
+    fn target_rec_v3_roundtrip() {
+        let rec = TargetRec::Global {
+            agent: "claude-code".into(),
+        };
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"scope": "global", "agent": "claude-code"})
+        );
+        let back: TargetRec = serde_json::from_value(v).unwrap();
+        assert_eq!(back, rec);
+        let p = TargetRec::Project {
+            agent: "codex".into(),
+            root: PathBuf::from("/x"),
+        };
+        let back: TargetRec = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
     }
 
     #[test]
-    fn target_rec_serde_shape() {
-        let g = serde_json::to_string(&TargetRec::Global {
-            name: "agents".into(),
-        })
-        .unwrap();
-        assert_eq!(g, r#"{"kind":"global","name":"agents"}"#);
-        let p = serde_json::to_string(&TargetRec::Project { root: "/x".into() }).unwrap();
-        assert_eq!(p, r#"{"kind":"project","root":"/x"}"#);
-    }
-
-    #[test]
-    fn legacy_registry_without_favorites_loads() {
-        // 向后兼容：收藏功能上线前的旧版 registry.json 没有 favorites 段
+    fn load_rejects_legacy_version() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = Layout::at(tmp.path().to_path_buf());
-        std::fs::write(
-            layout.registry_path(),
-            r#"{"version":1,"sources":{},"installs":[]}"#,
-        )
-        .unwrap();
-        let reg = Registry::load(&layout).unwrap();
-        assert!(reg.favorites.is_empty());
+        // v2 旧格式（target 带 kind 标签）必须被拒绝，不得静默吞掉
+        std::fs::write(layout.registry_path(), r#"{"version":2,"sources":{},"installs":[{"skill":"a","source":"s","source_path":"s","target":{"kind":"global","name":"agents"},"method":"copy","commit":"c","installed_at":"t"}]}"#).unwrap();
+        let err = Registry::load(&layout).unwrap_err();
+        assert!(err.to_string().contains("registry.json"), "{err}");
     }
 
     #[test]
@@ -349,7 +289,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = Layout::at(tmp.path().to_path_buf());
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         reg.favorites.insert(
@@ -379,20 +319,23 @@ mod tests {
     fn target_rec_to_target_maps_both_kinds() {
         assert_eq!(
             TargetRec::Global {
-                name: "agents".into()
+                agent: "agents".into()
             }
             .to_target(),
-            crate::core::paths::Target::Global {
-                name: "agents".into()
+            crate::core::paths::Target {
+                agent: "agents".into(),
+                scope: crate::core::paths::Scope::Global,
             }
         );
         assert_eq!(
             TargetRec::Project {
+                agent: "agents".into(),
                 root: PathBuf::from("/x")
             }
             .to_target(),
-            crate::core::paths::Target::Project {
-                root: PathBuf::from("/x")
+            crate::core::paths::Target {
+                agent: "agents".into(),
+                scope: crate::core::paths::Scope::Project(PathBuf::from("/x")),
             }
         );
     }

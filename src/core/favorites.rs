@@ -214,7 +214,7 @@ mod tests {
     use super::*;
     use crate::core::config::Config;
     use crate::core::install::COPY_MANIFEST;
-    use crate::core::paths::Target;
+    use crate::core::paths::{Scope, Target};
     use crate::core::registry::Method;
     use crate::core::source::parse_source;
     use std::path::PathBuf;
@@ -237,7 +237,7 @@ mod tests {
         )
         .unwrap();
         let reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         (tmp, layout, reg, src)
@@ -368,7 +368,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = Layout::at(tmp.path().join(".skills"));
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         // 根级 SKILL.md 的单技能仓库
@@ -406,8 +406,9 @@ mod tests {
             &mut reg,
             "local/src",
             "alpha",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Copy,
         )
@@ -423,8 +424,9 @@ mod tests {
     fn fav_install_unknown_favorite_or_skill_errors() {
         let (_t, layout, cfg, mut reg, src) = setup_with_cfg();
         bookmark(&layout, &mut reg, &local_spec(&src), &[]).unwrap();
-        let t = Target::Global {
-            name: "agents".into(),
+        let t = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
         };
         assert!(matches!(
             fav_install(
@@ -465,8 +467,9 @@ mod tests {
             &mut reg,
             "local/src",
             "beta",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Copy,
         )
@@ -486,8 +489,9 @@ mod tests {
             &mut reg,
             "local/src",
             "alpha",
-            &Target::Global {
-                name: "agents".into(),
+            &Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Copy,
         )
@@ -500,8 +504,9 @@ mod tests {
     fn fav_install_conflict_returns_decision_request() {
         let (_t, layout, cfg, mut reg, src) = setup_with_cfg();
         bookmark(&layout, &mut reg, &local_spec(&src), &[]).unwrap();
-        let t = Target::Global {
-            name: "agents".into(),
+        let t = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
         };
         fav_install(
             &layout,

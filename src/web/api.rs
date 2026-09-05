@@ -528,6 +528,7 @@ async fn list_targets(State(s): S) -> Result<Json<serde_json::Value>, (StatusCod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::paths::Scope;
     use crate::core::registry::{Install, Method, TargetRec};
     use tower::ServiceExt; // oneshot
 
@@ -535,7 +536,7 @@ mod tests {
         let tmp = Arc::new(tempfile::tempdir().unwrap());
         let layout = Layout::at(tmp.path().join(".skills"));
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         reg.installs.push(Install {
@@ -543,7 +544,7 @@ mod tests {
             source: "github/o/r".into(),
             source_path: "skills/alpha".into(),
             target: TargetRec::Global {
-                name: "agents".into(),
+                agent: "agents".into(),
             },
             method: Method::Copy,
             commit: "c1".into(),
@@ -595,7 +596,7 @@ mod tests {
                     .body(axum::body::Body::from(
                         serde_json::to_string(&serde_json::json!({
                             "skill": "alpha",
-                            "target": {"kind": "global", "name": "agents"},
+                            "target": {"scope": "global", "agent": "agents"},
                             "value": true
                         }))
                         .unwrap(),
@@ -727,7 +728,7 @@ mod tests {
                 serde_json::json!({
                     "source": src.to_str().unwrap(),
                     "skills": ["sa"],
-                    "targets": [{"kind": "global", "name": "agents"}],
+                    "targets": [{"scope": "global", "agent": "agents"}],
                     "method": "copy",
                 }),
             ))
@@ -759,7 +760,7 @@ mod tests {
                 serde_json::json!({
                     "source": src.to_str().unwrap(),
                     "skills": ["sa", "ghost"],
-                    "targets": [{"kind": "global", "name": "agents"}],
+                    "targets": [{"scope": "global", "agent": "agents"}],
                     "method": "copy",
                 }),
             ))
@@ -783,7 +784,7 @@ mod tests {
             serde_json::json!({
                 "source": src.to_str().unwrap(),
                 "skills": ["sa"],
-                "targets": [{"kind": "global", "name": "agents"}],
+                "targets": [{"scope": "global", "agent": "agents"}],
                 "method": "copy",
                 "overwrite": overwrite,
             })
@@ -825,8 +826,8 @@ mod tests {
                     "source": src.to_str().unwrap(),
                     "skills": ["sa"],
                     "targets": [
-                        {"kind": "global", "name": "agents"},
-                        {"kind": "global", "name": "claude"}
+                        {"scope": "global", "agent": "agents"},
+                        {"scope": "global", "agent": "claude"}
                     ],
                     "method": "copy",
                 }),
@@ -1005,7 +1006,7 @@ mod tests {
 
         let cfg = crate::core::config::Config::load(&layout).unwrap();
         let mut reg = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         reg.sources.insert(
@@ -1024,8 +1025,9 @@ mod tests {
             "github/o/r",
             "alpha",
             "skills/alpha",
-            &crate::core::paths::Target::Global {
-                name: "agents".into(),
+            &crate::core::paths::Target {
+                agent: "agents".into(),
+                scope: Scope::Global,
             },
             Method::Copy,
             &c1,
@@ -1253,7 +1255,7 @@ mod tests {
                 serde_json::json!({
                     "source": "local/mysrc",
                     "skill": "alpha",
-                    "targets": [{"kind": "global", "name": "agents"}],
+                    "targets": [{"scope": "global", "agent": "agents"}],
                     "method": "copy",
                     "overwrite": overwrite
                 }),
@@ -1276,7 +1278,7 @@ mod tests {
                 serde_json::json!({
                     "source": "local/mysrc",
                     "skill": "nope",
-                    "targets": [{"kind": "global", "name": "agents"}]
+                    "targets": [{"scope": "global", "agent": "agents"}]
                 }),
             ))
             .await

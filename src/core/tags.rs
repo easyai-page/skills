@@ -37,7 +37,7 @@ mod tests {
 
     fn reg() -> Registry {
         let mut r = Registry {
-            version: 1,
+            version: 3,
             ..Default::default()
         };
         // a 同时装到 agents 与 claude（同来源）；b 装到 agents；
@@ -52,7 +52,7 @@ mod tests {
                 skill: skill.into(),
                 source: source.into(),
                 source_path: format!("skills/{skill}").into(),
-                target: TargetRec::Global { name: name.into() },
+                target: TargetRec::Global { agent: name.into() },
                 method: Method::Copy,
                 commit: "c1".into(),
                 auto_update: None,
