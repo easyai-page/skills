@@ -46,14 +46,9 @@ pub fn validate_config_toml(text: &str) -> Result<()> {
 
 impl Default for Config {
     fn default() -> Self {
-        let mut targets = BTreeMap::new();
-        if let Some(home) = dirs::home_dir() {
-            targets.insert("agents".into(), home.join(".agents").join("skills"));
-            targets.insert("claude".into(), home.join(".claude").join("skills"));
-            targets.insert("codex".into(), home.join(".codex").join("skills"));
-        }
+        // 内置默认已进 agents 注册表；cfg.targets 只装配置文件里的覆盖/自定义项
         Config {
-            targets,
+            targets: BTreeMap::new(),
             default_method: Method::Symlink,
             web_port: 7823,
         }
@@ -90,13 +85,16 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::agents;
     use crate::core::paths::Layout;
 
     #[test]
     fn no_config_file_uses_builtin_defaults() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = Config::load(&Layout::at(tmp.path().to_path_buf())).unwrap();
-        assert!(cfg.targets.contains_key("agents"));
+        assert!(cfg.targets.is_empty());
+        // 内置默认走 agents 注册表，不经 cfg.targets
+        assert!(agents::resolve("claude-code", &cfg.targets).is_ok());
         assert_eq!(cfg.web_port, 7823);
         assert_eq!(cfg.default_method, Method::Symlink);
     }
@@ -120,7 +118,12 @@ cursor = "~/.cursor/skills"
         assert_eq!(cfg.default_method, Method::Copy);
         assert_eq!(cfg.web_port, 9000);
         assert!(cfg.targets.contains_key("cursor"));
-        assert!(cfg.targets.contains_key("agents")); // 内置的还在
+        // 覆盖/自定义项经 agents::resolve 解析出展开后的全局路径
+        let resolved = agents::resolve("cursor", &cfg.targets).unwrap();
+        assert_eq!(
+            resolved.global_dir.unwrap(),
+            dirs::home_dir().unwrap().join(".cursor").join("skills")
+        );
     }
 
     #[test]

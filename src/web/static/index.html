@@ -64,7 +64,7 @@ function show(id) {
   for (const d of ['installs-view','sources','favorites']) document.getElementById(d).style.display = d===id?'':'none';
   refresh();
 }
-function targetRef(i) { return i.target.kind==='global' ? i.target.name : i.target.root; }
+function targetRef(i) { return i.target.scope==='global' ? i.target.agent : i.target.root; }
 function renderInstalls(installs) {
   const table = el('table');
   const head = el('tr');
@@ -74,7 +74,7 @@ function renderInstalls(installs) {
     const tr = el('tr');
     tr.appendChild(el('td', i.skill));
     tr.appendChild(el('td', i.method));
-    tr.appendChild(el('td', i.target.kind + ':' + targetRef(i)));
+    tr.appendChild(el('td', i.target.scope + ':' + targetRef(i)));
 
     const tagInput = document.createElement('input');
     tagInput.value = i.tags.join(',');
@@ -89,14 +89,14 @@ function renderInstalls(installs) {
         opt.selected = v === '' ? i.auto_update === null : i.auto_update === (v === 'true');
         sel.appendChild(opt);
       }
-      sel.addEventListener('change', () => setAU(i.skill, i.target.kind, targetRef(i), sel.value));
+      sel.addEventListener('change', () => setAU(i.skill, i.target.scope, targetRef(i), sel.value));
       cell(tr, sel);
     } else {
       tr.appendChild(el('td', '跟随包级'));
     }
 
     const rmBtn = el('button', '删除');
-    rmBtn.addEventListener('click', () => rm(i.skill, i.target.kind, targetRef(i)));
+    rmBtn.addEventListener('click', () => rm(i.skill, i.target.scope, targetRef(i)));
     cell(tr, rmBtn);
     table.appendChild(tr);
   }
@@ -218,8 +218,8 @@ async function targetMethodPicker() {
   return {
     container,
     targets: () => {
-      const out = boxes.filter(b => b.checked).map(b => ({kind:'global', name: b.value}));
-      if (pcb.checked) out.push({kind:'project', root: pathInput.value.trim()});
+      const out = boxes.filter(b => b.checked).map(b => ({scope:'global', agent: b.value}));
+      if (pcb.checked) out.push({scope:'project', agent:'agents', root: pathInput.value.trim()});
       return out;
     },
     method: () => msel.value,
@@ -374,7 +374,7 @@ async function refresh() {
   const favs = await api('favorites');
   document.getElementById('fav-list').replaceChildren(renderFavorites(favs));
 }
-function targetBody(kind, ref) { return kind==='global' ? {kind:'global',name:ref} : {kind:'project',root:ref}; }
+function targetBody(kind, ref) { return kind==='global' ? {scope:'global',agent:ref} : {scope:'project',agent:'agents',root:ref}; }
 async function setAU(skill, kind, ref, v) {
   await api('auto-update', {method:'POST', headers:{'content-type':'application/json'},
     body: JSON.stringify({skill, target: targetBody(kind, ref), value: v===''?null:v==='true'})});

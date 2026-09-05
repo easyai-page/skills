@@ -23,7 +23,7 @@ pub fn remove_install(
 ) -> Result<RemoveOutcome> {
     let rec = reg
         .find(skill, target)
-        .ok_or_else(|| Error::NotInstalled(format!("{skill} @ {target:?}")))?
+        .ok_or_else(|| Error::NotInstalled(format!("{skill} @ {}", target.to_target())))?
         .clone();
     validate_record(&rec)?;
 

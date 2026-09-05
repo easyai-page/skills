@@ -1289,7 +1289,16 @@ mod tests {
 
     #[tokio::test]
     async fn targets_endpoint_lists_configured() {
-        let app = router(test_state());
+        let state = test_state();
+        // Config::default 不再预填 targets（内置默认在 agents 注册表），
+        // /api/targets 只列配置文件里的覆盖/自定义项
+        std::fs::create_dir_all(state.layout.root.clone()).unwrap();
+        std::fs::write(
+            state.layout.config_path(),
+            "[targets]\ncursor = \"~/.cursor/skills\"\n",
+        )
+        .unwrap();
+        let app = router(state);
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -1310,6 +1319,6 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        assert!(names.contains(&"agents"), "{names:?}");
+        assert_eq!(names, ["cursor"], "{names:?}");
     }
 }

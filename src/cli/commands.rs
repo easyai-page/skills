@@ -51,10 +51,10 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             for i in rows {
                 println!(
-                    "{}\t{:?}\t{:?}\ttags={:?}\tauto_update={:?}",
+                    "{}\t{:?}\t{}\ttags={:?}\tauto_update={:?}",
                     i.skill,
                     i.method,
-                    i.target,
+                    i.target.to_target(),
                     reg.tags_of(&i.source, &i.skill),
                     i.auto_update
                 );
@@ -173,13 +173,15 @@ pub fn run(cli: Cli) -> Result<()> {
             let mut failed = 0usize;
             for (s, t) in unique {
                 match remove::remove_install(&layout, &cfg, &mut reg, &s, &t) {
-                    Ok(remove::RemoveOutcome::Removed) => println!("已删除 {s} @ {t:?}"),
+                    Ok(remove::RemoveOutcome::Removed) => {
+                        println!("已删除 {s} @ {}", t.to_target())
+                    }
                     Ok(remove::RemoveOutcome::RecordOnly) => {
-                        println!("磁盘已不存在，仅清记录: {s} @ {t:?}")
+                        println!("磁盘已不存在，仅清记录: {s} @ {}", t.to_target())
                     }
                     // 单项失败不中断批量删除，但必须汇总后以非零退出，不得静默吞错
                     Err(e) => {
-                        eprintln!("删除失败 {s} @ {t:?}: {e}");
+                        eprintln!("删除失败 {s} @ {}: {e}", t.to_target());
                         failed += 1;
                     }
                 }
@@ -246,9 +248,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!("软连接跟随: {:?}", plan.symlinks);
                 for c in &plan.copies {
                     println!(
-                        "{} @ {:?}: {}（{}）",
+                        "{} @ {}: {}（{}）",
                         c.skill,
-                        c.target,
+                        c.target.to_target(),
                         if c.update { "更新" } else { "跳过" },
                         c.reason
                     );
@@ -432,21 +434,6 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// `-g` 且未显式 --target 时的默认安装目标：配置里第一个可用 global target
-/// （BTreeMap 按名字排序，内置默认下即 agents）。用户删光 target 时给明确错误。
-fn default_global_target(cfg: &Config) -> Result<Target> {
-    cfg.targets
-        .keys()
-        .next()
-        .map(|name| Target {
-            agent: name.clone(),
-            scope: Scope::Global,
-        })
-        .ok_or_else(|| {
-            Error::Msg("没有可用的全局 target：请先 skills config targets add <name> <路径>".into())
-        })
-}
-
 /// 标量值推断：纯数字存 Integer、true/false 存 Boolean，其余存 String。
 /// 否则 `config set web.port 9000` 会写成字符串，导致 Config::load 反序列化失败，锁死 CLI。
 fn scalar(value: &str) -> toml::Value {
@@ -627,8 +614,11 @@ fn resolve_targets(target: &[String], global: bool, cfg: &Config) -> Result<Vec<
         return target.iter().map(|s| Target::parse(s)).collect();
     }
     if global {
-        // -g：装进配置里第一个可用 global target（内置默认下即 agents）
-        return Ok(vec![default_global_target(cfg)?]);
+        // 临时：-g 暂等价 agents@global，任务 5 会重写 add 向导（按 agent 多选）
+        return Ok(vec![Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
+        }]);
     }
     if std::io::stdin().is_terminal() {
         return pick_targets_interactive(cfg);
@@ -704,7 +694,7 @@ fn install_loop(
         for t in targets {
             let installed = match install_fn(reg, s, t) {
                 Ok(()) => {
-                    println!("已安装 {s} → {t:?} ({method:?})");
+                    println!("已安装 {s} → {t} ({method:?})");
                     true
                 }
                 Err(Error::Conflict(p)) => {
@@ -742,30 +732,6 @@ fn install_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_global_target_picks_first_configured() {
-        // 内置默认 agents < claude < codex（按名字排序），与简报“等价 global:agents”一致
-        let cfg = Config::default();
-        let t = default_global_target(&cfg).unwrap();
-        assert_eq!(
-            t,
-            Target {
-                agent: "agents".into(),
-                scope: Scope::Global
-            }
-        );
-    }
-
-    #[test]
-    fn default_global_target_errors_when_targets_empty() {
-        let cfg = Config {
-            targets: Default::default(),
-            ..Config::default()
-        };
-        let err = default_global_target(&cfg).unwrap_err();
-        assert!(format!("{err}").contains("没有可用的全局 target"), "{err}");
-    }
 
     #[test]
     fn validate_config_set_rejects_bad_known_scalars() {

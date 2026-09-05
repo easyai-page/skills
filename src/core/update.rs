@@ -55,7 +55,7 @@ pub fn build_plan(reg: &Registry, selection: Option<&Selection>) -> Plan {
                 }
             }
             None => {
-                plan.missing = Some(format!("{} @ {:?}", sel.skill, sel.target));
+                plan.missing = Some(format!("{} @ {}", sel.skill, sel.target.to_target()));
             }
         },
         None => {
@@ -132,7 +132,7 @@ pub fn execute_plan(
     for d in plan.copies.iter().filter(|c| c.update) {
         let rec = reg
             .find(&d.skill, &d.target)
-            .ok_or_else(|| Error::NotInstalled(format!("{} @ {:?}", d.skill, d.target)))?
+            .ok_or_else(|| Error::NotInstalled(format!("{} @ {}", d.skill, d.target.to_target())))?
             .clone();
         // 与 remove 相同的前置防线：记录校验 + 副本归属核验；无法确认归属则不删不更新。
         super::remove::validate_record(&rec)?;
@@ -162,7 +162,11 @@ pub fn execute_plan(
         {
             mut_inst.commit = commit;
         }
-        done.push(format!("副本 {} @ {:?} 已更新", d.skill, d.target));
+        done.push(format!(
+            "副本 {} @ {} 已更新",
+            d.skill,
+            d.target.to_target()
+        ));
     }
     for name in &plan.symlinks {
         for inst in reg
@@ -212,7 +216,7 @@ fn pre_scan_local_modifications(
         }
         let lines = super::manifest::detect_local_modifications(&dest)?;
         if !lines.is_empty() {
-            report.push(format!("{} @ {:?}:", d.skill, d.target));
+            report.push(format!("{} @ {}:", d.skill, d.target.to_target()));
             report.extend(lines.into_iter().map(|line| format!("  - {line}")));
         }
     }

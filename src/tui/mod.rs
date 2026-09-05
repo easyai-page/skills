@@ -194,7 +194,7 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
                 method,
                 &cached.commit,
             ) {
-                Ok(_) => println!("已安装 {} → {target:?} ({method:?})", entry.name),
+                Ok(_) => println!("已安装 {} → {target} ({method:?})", entry.name),
                 Err(Error::Conflict(p)) => {
                     let overwrite = dialoguer::Confirm::new()
                         .with_prompt(format!("{p:?} 已存在，覆盖？"))
@@ -214,9 +214,9 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
                             method,
                             &cached.commit,
                         )?;
-                        println!("已覆盖安装 {} → {target:?} ({method:?})", entry.name);
+                        println!("已覆盖安装 {} → {target} ({method:?})", entry.name);
                     } else {
-                        println!("跳过 {} → {target:?}", entry.name);
+                        println!("跳过 {} → {target}", entry.name);
                     }
                 }
                 Err(e) => return Err(e),
@@ -341,7 +341,7 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
     for s in &picked {
         for target in &targets {
             match favorites::fav_install(layout, cfg, &mut app.registry, &key, s, target, method) {
-                Ok(_) => println!("已安装 {s} → {target:?} ({method:?})"),
+                Ok(_) => println!("已安装 {s} → {target} ({method:?})"),
                 Err(Error::Conflict(p)) => {
                     let overwrite = dialoguer::Confirm::new()
                         .with_prompt(format!("{p:?} 已存在，覆盖？"))
@@ -359,9 +359,9 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
                             target,
                             method,
                         )?;
-                        println!("已覆盖安装 {s} → {target:?} ({method:?})");
+                        println!("已覆盖安装 {s} → {target} ({method:?})");
                     } else {
-                        println!("跳过 {s} → {target:?}");
+                        println!("跳过 {s} → {target}");
                     }
                 }
                 Err(e) => return Err(e),
