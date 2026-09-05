@@ -34,6 +34,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/installs", get(list_installs))
+        .route("/api/scan", post(scan_source))
+        .route("/api/install", post(install_from_source))
         .route("/api/sources", get(list_sources))
         .route("/api/auto-update", post(set_auto_update))
         .route("/api/tags", post(set_tags))
@@ -69,6 +71,154 @@ async fn list_sources(State(s): S) -> Json<serde_json::Value> {
     let s = s.lock().unwrap();
     let reg = Registry::load(&s.layout).unwrap_or_default();
     Json(serde_json::json!(reg.sources))
+}
+
+#[derive(serde::Deserialize)]
+struct ScanReq {
+    source: String,
+}
+
+/// 扫描 source 的技能列表（安装前的预览步骤）：已缓存则复用，语义同 CLI add 的缓存复用。
+async fn scan_source(
+    State(s): S,
+    Json(req): Json<ScanReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let s = s.lock().unwrap();
+    let spec = crate::core::source::parse_source(&req.source)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+    let cached = crate::core::cache::ensure_cached(&s.layout, &spec)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("缓存失败: {e}")))?;
+    let skills = crate::core::cache::scan_skills(&cached.path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("扫描失败: {e}")))?;
+    let skills: Vec<serde_json::Value> = skills
+        .iter()
+        .map(|e| serde_json::json!({"name": e.name, "description": e.description}))
+        .collect();
+    Ok(Json(serde_json::json!({
+        "key": spec.key,
+        "commit": cached.commit,
+        "skills": skills,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct InstallReq {
+    source: String,
+    skills: Vec<String>,
+    target: TargetRec,
+    method: Option<Method>,
+    overwrite: Option<bool>,
+}
+
+/// 从仓库批量安装选中的技能。技能存在性校验前置（任一不存在即整体 400，同 CLI add）；
+/// 逐条安装逐条落盘（同 CLI install_loop：中途失败不留孤儿副本）；
+/// 目标已存在 → 409 + 明细，前端确认后带 overwrite=true 重试（同 favorites/install 确认链）。
+async fn install_from_source(
+    State(s): S,
+    Json(req): Json<InstallReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let s = s.lock().unwrap();
+    // config 损坏必须显式 500（同 run_update：静默回退默认会把内置 target 解析到真实 home 并落盘）
+    let cfg = crate::core::config::Config::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 config 失败: {e}"),
+        )
+    })?;
+    let mut reg = Registry::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 registry 失败: {e}"),
+        )
+    })?;
+    let spec = crate::core::source::parse_source(&req.source)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+    let cached = crate::core::cache::ensure_cached(&s.layout, &spec)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("缓存失败: {e}")))?;
+    let all = crate::core::cache::scan_skills(&cached.path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("扫描失败: {e}")))?;
+    if req.skills.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "未选择技能".into()));
+    }
+    for name in &req.skills {
+        if !all.iter().any(|e| &e.name == name) {
+            return Err((StatusCode::BAD_REQUEST, format!("仓库中无技能 {name}")));
+        }
+    }
+    let target = req.target.to_target();
+    let method = req.method.unwrap_or(cfg.default_method);
+    let overwrite = req.overwrite.unwrap_or(false);
+    reg.sources
+        .entry(spec.key.clone())
+        .or_insert(crate::core::registry::SourceRecord {
+            url: spec.url.clone().unwrap_or_default(),
+            commit: cached.commit.clone(),
+            fetched_at: chrono::Utc::now().to_rfc3339(),
+            auto_update: None,
+        });
+    let mut installed = Vec::new();
+    for name in &req.skills {
+        let entry = all.iter().find(|e| &e.name == name).expect("刚校验过存在");
+        let result = crate::core::install::install_skill(
+            &s.layout,
+            &cfg,
+            &mut reg,
+            &spec.key,
+            &entry.name,
+            &entry.rel_path.to_string_lossy(),
+            &target,
+            method,
+            &cached.commit,
+        );
+        match result {
+            Ok(_) => {}
+            Err(crate::core::error::Error::Conflict(p)) => {
+                if !overwrite {
+                    return Err((StatusCode::CONFLICT, format!("{p:?} 已存在")));
+                }
+                // 与 CLI 的覆盖路径一致：先按记录删（无记录则忽略），再重装
+                let _ = crate::core::remove::remove_install(
+                    &s.layout,
+                    &cfg,
+                    &mut reg,
+                    name,
+                    &req.target,
+                );
+                crate::core::install::install_skill(
+                    &s.layout,
+                    &cfg,
+                    &mut reg,
+                    &spec.key,
+                    &entry.name,
+                    &entry.rel_path.to_string_lossy(),
+                    &target,
+                    method,
+                    &cached.commit,
+                )
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("覆盖安装 {name} 失败: {e}"),
+                    )
+                })?;
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("安装 {name} 失败: {e}"),
+                ));
+            }
+        }
+        installed.push(name.clone());
+        // 逐条落盘：之后任一技能安装失败提前返回时，registry 与磁盘已写入的副本一致
+        reg.save(&s.layout).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("保存 registry 失败: {e}"),
+            )
+        })?;
+    }
+    Ok(Json(serde_json::json!({ "installed": installed })))
 }
 
 #[derive(serde::Deserialize)]
@@ -487,6 +637,173 @@ mod tests {
         let reg = Registry::load(&Layout::at(layout_root)).unwrap();
         // 覆盖式写入技能级标签，原有 frontend 被替换
         assert_eq!(reg.tags_of("github/o/r", "alpha"), &["backend"]);
+        drop(keep);
+    }
+
+    // ---- 从仓库安装（多技能选择） ----
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// agents target 重定向到临时目录的 AppState，避免安装测试落盘到真实 home
+    fn test_state_with_target() -> AppState {
+        let tmp = Arc::new(tempfile::tempdir().unwrap());
+        let layout = Layout::at(tmp.path().join(".skills"));
+        std::fs::create_dir_all(&layout.root).unwrap();
+        let mut targets = toml::value::Table::new();
+        targets.insert(
+            "agents".into(),
+            toml::Value::String(tmp.path().join("agents").to_string_lossy().into_owned()),
+        );
+        let mut doc = toml::value::Table::new();
+        doc.insert("targets".into(), toml::Value::Table(targets));
+        std::fs::write(layout.config_path(), toml::to_string(&doc).unwrap()).unwrap();
+        AppState { layout, tmp }
+    }
+
+    /// 多技能本地源：skills/sa、skills/sb 两个技能
+    fn make_multi_skill_source(parent: &std::path::Path) -> std::path::PathBuf {
+        let src = parent.join("multi-src");
+        for (name, desc) in [("sa", "技能 A"), ("sb", "技能 B")] {
+            let dir = src.join("skills").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {desc}\n---\n"),
+            )
+            .unwrap();
+        }
+        src
+    }
+
+    #[tokio::test]
+    async fn scan_lists_all_skills_of_multi_skill_source() {
+        let state = test_state_with_target();
+        let src = make_multi_skill_source(state.tmp.path());
+        let app = router(state);
+        let resp = app
+            .oneshot(post_json(
+                "/api/scan",
+                serde_json::json!({"source": src.to_str().unwrap()}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["key"], "local/multi-src");
+        let skills: Vec<(&str, &str)> = v["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["name"].as_str().unwrap(),
+                    s["description"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert!(skills.contains(&("sa", "技能 A")), "{skills:?}");
+        assert!(skills.contains(&("sb", "技能 B")), "{skills:?}");
+    }
+
+    #[tokio::test]
+    async fn install_selected_skills_only() {
+        let state = test_state_with_target();
+        let layout_root = state.layout.root.clone();
+        let tmp_root = state.tmp.path().to_path_buf();
+        let keep = state.tmp.clone();
+        let src = make_multi_skill_source(&tmp_root);
+        let app = router(state);
+        let resp = app
+            .oneshot(post_json(
+                "/api/install",
+                serde_json::json!({
+                    "source": src.to_str().unwrap(),
+                    "skills": ["sa"],
+                    "target": {"kind": "global", "name": "agents"},
+                    "method": "copy",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["installed"], serde_json::json!(["sa"]));
+        // 只装选中的 sa：registry 与磁盘都没有 sb
+        let reg = Registry::load(&Layout::at(layout_root)).unwrap();
+        assert_eq!(reg.installs.len(), 1);
+        assert_eq!(reg.installs[0].skill, "sa");
+        assert!(tmp_root.join("agents/sa/SKILL.md").exists());
+        assert!(!tmp_root.join("agents/sb").exists());
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn install_rejects_unknown_skill_before_any_install() {
+        let state = test_state_with_target();
+        let layout_root = state.layout.root.clone();
+        let tmp_root = state.tmp.path().to_path_buf();
+        let keep = state.tmp.clone();
+        let src = make_multi_skill_source(&tmp_root);
+        let app = router(state);
+        let resp = app
+            .oneshot(post_json(
+                "/api/install",
+                serde_json::json!({
+                    "source": src.to_str().unwrap(),
+                    "skills": ["sa", "ghost"],
+                    "target": {"kind": "global", "name": "agents"},
+                    "method": "copy",
+                }),
+            ))
+            .await
+            .unwrap();
+        // 任一技能不存在即整体 400：校验前置，sa 也不得安装（同 CLI add 语义）
+        assert_eq!(resp.status(), 400);
+        let reg = Registry::load(&Layout::at(layout_root)).unwrap();
+        assert!(reg.installs.is_empty());
+        assert!(!tmp_root.join("agents/sa").exists());
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn install_conflict_409_then_overwrite_succeeds() {
+        let state = test_state_with_target();
+        let tmp_root = state.tmp.path().to_path_buf();
+        let keep = state.tmp.clone();
+        let src = make_multi_skill_source(&tmp_root);
+        let body = |overwrite: bool| {
+            serde_json::json!({
+                "source": src.to_str().unwrap(),
+                "skills": ["sa"],
+                "target": {"kind": "global", "name": "agents"},
+                "method": "copy",
+                "overwrite": overwrite,
+            })
+        };
+        let app = router(state);
+        let resp = app
+            .clone()
+            .oneshot(post_json("/api/install", body(false)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // 已存在 → 409，前端确认后带 overwrite=true 重试（同 favorites/install 确认链）
+        let resp = app
+            .clone()
+            .oneshot(post_json("/api/install", body(false)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let resp = app
+            .oneshot(post_json("/api/install", body(true)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
         drop(keep);
     }
 
