@@ -110,7 +110,8 @@ method = "copy"
 [web]
 port = 9000
 [targets]
-cursor = "~/.cursor/skills"
+cursor = "~/custom/skills"
+mytool = "~/mytool/skills"
 "#,
         )
         .unwrap();
@@ -118,11 +119,18 @@ cursor = "~/.cursor/skills"
         assert_eq!(cfg.default_method, Method::Copy);
         assert_eq!(cfg.web_port, 9000);
         assert!(cfg.targets.contains_key("cursor"));
-        // 覆盖/自定义项经 agents::resolve 解析出展开后的全局路径
+        // 覆盖分支：cursor 在内置表，[targets] 同名项必须压过内置值
+        // （内置是 ~/.cursor/skills，这里故意用不同路径，避免断言恒真）
         let resolved = agents::resolve("cursor", &cfg.targets).unwrap();
         assert_eq!(
             resolved.global_dir.unwrap(),
-            dirs::home_dir().unwrap().join(".cursor").join("skills")
+            dirs::home_dir().unwrap().join("custom").join("skills")
+        );
+        // 自定义分支：mytool 不在内置表，仅由 [targets] 定义
+        let custom = agents::resolve("mytool", &cfg.targets).unwrap();
+        assert_eq!(
+            custom.global_dir.unwrap(),
+            dirs::home_dir().unwrap().join("mytool").join("skills")
         );
     }
 

@@ -37,7 +37,7 @@ pub fn draw(f: &mut Frame, app: &AppState) {
                 Row::new(vec![
                     Cell::from(r.skill.clone()),
                     Cell::from(format!("{:?}", r.method)),
-                    Cell::from(format!("{:?}", r.target)),
+                    Cell::from(format!("{}", r.target.to_target())),
                     Cell::from(app.registry.tags_of(&r.source, &r.skill).join(",")),
                     Cell::from(match r.auto_update {
                         Some(true) => "开",
