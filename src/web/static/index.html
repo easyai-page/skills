@@ -179,50 +179,80 @@ async function rmFav(source, skills) {
     body: JSON.stringify({source, skill: skills})});
   refresh();
 }
-// 目标（可多选）+ 方式选择器：收藏安装（openInstall）与从仓库安装共用
+// 目标（agent 多选）+ 范围 + 方式选择器：收藏安装（openInstall）与从仓库安装共用
+// radio name 需页面唯一（安装面板与扫描面板可能同时存在），用递增序号区分
+let pickerSeq = 0;
 async function targetMethodPicker() {
-  const targets = await api('targets');
+  const data = await api('agents');
+  const seq = pickerSeq++;
   const container = el('span');
   const boxes = [];
-  targets.forEach((t, i) => {
+  // 全选快捷勾选
+  const allLabel = el('label');
+  const allCb = document.createElement('input');
+  allCb.type = 'checkbox';
+  allLabel.appendChild(allCb);
+  allLabel.appendChild(el('span', ' 全选 '));
+  container.appendChild(allLabel);
+  for (const a of data.agents) {
     const label = el('label');
     const cb = document.createElement('input');
     cb.type = 'checkbox';
-    cb.checked = i === 0; // 默认勾第一个 global target
-    cb.value = t.name;
+    cb.checked = a.detected; // 检测到的 agent 默认勾
+    cb.value = a.id;
+    cb.dataset.global = a.global_supported ? '1' : '';
     boxes.push(cb);
     label.appendChild(cb);
-    label.appendChild(el('span', ` global:${t.name}`));
+    label.appendChild(el('span', ` ${a.name} `));
     container.appendChild(label);
-  });
-  const plabel = el('label');
-  const pcb = document.createElement('input');
-  pcb.type = 'checkbox';
-  plabel.appendChild(pcb);
-  plabel.appendChild(el('span', ' project：'));
-  const pathInput = document.createElement('input');
-  pathInput.placeholder = '/abs/project/path';
-  pathInput.style.display = 'none';
-  pcb.addEventListener('change', () => {
-    pathInput.style.display = pcb.checked ? '' : 'none';
-  });
-  plabel.appendChild(pathInput);
-  container.appendChild(plabel);
-  const msel = document.createElement('select');
-  for (const [v, label] of [['', '默认'], ['symlink', 'symlink'], ['copy', 'copy']]) {
-    const o = el('option', label);
-    o.value = v;
-    msel.appendChild(o);
   }
-  container.appendChild(msel);
+  // 范围：项目默认；所选 agent 全不支持全局时禁用全局选项
+  container.appendChild(el('span', ' 范围 '));
+  const scopeRadios = [];
+  for (const [v, text] of [['project', '项目 ./'], ['global', '全局']]) {
+    const label = el('label');
+    const r = document.createElement('input');
+    r.type = 'radio';
+    r.name = `scope-${seq}`;
+    r.value = v;
+    r.checked = v === 'project';
+    scopeRadios.push(r);
+    label.appendChild(r);
+    label.appendChild(el('span', ` ${text} `));
+    container.appendChild(label);
+  }
+  const syncScope = () => {
+    const anyGlobal = boxes.some(b => b.checked && b.dataset.global);
+    const globalR = scopeRadios.find(r => r.value === 'global');
+    globalR.disabled = !anyGlobal;
+    if (!anyGlobal && globalR.checked) scopeRadios.find(r => r.value === 'project').checked = true;
+  };
+  boxes.forEach(b => b.addEventListener('change', syncScope));
+  allCb.addEventListener('change', () => {
+    boxes.forEach(b => b.checked = allCb.checked);
+    syncScope();
+  });
+  syncScope();
+  // 方式：symlink 默认 / copy
+  container.appendChild(el('span', ' 方式 '));
+  const methodRadios = [];
+  for (const [v, text] of [['symlink', 'symlink'], ['copy', 'copy']]) {
+    const label = el('label');
+    const r = document.createElement('input');
+    r.type = 'radio';
+    r.name = `method-${seq}`;
+    r.value = v;
+    r.checked = v === 'symlink';
+    methodRadios.push(r);
+    label.appendChild(r);
+    label.appendChild(el('span', ` ${text} `));
+    container.appendChild(label);
+  }
   return {
     container,
-    targets: () => {
-      const out = boxes.filter(b => b.checked).map(b => ({scope:'global', agent: b.value}));
-      if (pcb.checked) out.push({scope:'project', agent:'agents', root: pathInput.value.trim()});
-      return out;
-    },
-    method: () => msel.value,
+    agents: () => boxes.filter(b => b.checked).map(b => b.value),
+    scope: () => scopeRadios.find(r => r.checked).value,
+    method: () => methodRadios.find(r => r.checked).value,
   };
 }
 // 从仓库安装：扫描 → 勾选技能（默认全选，同收藏向导惯例）→ 批量安装
@@ -260,7 +290,7 @@ async function scanSource() {
   try {
     picker = await targetMethodPicker();
   } catch (e) {
-    alert('加载 targets 失败: ' + e.message);
+    alert('加载 agents 失败: ' + e.message);
     return;
   }
   const row = el('p');
@@ -280,13 +310,12 @@ async function installSelected(source, boxes, picker) {
     alert('未选择技能');
     return;
   }
-  const targets = picker.targets();
-  if (!targets.length) {
+  const agents = picker.agents();
+  if (!agents.length) {
     alert('未选择目标');
     return;
   }
-  const body = {source, skills, targets, overwrite: false};
-  if (picker.method()) body.method = picker.method();
+  const body = {source, skills, agents, scope: picker.scope(), method: picker.method(), overwrite: false};
   try {
     const r = await api('install', {method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify(body)});
@@ -312,7 +341,7 @@ async function installSelected(source, boxes, picker) {
     alert('安装失败: ' + e.message);
   }
 }
-// 安装面板：global target 下拉（/api/targets）+ project 绝对路径输入 + method 选择
+// 安装面板：agent 多选 + 范围/方式选择（数据来自 /api/agents）
 let installPanel = null;
 async function openInstall(source, skill) {
   if (installPanel) installPanel.remove();
@@ -320,7 +349,7 @@ async function openInstall(source, skill) {
   try {
     picker = await targetMethodPicker();
   } catch (e) {
-    alert('加载 targets 失败: ' + e.message);
+    alert('加载 agents 失败: ' + e.message);
     return;
   }
   const panel = el('p');
@@ -328,12 +357,12 @@ async function openInstall(source, skill) {
   panel.appendChild(picker.container);
   const ok = el('button', '确认安装');
   ok.addEventListener('click', () => {
-    const targets = picker.targets();
-    if (!targets.length) {
+    const agents = picker.agents();
+    if (!agents.length) {
       alert('未选择目标');
       return;
     }
-    doInstall(source, skill, targets, picker.method());
+    doInstall(source, skill, agents, picker.scope(), picker.method());
   });
   panel.appendChild(ok);
   const cancel = el('button', '取消');
@@ -342,9 +371,8 @@ async function openInstall(source, skill) {
   document.getElementById('favorites').appendChild(panel);
   installPanel = panel;
 }
-async function doInstall(source, skill, targets, method) {
-  const body = {source, skill, targets, overwrite: false};
-  if (method) body.method = method;
+async function doInstall(source, skill, agents, scope, method) {
+  const body = {source, skill, agents, scope, method, overwrite: false};
   try {
     await api('favorites/install', {method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify(body)});

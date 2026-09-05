@@ -8,7 +8,7 @@ use axum::{
 use std::sync::{Arc, Mutex};
 
 use crate::core::{
-    paths::Layout,
+    paths::{Layout, Scope},
     registry::{Method, Registry, TargetRec},
 };
 
@@ -44,7 +44,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/favorites", get(list_favorites).post(add_favorite))
         .route("/api/favorites/remove", post(remove_favorite))
         .route("/api/favorites/install", post(install_favorite))
-        .route("/api/targets", get(list_targets))
+        .route("/api/agents", get(list_agents))
         .with_state(Arc::new(Mutex::new(state)))
 }
 
@@ -53,6 +53,55 @@ async fn index() -> Html<&'static str> {
 }
 
 type S = State<Arc<Mutex<AppState>>>;
+
+/// agent 注册表视图 + 本机检测标记：安装面板的目标多选数据源（取代旧 /api/targets）。
+async fn list_agents(State(s): S) -> Json<serde_json::Value> {
+    let detected = crate::core::agents::detect_installed();
+    let _ = &s; // state 未用，但保持 handler 签名一致
+    Json(serde_json::json!({
+        "agents": crate::core::agents::all().iter().map(|a| serde_json::json!({
+            "id": a.id, "name": a.name, "project_dir": a.project_dir,
+            "global_supported": a.global_dir.is_some(),
+            "universal": a.universal,
+            "detected": detected.contains(&a.id),
+        })).collect::<Vec<_>>()
+    }))
+}
+
+/// 把安装请求的 agents + scope 展开为去重后的 TargetRec 列表（同 CLI add 向导的展开语义）。
+/// scope 缺省 = project（web 为本机工具，项目根取服务器进程 cwd）；
+/// 空 agents、非法 scope 值、未知 agent id 均为用户输入错误 → 400。
+fn expand_request_targets(
+    agents: &[String],
+    scope: &Option<String>,
+    cfg: &crate::core::config::Config,
+) -> Result<Vec<TargetRec>, (StatusCode, String)> {
+    if agents.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "未选择目标".into()));
+    }
+    let scope = match scope.as_deref() {
+        None | Some("project") => {
+            let root = std::env::current_dir().map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("获取项目根失败: {e}"),
+                )
+            })?;
+            Scope::Project(root)
+        }
+        Some("global") => Scope::Global,
+        Some(other) => return Err((StatusCode::BAD_REQUEST, format!("非法 scope: {other}"))),
+    };
+    let targets = crate::wizard::expand_targets(agents, &scope, cfg)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+    if targets.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "所选 agent 在该范围下均不可安装".into(),
+        ));
+    }
+    Ok(targets.iter().map(crate::core::install::to_rec).collect())
+}
 
 async fn list_installs(State(s): S) -> Json<serde_json::Value> {
     let s = s.lock().unwrap();
@@ -105,7 +154,8 @@ async fn scan_source(
 struct InstallReq {
     source: String,
     skills: Vec<String>,
-    targets: Vec<TargetRec>,
+    agents: Vec<String>,
+    scope: Option<String>, // "project" | "global"，默认 project
     method: Option<Method>,
     overwrite: Option<bool>,
 }
@@ -141,9 +191,7 @@ async fn install_from_source(
     if req.skills.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "未选择技能".into()));
     }
-    if req.targets.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "未选择目标".into()));
-    }
+    let targets = expand_request_targets(&req.agents, &req.scope, &cfg)?;
     for name in &req.skills {
         if !all.iter().any(|e| &e.name == name) {
             return Err((StatusCode::BAD_REQUEST, format!("仓库中无技能 {name}")));
@@ -162,7 +210,7 @@ async fn install_from_source(
     let mut installed = Vec::new();
     for name in &req.skills {
         let entry = all.iter().find(|e| &e.name == name).expect("刚校验过存在");
-        for trec in &req.targets {
+        for trec in &targets {
             let target = trec.to_target();
             let result = crate::core::install::install_skill(
                 &s.layout,
@@ -437,7 +485,8 @@ async fn remove_favorite(
 struct FavInstallReq {
     source: String,
     skill: String,
-    targets: Vec<TargetRec>,
+    agents: Vec<String>,
+    scope: Option<String>, // "project" | "global"，默认 project
     method: Option<Method>,
     overwrite: Option<bool>,
 }
@@ -464,12 +513,10 @@ async fn install_favorite(
     })?;
     let key = crate::core::favorites::resolve_key(&reg, &req.source)
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e}")))?;
-    if req.targets.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "未选择目标".into()));
-    }
+    let targets = expand_request_targets(&req.agents, &req.scope, &cfg)?;
     let method = req.method.unwrap_or(cfg.default_method);
     let overwrite = req.overwrite.unwrap_or(false);
-    for trec in &req.targets {
+    for trec in &targets {
         let target = trec.to_target();
         let do_install = |reg: &mut Registry| {
             crate::core::favorites::fav_install(
@@ -509,28 +556,40 @@ async fn install_favorite(
     Ok(Json(serde_json::json!({ "installed": req.skill })))
 }
 
-async fn list_targets(State(s): S) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let s = s.lock().unwrap();
-    let cfg = crate::core::config::Config::load(&s.layout).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("加载 config 失败: {e}"),
-        )
-    })?;
-    let v: Vec<serde_json::Value> = cfg
-        .targets
-        .iter()
-        .map(|(n, p)| serde_json::json!({ "name": n, "path": p }))
-        .collect();
-    Ok(Json(serde_json::json!(v)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::paths::Scope;
     use crate::core::registry::{Install, Method, TargetRec};
+    use axum::body::Body;
+    use axum::http::Request;
     use tower::ServiceExt; // oneshot
+
+    #[tokio::test]
+    async fn list_agents_returns_registry_with_detected_flag() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let agents = v["agents"].as_array().unwrap();
+        assert!(agents.len() >= 60);
+        let claude = agents.iter().find(|a| a["id"] == "claude-code").unwrap();
+        assert_eq!(claude["project_dir"], ".claude/skills");
+        assert!(claude.get("detected").is_some());
+        // eve 不支持全局
+        let eve = agents.iter().find(|a| a["id"] == "eve").unwrap();
+        assert_eq!(eve["global_supported"], false);
+    }
 
     fn test_state() -> AppState {
         let tmp = Arc::new(tempfile::tempdir().unwrap());
@@ -728,7 +787,8 @@ mod tests {
                 serde_json::json!({
                     "source": src.to_str().unwrap(),
                     "skills": ["sa"],
-                    "targets": [{"scope": "global", "agent": "agents"}],
+                    "agents": ["agents"],
+                    "scope": "global",
                     "method": "copy",
                 }),
             ))
@@ -760,7 +820,8 @@ mod tests {
                 serde_json::json!({
                     "source": src.to_str().unwrap(),
                     "skills": ["sa", "ghost"],
-                    "targets": [{"scope": "global", "agent": "agents"}],
+                    "agents": ["agents"],
+                    "scope": "global",
                     "method": "copy",
                 }),
             ))
@@ -784,7 +845,8 @@ mod tests {
             serde_json::json!({
                 "source": src.to_str().unwrap(),
                 "skills": ["sa"],
-                "targets": [{"scope": "global", "agent": "agents"}],
+                "agents": ["agents"],
+                "scope": "global",
                 "method": "copy",
                 "overwrite": overwrite,
             })
@@ -825,10 +887,8 @@ mod tests {
                 serde_json::json!({
                     "source": src.to_str().unwrap(),
                     "skills": ["sa"],
-                    "targets": [
-                        {"scope": "global", "agent": "agents"},
-                        {"scope": "global", "agent": "claude"}
-                    ],
+                    "agents": ["agents", "claude"],
+                    "scope": "global",
                     "method": "copy",
                 }),
             ))
@@ -844,7 +904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_rejects_empty_targets() {
+    async fn install_rejects_empty_agents() {
         let state = test_state_with_target();
         let tmp_root = state.tmp.path().to_path_buf();
         let keep = state.tmp.clone();
@@ -856,13 +916,38 @@ mod tests {
                 serde_json::json!({
                     "source": src.to_str().unwrap(),
                     "skills": ["sa"],
-                    "targets": [],
+                    "agents": [],
                     "method": "copy",
                 }),
             ))
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn install_rejects_invalid_scope() {
+        let state = test_state_with_target();
+        let tmp_root = state.tmp.path().to_path_buf();
+        let keep = state.tmp.clone();
+        let src = make_multi_skill_source(&tmp_root);
+        let app = router(state);
+        let resp = app
+            .oneshot(post_json(
+                "/api/install",
+                serde_json::json!({
+                    "source": src.to_str().unwrap(),
+                    "skills": ["sa"],
+                    "agents": ["agents"],
+                    "scope": "bogus",
+                    "method": "copy",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        assert!(!tmp_root.join("agents/sa").exists());
         drop(keep);
     }
 
@@ -1255,7 +1340,8 @@ mod tests {
                 serde_json::json!({
                     "source": "local/mysrc",
                     "skill": "alpha",
-                    "targets": [{"scope": "global", "agent": "agents"}],
+                    "agents": ["agents"],
+                    "scope": "global",
                     "method": "copy",
                     "overwrite": overwrite
                 }),
@@ -1278,47 +1364,13 @@ mod tests {
                 serde_json::json!({
                     "source": "local/mysrc",
                     "skill": "nope",
-                    "targets": [{"scope": "global", "agent": "agents"}]
+                    "agents": ["agents"],
+                    "scope": "global"
                 }),
             ))
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
         drop(keep);
-    }
-
-    #[tokio::test]
-    async fn targets_endpoint_lists_configured() {
-        let state = test_state();
-        // Config::default 不再预填 targets（内置默认在 agents 注册表），
-        // /api/targets 只列配置文件里的覆盖/自定义项
-        std::fs::create_dir_all(state.layout.root.clone()).unwrap();
-        std::fs::write(
-            state.layout.config_path(),
-            "[targets]\ncursor = \"~/.cursor/skills\"\n",
-        )
-        .unwrap();
-        let app = router(state);
-        let resp = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/api/targets")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let names: Vec<&str> = v
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
-        assert_eq!(names, ["cursor"], "{names:?}");
     }
 }
