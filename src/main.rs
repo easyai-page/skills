@@ -2,6 +2,7 @@ mod cli;
 mod core;
 mod tui;
 mod web;
+mod wizard;
 
 fn main() {
     let cli = <cli::Cli as clap::Parser>::parse();
