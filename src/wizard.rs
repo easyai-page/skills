@@ -104,14 +104,14 @@ pub fn pick_method() -> Result<Method> {
     })
 }
 
-/// 选中的 agent × scope 展开为 Target 列表：项目级按解析后的 install_dir 去重
-/// （多个 universal agent 项目级同目录只装一份，记录保留排序最前的 id；全局级不去重，
-/// 每个 agent 保留独立记录）；跳过 scope 不支持的 agent（如 eve 无全局目录）。
+/// 选中的 agent × scope 展开为 Target 列表：按解析后的 install_dir 去重（无论 scope——
+/// 项目级多个 universal agent 同目录只装一份；全局级 agents/cline/zed 等共享
+/// ~/.agents/skills，不去重会触发同目录重复安装 Conflict；记录保留排序最前的 id）；
+/// 跳过 scope 不支持的 agent（如 eve 无全局目录）。
 /// 先排序再展开去重，保证结果确定性。
 pub fn expand_targets(agent_ids: &[String], scope: &Scope, cfg: &Config) -> Result<Vec<Target>> {
     let mut ids = agent_ids.to_vec();
     ids.sort();
-    let project_scope = matches!(scope, Scope::Project(_));
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for id in ids {
@@ -125,7 +125,7 @@ pub fn expand_targets(agent_ids: &[String], scope: &Scope, cfg: &Config) -> Resu
             Err(Error::Msg(_)) => continue,
             Err(e) => return Err(e),
         };
-        if !project_scope || seen.insert(dir) {
+        if seen.insert(dir) {
             out.push(t);
         }
     }
@@ -159,7 +159,21 @@ mod tests {
         let ts = expand_targets(&ids, &Scope::Project(PathBuf::from("/p")), &cfg).unwrap();
         assert_eq!(ts.len(), 1);
         assert_eq!(ts[0].agent, "agents");
-        // 全局 scope 下 cursor 与 cline 目录不同，不去重
+        // 全局 scope 同样去重：agents 与 cline 共享 ~/.agents/skills，只留一个
+        let ts = expand_targets(
+            &["agents".to_string(), "cline".to_string()],
+            &Scope::Global,
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts[0].agent, "agents");
+        // 全局目录互不相同的 agent 不去重
+        let ids = vec![
+            "claude-code".to_string(),
+            "codex".to_string(),
+            "cursor".to_string(),
+        ];
         let ts = expand_targets(&ids, &Scope::Global, &cfg).unwrap();
         assert_eq!(ts.len(), 3);
     }
