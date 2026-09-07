@@ -720,7 +720,7 @@ fn resolve_install_plan(
     } else if no_prompt {
         vec!["agents".to_string()]
     } else {
-        match wizard::pick_agents(&agents::detect_installed())? {
+        match wizard::pick_agents(&agents::detect_installed(), &[])? {
             Some(ids) => ids,
             None => return Ok((vec![], cfg.default_method)), // 空选取消
         }

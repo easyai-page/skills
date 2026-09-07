@@ -168,7 +168,7 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
         return Ok(());
     };
     // 第 2 步：agent（空选 = 取消）
-    let Some(agent_ids) = wizard::pick_agents(&agents::detect_installed())? else {
+    let Some(agent_ids) = wizard::pick_agents(&agents::detect_installed(), &[])? else {
         println!("未选择目标，取消安装");
         return Ok(());
     };
@@ -327,7 +327,7 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
         }
     };
     // 第 2~4 步：agent（空选 = 取消）→ scope → method（ESC/Ctrl+C = 取消），展开去重为 targets
-    let Some(agent_ids) = wizard::pick_agents(&agents::detect_installed())? else {
+    let Some(agent_ids) = wizard::pick_agents(&agents::detect_installed(), &[])? else {
         println!("未选择目标，取消安装");
         return Ok(());
     };

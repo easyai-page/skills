@@ -82,32 +82,91 @@ pub fn pick_skills(skills: &[SkillChoice]) -> Result<Option<Vec<String>>> {
     cancel_to_none(r).map(|o| o.map(|picked| picked.into_iter().map(|c| c.name).collect()))
 }
 
-/// agent 多选：detected 里的默认勾选；detected 为空时预选 ["agents"]。
-/// 返回 None = 空选取消。
-/// 只列内置 agent（config 自定义 target 无法检测本机安装，走 -a 参数指定）。
-pub fn pick_agents(detected: &[&'static str]) -> Result<Option<Vec<String>>> {
-    let specs = agents::all(); // 注册表已按 id 字典序排列
-    let labels: Vec<String> = specs
-        .iter()
-        .map(|a| format!("{}（{}）", a.id, a.name))
-        .collect();
-    let defaults: Vec<bool> = if detected.is_empty() {
-        specs.iter().map(|a| a.id == "agents").collect()
-    } else {
-        specs.iter().map(|a| detected.contains(&a.id)).collect()
-    };
-    let idx = dialoguer::MultiSelect::new()
-        .with_prompt("安装到哪些 agent（空格多选，回车确认）")
-        .items(&labels)
-        .defaults(&defaults)
-        .interact()
-        .map_err(|e| Error::Msg(e.to_string()))?;
-    if idx.is_empty() {
-        return Ok(None);
+/// agent 选项：行内显示 id（名称）→ 项目目录，检测到的带标记。
+pub struct AgentChoice {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub project_dir: &'static str,
+    pub detected: bool,
+}
+
+impl std::fmt::Display for AgentChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mark = if self.detected { "  ✓已检测" } else { "" };
+        write!(
+            f,
+            "{}（{}）→ {}{}",
+            self.id, self.name, self.project_dir, mark
+        )
     }
-    Ok(Some(
-        idx.into_iter().map(|i| specs[i].id.to_string()).collect(),
-    ))
+}
+
+/// 预选决策：上次选择的记忆（过滤已失效 id）> 检测到的 > ["agents"]。
+pub fn agent_defaults(detected: &[&str], last_selected: &[String]) -> Vec<String> {
+    let remembered: Vec<String> = last_selected
+        .iter()
+        .filter(|id| agents::all().iter().any(|a| a.id == id.as_str()))
+        .cloned()
+        .collect();
+    if !remembered.is_empty() {
+        return remembered;
+    }
+    if !detected.is_empty() {
+        return detected.iter().map(|s| s.to_string()).collect();
+    }
+    vec!["agents".to_string()]
+}
+
+/// 列表排序：检测到的置顶（两组各自保持注册表的 id 字典序）。
+pub fn detected_first(detected: &[&str]) -> Vec<&'static agents::AgentSpec> {
+    let mut out: Vec<_> = agents::all()
+        .iter()
+        .filter(|a| detected.contains(&a.id))
+        .collect();
+    out.extend(agents::all().iter().filter(|a| !detected.contains(&a.id)));
+    out
+}
+
+/// agent 多选：恰好检测到 1 个时不弹窗直接用；否则搜索式多选，
+/// 预选 = agent_defaults（记忆 > 检测 > agents）。返回 None = 取消。
+/// 只列内置 agent（config 自定义 target 无法检测本机安装，走 -a 参数指定）。
+pub fn pick_agents(
+    detected: &[&'static str],
+    last_selected: &[String],
+) -> Result<Option<Vec<String>>> {
+    if let [only] = detected {
+        let name = agents::all()
+            .iter()
+            .find(|a| a.id == *only)
+            .map(|a| a.name)
+            .unwrap_or(only);
+        println!("安装到：{name}（已检测）");
+        return Ok(Some(vec![only.to_string()]));
+    }
+    let specs = detected_first(detected);
+    let want = agent_defaults(detected, last_selected);
+    let default_idx: Vec<usize> = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| want.iter().any(|w| w == a.id))
+        .map(|(i, _)| i)
+        .collect();
+    let options: Vec<AgentChoice> = specs
+        .iter()
+        .map(|a| AgentChoice {
+            id: a.id,
+            name: a.name,
+            project_dir: a.project_dir,
+            detected: detected.contains(&a.id),
+        })
+        .collect();
+    let r = inquire::MultiSelect::new("安装到哪些 agent", options)
+        .with_default(&default_idx)
+        .with_help_message("输入过滤，空格勾选，→ 全选，← 全清，回车确认，ESC 取消")
+        .with_page_size(20)
+        .with_validator(inquire::min_length!(1, "至少选择一个 agent"))
+        .prompt();
+    cancel_to_none(r).map(|o| o.map(|cs| cs.into_iter().map(|c| c.id.to_string()).collect()))
 }
 
 /// scope 单选：项目（默认）/ 全局。所有 agent 都不支持全局时直接返回项目，不弹窗。
@@ -241,5 +300,31 @@ mod tests {
     fn needs_scope_prompt_only_when_some_global_capable() {
         assert!(needs_scope_prompt(&["claude-code"]));
         assert!(!needs_scope_prompt(&["eve"])); // 全都不支持全局则不问
+    }
+
+    #[test]
+    fn agent_defaults_priority() {
+        // 记忆优先，且过滤已失效 id
+        assert_eq!(
+            agent_defaults(
+                &["codex"],
+                &["claude-code".to_string(), "ghost".to_string()]
+            ),
+            vec!["claude-code".to_string()]
+        );
+        // 无有效记忆 → 检测到的
+        assert_eq!(agent_defaults(&["codex"], &[]), vec!["codex".to_string()]);
+        // 全无 → universal 兜底
+        assert_eq!(agent_defaults(&[], &[]), vec!["agents".to_string()]);
+    }
+
+    #[test]
+    fn detected_first_ordering() {
+        let specs = detected_first(&["zed"]);
+        assert_eq!(specs[0].id, "zed", "检测到的必须置顶");
+        assert!(
+            specs[1..].windows(2).all(|w| w[0].id < w[1].id),
+            "未检测组保持 id 字典序"
+        );
     }
 }
