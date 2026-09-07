@@ -1,3 +1,6 @@
 /target
 /dist
 /stage
+
+# 隔离工作树（superpowers 工作流）
+.worktrees/
