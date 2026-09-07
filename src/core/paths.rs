@@ -127,6 +127,9 @@ impl Layout {
     pub fn config_path(&self) -> PathBuf {
         self.root.join("config.toml")
     }
+    pub fn state_path(&self) -> PathBuf {
+        self.root.join("state.json")
+    }
 }
 
 #[cfg(test)]
