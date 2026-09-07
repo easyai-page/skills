@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 pub mod commands;
+pub mod ui;
 
 #[derive(Parser)]
 #[command(name = "skills", about = "技能包管理器：下载、安装、分类、更新")]
