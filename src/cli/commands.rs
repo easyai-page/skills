@@ -1,4 +1,6 @@
+use super::ui;
 use super::{Cli, Cmd, ConfigCmd, FavSub, MethodArg, TargetsCmd};
+use crate::core::state;
 use crate::core::{
     agents, cache,
     config::Config,
@@ -74,7 +76,17 @@ pub fn run(cli: Cli) -> Result<()> {
         }) => {
             let mut reg = Registry::load(&layout)?;
             let spec = parse_source(&source)?;
-            let cached = cache::ensure_cached(&layout, &spec)?;
+            let sp = ui::spinner("正在获取技能包…");
+            let cached = match cache::ensure_cached(&layout, &spec) {
+                Ok(c) => {
+                    sp.finish_and_clear();
+                    c
+                }
+                Err(e) => {
+                    sp.finish_and_clear();
+                    return Err(e);
+                }
+            };
             if !cached.fresh {
                 println!("已缓存 {}，复用（skills update 可更新）", spec.key);
             }
@@ -86,10 +98,21 @@ pub fn run(cli: Cli) -> Result<()> {
                     fetched_at: chrono::Utc::now().to_rfc3339(),
                     auto_update: None,
                 });
-            let all_skills = cache::scan_skills(&cached.path)?;
+            let sp = ui::spinner("正在扫描技能…");
+            let all_skills = match cache::scan_skills(&cached.path) {
+                Ok(s) => {
+                    sp.finish_and_clear();
+                    s
+                }
+                Err(e) => {
+                    sp.finish_and_clear();
+                    return Err(e);
+                }
+            };
             if all_skills.is_empty() {
                 return Err(Error::Msg("仓库中没有可安装的技能".into()));
             }
+            println!("{}", ui::ok(format!("发现 {} 个技能", all_skills.len())));
             let all_names: Vec<String> = all_skills.iter().map(|s| s.name.clone()).collect();
             // 第 1 步：技能。--all / -s '*' → 全部；-s 列表 → 校验后用之（显式 -s 优先于 -y 默认）；
             // 否则 TTY 弹 pick_skills（ESC/Ctrl+C = 取消），非 TTY → 全部（修掉旧版管道下弹窗报错的不对称）
@@ -100,18 +123,17 @@ pub fn run(cli: Cli) -> Result<()> {
             } else if yes {
                 all_names.clone()
             } else if std::io::stdin().is_terminal() {
-                // description 留空，待任务 5 接线真实描述
                 let choices: Vec<wizard::SkillChoice> = all_skills
                     .iter()
-                    .map(|s| wizard::SkillChoice {
-                        name: s.name.clone(),
-                        description: String::new(),
+                    .map(|e| wizard::SkillChoice {
+                        name: e.name.clone(),
+                        description: e.description.clone(),
                     })
                     .collect();
                 match wizard::pick_skills(&choices)? {
                     Some(p) => p,
                     None => {
-                        println!("未选择技能，取消安装");
+                        println!("已取消安装");
                         return Ok(());
                     }
                 }
@@ -120,15 +142,16 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             // 第 2~4 步：agent → scope → method（与 fav install 共用）
             let (targets, method) =
-                resolve_install_plan(&agent, &target, global, all, yes, method, &cfg)?;
+                resolve_install_plan(&layout, &agent, &target, global, all, yes, method, &cfg)?;
             if targets.is_empty() {
-                println!("未选择目标，取消安装");
+                println!("已取消安装");
                 return Ok(());
             }
             println!(
-                "将安装 {} 个技能 → {} 个目标（{method:?}）",
+                "将安装 {} 个技能 → {} 个目标（{}）",
                 picked.len(),
-                targets.len()
+                targets.len(),
+                ui::method_label(method)
             );
             install_loop(
                 &layout,
@@ -289,10 +312,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 // （归属核验类的 Mismatch 即使确认后重跑也会再次报错，错误信息会如实呈现原因）
                 Err(Error::Mismatch(msg)) if !force => {
                     println!("{msg}");
-                    let confirmed = dialoguer::Confirm::new()
-                        .with_prompt("将覆盖上述本地修改，继续？")
-                        .default(false)
-                        .interact()
+                    let confirmed = inquire::Confirm::new("将覆盖上述本地修改，继续？")
+                        .with_default(false)
+                        .prompt()
                         .map_err(|e| {
                             Error::Msg(format!(
                                 "确认交互失败（{e}）；非交互环境请改用 skills update --force 明确覆盖"
@@ -412,38 +434,39 @@ pub fn run(cli: Cli) -> Result<()> {
                     } else if yes || !std::io::stdin().is_terminal() {
                         fav_names.clone()
                     } else {
-                        // description 留空，待任务 5 接线真实描述
                         let choices: Vec<wizard::SkillChoice> = reg.favorites[&key]
                             .skills
                             .iter()
                             .map(|s| wizard::SkillChoice {
                                 name: s.name.clone(),
-                                description: String::new(),
+                                description: s.description.clone(),
                             })
                             .collect();
                         match wizard::pick_skills(&choices)? {
                             Some(p) => p,
                             None => {
-                                println!("未选择技能，取消安装");
+                                println!("已取消安装");
                                 return Ok(());
                             }
                         }
                     };
                     if picked.is_empty() {
-                        println!("未选择技能，取消安装");
+                        println!("已取消安装");
                         return Ok(());
                     }
                     // 第 2~4 步：agent → scope → method（与 add 共用）
-                    let (targets, method) =
-                        resolve_install_plan(&agent, &target, global, all, yes, method, &cfg)?;
+                    let (targets, method) = resolve_install_plan(
+                        &layout, &agent, &target, global, all, yes, method, &cfg,
+                    )?;
                     if targets.is_empty() {
-                        println!("未选择目标，取消安装");
+                        println!("已取消安装");
                         return Ok(());
                     }
                     println!(
-                        "将安装 {} 个技能 → {} 个目标（{method:?}）",
+                        "将安装 {} 个技能 → {} 个目标（{}）",
                         picked.len(),
-                        targets.len()
+                        targets.len(),
+                        ui::method_label(method)
                     );
                     install_loop(
                         &layout,
@@ -678,13 +701,14 @@ fn yes_agents(detected: &[&str]) -> Vec<String> {
 }
 
 /// add 与 fav install 共用的第 2~4 步：agent → scope → method，返回展开去重后的
-/// 目标列表与安装方式。返回空目标列表 = 用户在弹窗里取消（agent 步空选；scope/方式步 ESC/Ctrl+C），
+/// 目标列表与安装方式。返回空目标列表 = 用户在弹窗里取消（agent/scope/方式步 ESC/Ctrl+C），
 /// 调用方视为取消安装。
 /// -t 旧写法直达 targets，不弹 agent/scope/method；--all / -y / 非 TTY 一律不弹窗。
 // 参数即一次安装决策的全部输入（agent/target 列表、三个开关、--method、配置），
 // 打包成结构体只是挪位置，保留平铺签名。
 #[allow(clippy::too_many_arguments)]
 fn resolve_install_plan(
+    layout: &Layout,
     agent: &[String],
     target: &[String],
     global: bool,
@@ -705,8 +729,12 @@ fn resolve_install_plan(
         return Ok((targets, resolve_method(method, cfg)));
     }
     let no_prompt = all || yes || !std::io::stdin().is_terminal();
+    // 纯兜底路径（非 TTY 且未给 -y/--all）给用户一行引导，行为本身不变
+    if !all && !yes && !std::io::stdin().is_terminal() {
+        eprintln!("提示：非交互环境可使用 -y / -s / -a / -t / -g 参数控制安装行为");
+    }
     // 第 2 步：agent。--all / -a '*' → 全内置 agent；-a 列表 → 全部先校验再开工；
-    // -y → 检测到的（检测不到退回 agents）；否则 TTY 弹 pick_agents（detected 预选），非 TTY → agents
+    // -y → 检测到的（检测不到退回 agents）；否则 TTY 弹 pick_agents（记忆 > 检测 > agents 预选），非 TTY → agents
     let agent_ids: Vec<String> = if all || agent.iter().any(|a| a == "*") {
         agents::all().iter().map(|a| a.id.to_string()).collect()
     } else if !agent.is_empty() {
@@ -720,9 +748,14 @@ fn resolve_install_plan(
     } else if no_prompt {
         vec!["agents".to_string()]
     } else {
-        match wizard::pick_agents(&agents::detect_installed(), &[])? {
-            Some(ids) => ids,
-            None => return Ok((vec![], cfg.default_method)), // 空选取消
+        let detected = agents::detect_installed();
+        let remembered = state::load(layout).last_selected_agents;
+        match wizard::pick_agents(&detected, &remembered)? {
+            Some(ids) => {
+                state::save_last_agents(layout, &ids);
+                ids
+            }
+            None => return Ok((vec![], cfg.default_method)), // 取消
         }
     };
     // 第 3 步：scope。-g → Global；不弹窗路径 → 项目（cwd）；
@@ -758,9 +791,9 @@ fn resolve_method(method: Option<MethodArg>, cfg: &Config) -> Method {
     }
 }
 
-/// 「逐技能逐目标安装 + Conflict 确认/跳过 + 逐条落盘」循环。
-/// 逐条落盘的原因同 add 原注释：中途失败时 registry 与磁盘已写入的副本保持一致。
-/// install_fn 返回 Ok=装成，Err(Conflict)=走确认，其余 Err 直接中断。
+/// 「逐技能逐目标安装 + Conflict 确认/跳过 + 逐条落盘 + 收尾摘要」循环。
+/// 逐条落盘的原因不变：中途失败时 registry 与磁盘已写入的副本保持一致。
+/// install_fn 返回 Ok=装成，Err(Conflict)=走确认（yes=跳过），其余 Err 中断。
 // 参数即一次安装批次的全部上下文（布局/配置/记录/技能集/目标集/方式/确认/动作），
 // 打包成结构体只是挪位置，与 install_skill 同款保留平铺签名。
 #[allow(clippy::too_many_arguments)]
@@ -774,40 +807,81 @@ fn install_loop(
     yes: bool,
     install_fn: &dyn Fn(&mut Registry, &str, &Target) -> Result<()>,
 ) -> Result<()> {
+    let total = picked.len() * targets.len();
+    let pb = ui::spinner(format!("正在安装（共 {total} 条）…"));
+    let mut installed = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
     for s in picked {
         for t in targets {
-            let installed = match install_fn(reg, s, t) {
+            let installed_now = match install_fn(reg, s, t) {
                 Ok(()) => {
-                    println!("已安装 {s} → {t} ({method:?})");
+                    ui::progress_or_print(
+                        &pb,
+                        ui::ok(format!("已安装 {s} → {t}（{}）", ui::method_label(method))),
+                    );
                     true
                 }
                 Err(Error::Conflict(p)) => {
                     if yes {
-                        println!("跳过已存在: {p:?}");
+                        ui::progress_or_print(
+                            &pb,
+                            ui::skip(format!("跳过已存在：{}", p.display())),
+                        );
+                        skipped.push(format!("{s} → {t}"));
                         false
                     } else {
-                        let overwrite = dialoguer::Confirm::new()
-                            .with_prompt(format!("{p:?} 已存在，覆盖？"))
-                            .interact()
-                            .map_err(|e| Error::Msg(e.to_string()))?;
+                        // spinner 挂起再弹窗，避免两套终端绘制互相糊屏
+                        let prompt = format!("{} 已存在，覆盖？", p.display());
+                        let overwrite = match pb
+                            .suspend(|| inquire::Confirm::new(&prompt).with_default(false).prompt())
+                        {
+                            Ok(v) => v,
+                            // 覆盖确认的 ESC/Ctrl+C 视为不覆盖（跳过该条），不中断批次
+                            Err(
+                                inquire::error::InquireError::OperationCanceled
+                                | inquire::error::InquireError::OperationInterrupted,
+                            ) => false,
+                            Err(e) => {
+                                pb.finish_and_clear();
+                                return Err(Error::Msg(e.to_string()));
+                            }
+                        };
                         if overwrite {
                             let rec = install::to_rec(t);
                             let _ = remove::remove_install(layout, cfg, reg, s, &rec);
                             install_fn(reg, s, t)?;
+                            ui::progress_or_print(&pb, ui::ok(format!("已覆盖安装 {s} → {t}")));
                             true
                         } else {
+                            skipped.push(format!("{s} → {t}"));
                             false
                         }
                     }
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    pb.finish_and_clear();
+                    return Err(e);
+                }
             };
-            if installed {
-                // 逐条落盘（tmp+rename 原子写，代价低）：之后任一技能/目标安装失败
-                // 或覆盖重装失败而提前返回时，registry 都与磁盘已写入的副本保持一致，
-                // 不会留下 list/remove 都管不到的孤儿副本。
+            if installed_now {
+                installed += 1;
+                // 逐条落盘（tmp+rename 原子写，代价低）：之后任一失败提前返回时，
+                // registry 都与磁盘已写入的副本保持一致，不留孤儿副本。
                 reg.save(layout)?;
             }
+        }
+    }
+    pb.finish_and_clear();
+    println!(
+        "共安装 {installed}/{total} 条（{} 个技能 × {} 个目标，{}）",
+        picked.len(),
+        targets.len(),
+        ui::method_label(method)
+    );
+    if !skipped.is_empty() {
+        println!("跳过 {} 条：", skipped.len());
+        for s in &skipped {
+            println!("  {}", ui::skip(s));
         }
     }
     Ok(())
