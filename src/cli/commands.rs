@@ -92,7 +92,7 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             let all_names: Vec<String> = all_skills.iter().map(|s| s.name.clone()).collect();
             // 第 1 步：技能。--all / -s '*' → 全部；-s 列表 → 校验后用之（显式 -s 优先于 -y 默认）；
-            // 否则 TTY 弹 pick_skills（空选 = 取消），非 TTY → 全部（修掉旧版管道下弹窗报错的不对称）
+            // 否则 TTY 弹 pick_skills（ESC/Ctrl+C = 取消），非 TTY → 全部（修掉旧版管道下弹窗报错的不对称）
             let picked: Vec<String> = if all || skill.iter().any(|s| s == "*") {
                 all_names.clone()
             } else if !skill.is_empty() {
@@ -100,7 +100,15 @@ pub fn run(cli: Cli) -> Result<()> {
             } else if yes {
                 all_names.clone()
             } else if std::io::stdin().is_terminal() {
-                match wizard::pick_skills(&all_names)? {
+                // description 留空，待任务 5 接线真实描述
+                let choices: Vec<wizard::SkillChoice> = all_skills
+                    .iter()
+                    .map(|s| wizard::SkillChoice {
+                        name: s.name.clone(),
+                        description: String::new(),
+                    })
+                    .collect();
+                match wizard::pick_skills(&choices)? {
                     Some(p) => p,
                     None => {
                         println!("未选择技能，取消安装");
@@ -404,7 +412,16 @@ pub fn run(cli: Cli) -> Result<()> {
                     } else if yes || !std::io::stdin().is_terminal() {
                         fav_names.clone()
                     } else {
-                        match wizard::pick_skills(&fav_names)? {
+                        // description 留空，待任务 5 接线真实描述
+                        let choices: Vec<wizard::SkillChoice> = reg.favorites[&key]
+                            .skills
+                            .iter()
+                            .map(|s| wizard::SkillChoice {
+                                name: s.name.clone(),
+                                description: String::new(),
+                            })
+                            .collect();
+                        match wizard::pick_skills(&choices)? {
                             Some(p) => p,
                             None => {
                                 println!("未选择技能，取消安装");
@@ -661,7 +678,8 @@ fn yes_agents(detected: &[&str]) -> Vec<String> {
 }
 
 /// add 与 fav install 共用的第 2~4 步：agent → scope → method，返回展开去重后的
-/// 目标列表与安装方式。返回空目标列表 = 用户在弹窗里空选取消，调用方视为取消安装。
+/// 目标列表与安装方式。返回空目标列表 = 用户在弹窗里取消（agent 步空选；scope/方式步 ESC/Ctrl+C），
+/// 调用方视为取消安装。
 /// -t 旧写法直达 targets，不弹 agent/scope/method；--all / -y / 非 TTY 一律不弹窗。
 // 参数即一次安装决策的全部输入（agent/target 列表、三个开关、--method、配置），
 // 打包成结构体只是挪位置，保留平铺签名。
@@ -708,19 +726,25 @@ fn resolve_install_plan(
         }
     };
     // 第 3 步：scope。-g → Global；不弹窗路径 → 项目（cwd）；
-    // 否则 pick_scope（内部对全不支持全局的 agent 组合直接返回项目，不弹窗）
+    // 否则 pick_scope（内部对全不支持全局的 agent 组合直接返回项目，不弹窗；ESC/Ctrl+C = 取消）
     let scope = if global {
         Scope::Global
     } else if no_prompt {
         Scope::Project(std::env::current_dir()?)
     } else {
-        wizard::pick_scope(&agent_ids)?
+        match wizard::pick_scope(&agent_ids)? {
+            Some(s) => s,
+            None => return Ok((vec![], cfg.default_method)), // 取消
+        }
     };
-    // 第 4 步：method。--method → 用之；不弹窗路径 → cfg.default_method；否则 pick_method
+    // 第 4 步：method。--method → 用之；不弹窗路径 → cfg.default_method；否则 pick_method（ESC/Ctrl+C = 取消）
     let method = match method {
         Some(m) => resolve_method(Some(m), cfg),
         None if no_prompt => cfg.default_method,
-        None => wizard::pick_method()?,
+        None => match wizard::pick_method()? {
+            Some(m) => m,
+            None => return Ok((vec![], cfg.default_method)), // 取消
+        },
     };
     let targets = wizard::expand_targets(&agent_ids, &scope, cfg)?;
     Ok((targets, method))

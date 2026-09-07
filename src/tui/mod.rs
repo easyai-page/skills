@@ -155,9 +155,15 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
     if all.is_empty() {
         return Err(Error::Msg("仓库中没有可安装的技能".into()));
     }
-    let names: Vec<String> = all.iter().map(|s| s.name.clone()).collect();
-    // 第 1 步：技能（空选 = 取消）
-    let Some(picked) = wizard::pick_skills(&names)? else {
+    // 第 1 步：技能（ESC/Ctrl+C = 取消）；description 留空，待任务 5 接线
+    let choices: Vec<wizard::SkillChoice> = all
+        .iter()
+        .map(|s| wizard::SkillChoice {
+            name: s.name.clone(),
+            description: String::new(),
+        })
+        .collect();
+    let Some(picked) = wizard::pick_skills(&choices)? else {
         println!("未选择技能，取消安装");
         return Ok(());
     };
@@ -166,9 +172,15 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
         println!("未选择目标，取消安装");
         return Ok(());
     };
-    // 第 3~4 步：scope → method，展开去重为 targets
-    let scope = wizard::pick_scope(&agent_ids)?;
-    let method = wizard::pick_method()?;
+    // 第 3~4 步：scope → method（ESC/Ctrl+C = 取消），展开去重为 targets
+    let Some(scope) = wizard::pick_scope(&agent_ids)? else {
+        println!("未选择目标，取消安装");
+        return Ok(());
+    };
+    let Some(method) = wizard::pick_method()? else {
+        println!("未选择目标，取消安装");
+        return Ok(());
+    };
     let targets = wizard::expand_targets(&agent_ids, &scope, cfg)?;
     if targets.is_empty() {
         println!("未选择目标，取消安装");
@@ -286,7 +298,7 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
         return Ok(());
     };
     // 第 1 步：技能集由当前行决定——技能行单技能；Source 行单技能仓直接取，
-    // 多技能仓弹 pick_skills（空选 = 取消）
+    // 多技能仓弹 pick_skills（ESC/Ctrl+C = 取消）
     let (key, picked) = match row {
         FavRow::Skill(key, i) => (
             key.clone(),
@@ -297,8 +309,16 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
             if favorites::is_single_skill_repo(fav) {
                 (key.clone(), vec![fav.skills[0].name.clone()])
             } else {
-                let names: Vec<String> = fav.skills.iter().map(|s| s.name.clone()).collect();
-                let Some(p) = wizard::pick_skills(&names)? else {
+                // description 留空，待任务 5 接线
+                let choices: Vec<wizard::SkillChoice> = fav
+                    .skills
+                    .iter()
+                    .map(|s| wizard::SkillChoice {
+                        name: s.name.clone(),
+                        description: String::new(),
+                    })
+                    .collect();
+                let Some(p) = wizard::pick_skills(&choices)? else {
                     println!("未选择技能，取消安装");
                     return Ok(());
                 };
@@ -306,13 +326,19 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
             }
         }
     };
-    // 第 2~4 步：agent（空选 = 取消）→ scope → method，展开去重为 targets
+    // 第 2~4 步：agent（空选 = 取消）→ scope → method（ESC/Ctrl+C = 取消），展开去重为 targets
     let Some(agent_ids) = wizard::pick_agents(&agents::detect_installed())? else {
         println!("未选择目标，取消安装");
         return Ok(());
     };
-    let scope = wizard::pick_scope(&agent_ids)?;
-    let method = wizard::pick_method()?;
+    let Some(scope) = wizard::pick_scope(&agent_ids)? else {
+        println!("未选择目标，取消安装");
+        return Ok(());
+    };
+    let Some(method) = wizard::pick_method()? else {
+        println!("未选择目标，取消安装");
+        return Ok(());
+    };
     let targets = wizard::expand_targets(&agent_ids, &scope, cfg)?;
     if targets.is_empty() {
         println!("未选择目标，取消安装");
