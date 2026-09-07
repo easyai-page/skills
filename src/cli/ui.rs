@@ -40,14 +40,6 @@ pub fn skip(msg: impl std::fmt::Display) -> String {
     format!("{} {}", style("⊘").yellow(), msg)
 }
 
-pub fn err(msg: impl std::fmt::Display) -> String {
-    format!("{} {}", style("✗").red().bold(), msg)
-}
-
-pub fn warn(msg: impl std::fmt::Display) -> String {
-    format!("{} {}", style("!").yellow(), msg)
-}
-
 /// Method 的用户向文案（不再对用户暴露 Rust 枚举名）。
 pub fn method_label(m: Method) -> &'static str {
     match m {

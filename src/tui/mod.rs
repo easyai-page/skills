@@ -5,6 +5,7 @@ use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 
+use crate::cli::ui as cli_ui;
 use crate::core::{
     agents, cache,
     config::Config,
@@ -36,7 +37,7 @@ impl TermGuard {
         Ok(TermGuard { active: true })
     }
 
-    /// 暂时恢复正常终端（跑 dialoguer 向导用）；幂等。
+    /// 暂时恢复正常终端（跑 inquire 向导用）；幂等。
     fn suspend(&mut self) {
         if self.active {
             let _ = crossterm::terminal::disable_raw_mode();
@@ -89,7 +90,7 @@ fn event_loop(
         term.draw(|f| ui::draw(f, app))?;
         if let Event::Key(k) = event::read()? {
             if k.code == KeyCode::Char('i') {
-                // i：Installed 等视图=从仓库装；Favorites=从收藏装。向导需正常终端（dialoguer）。
+                // i：Installed 等视图=从仓库装；Favorites=从收藏装。向导需正常终端（inquire）。
                 guard.suspend();
                 let r = if app.view == View::Favorites {
                     fav_install_wizard(layout, cfg, app)
@@ -98,10 +99,7 @@ fn event_loop(
                 };
                 if let Err(e) = r {
                     eprintln!("安装失败: {e}");
-                    let _ = dialoguer::Input::<String>::new()
-                        .with_prompt("按回车返回 TUI")
-                        .allow_empty(true)
-                        .interact_text();
+                    let _ = inquire::Text::new("按回车返回 TUI").prompt();
                 }
                 guard.resume()?;
                 term.clear()?;
@@ -112,10 +110,7 @@ fn event_loop(
                 let r = fav_wizard(layout, app);
                 if let Err(e) = r {
                     eprintln!("收藏失败: {e}");
-                    let _ = dialoguer::Input::<String>::new()
-                        .with_prompt("按回车返回 TUI")
-                        .allow_empty(true)
-                        .interact_text();
+                    let _ = inquire::Text::new("按回车返回 TUI").prompt();
                 }
                 guard.resume()?;
                 term.clear()?;
@@ -142,9 +137,8 @@ fn event_loop(
 
 /// 安装向导（已在正常终端模式下运行）：选 source → 共享四步向导（技能 → agent → scope → 方式）→ 走 core 安装。
 fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<()> {
-    let source: String = dialoguer::Input::new()
-        .with_prompt("source（github:owner/repo、URL 或本地路径）")
-        .interact_text()
+    let source = inquire::Text::new("source（github:owner/repo、URL 或本地路径）")
+        .prompt()
         .map_err(|e| Error::Msg(e.to_string()))?;
     let spec = parse_source(&source)?;
     let cached = cache::ensure_cached(layout, &spec)?;
@@ -155,41 +149,45 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
     if all.is_empty() {
         return Err(Error::Msg("仓库中没有可安装的技能".into()));
     }
-    // 第 1 步：技能（ESC/Ctrl+C = 取消）；description 留空，待任务 5 接线
+    // 第 1 步：技能（ESC/Ctrl+C = 取消）
     let choices: Vec<wizard::SkillChoice> = all
         .iter()
         .map(|s| wizard::SkillChoice {
             name: s.name.clone(),
-            description: String::new(),
+            description: s.description.clone(),
         })
         .collect();
     let Some(picked) = wizard::pick_skills(&choices)? else {
-        println!("未选择技能，取消安装");
+        println!("已取消安装");
         return Ok(());
     };
-    // 第 2 步：agent（空选 = 取消）
-    let Some(agent_ids) = wizard::pick_agents(&agents::detect_installed(), &[])? else {
-        println!("未选择目标，取消安装");
+    // 第 2 步：agent（ESC/Ctrl+C = 取消；确认后记忆本次选择）
+    let detected = agents::detect_installed();
+    let remembered = crate::core::state::load(layout).last_selected_agents;
+    let Some(agent_ids) = wizard::pick_agents(&detected, &remembered)? else {
+        println!("已取消安装");
         return Ok(());
     };
+    crate::core::state::save_last_agents(layout, &agent_ids);
     // 第 3~4 步：scope → method（ESC/Ctrl+C = 取消），展开去重为 targets
     let Some(scope) = wizard::pick_scope(&agent_ids)? else {
-        println!("未选择目标，取消安装");
+        println!("已取消安装");
         return Ok(());
     };
     let Some(method) = wizard::pick_method()? else {
-        println!("未选择目标，取消安装");
+        println!("已取消安装");
         return Ok(());
     };
     let targets = wizard::expand_targets(&agent_ids, &scope, cfg)?;
     if targets.is_empty() {
-        println!("未选择目标，取消安装");
+        println!("已取消安装");
         return Ok(());
     }
     println!(
-        "将安装 {} 个技能 → {} 个目标（{method:?}）",
+        "将安装 {} 个技能 → {} 个目标（{}）",
         picked.len(),
-        targets.len()
+        targets.len(),
+        cli_ui::method_label(method)
     );
 
     // 直接操作 TUI 内存中的 registry：用户在 TUI 内按 a 的 auto_update
@@ -218,12 +216,26 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
                 method,
                 &cached.commit,
             ) {
-                Ok(_) => println!("已安装 {} → {target} ({method:?})", entry.name),
+                Ok(_) => println!(
+                    "{}",
+                    cli_ui::ok(format!(
+                        "已安装 {} → {target}（{}）",
+                        entry.name,
+                        cli_ui::method_label(method)
+                    ))
+                ),
                 Err(Error::Conflict(p)) => {
-                    let overwrite = dialoguer::Confirm::new()
-                        .with_prompt(format!("{p:?} 已存在，覆盖？"))
-                        .interact()
-                        .map_err(|e| Error::Msg(e.to_string()))?;
+                    // ESC/Ctrl+C 视为不覆盖（跳过该条），不中断批次（与 CLI install_loop 同款）
+                    let prompt = format!("{} 已存在，覆盖？", p.display());
+                    let overwrite =
+                        match inquire::Confirm::new(&prompt).with_default(false).prompt() {
+                            Ok(v) => v,
+                            Err(
+                                inquire::error::InquireError::OperationCanceled
+                                | inquire::error::InquireError::OperationInterrupted,
+                            ) => false,
+                            Err(e) => return Err(Error::Msg(e.to_string())),
+                        };
                     if overwrite {
                         let rec = install::to_rec(target);
                         let _ = remove::remove_install(layout, cfg, reg, &entry.name, &rec);
@@ -238,9 +250,19 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
                             method,
                             &cached.commit,
                         )?;
-                        println!("已覆盖安装 {} → {target} ({method:?})", entry.name);
+                        println!(
+                            "{}",
+                            cli_ui::ok(format!(
+                                "已覆盖安装 {} → {target}（{}）",
+                                entry.name,
+                                cli_ui::method_label(method)
+                            ))
+                        );
                     } else {
-                        println!("跳过 {} → {target}", entry.name);
+                        println!(
+                            "{}",
+                            cli_ui::skip(format!("跳过 {} → {target}", entry.name))
+                        );
                     }
                 }
                 Err(e) => return Err(e),
@@ -254,9 +276,8 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
 /// 收藏向导（已在正常终端模式下运行）：输 source → 扫描 → 多选（默认全选）→ 走 core 收藏。
 /// 直接操作并落盘内存 registry（与 install_wizard 同因：TUI 内未落盘的 auto_update 切换不得丢失）。
 fn fav_wizard(layout: &Layout, app: &mut AppState) -> Result<()> {
-    let source: String = dialoguer::Input::new()
-        .with_prompt("source（github:owner/repo、URL 或本地路径）")
-        .interact_text()
+    let source = inquire::Text::new("source（github:owner/repo、URL 或本地路径）")
+        .prompt()
         .map_err(|e| Error::Msg(e.to_string()))?;
     let spec = parse_source(&source)?;
     let cached = cache::ensure_cached(layout, &spec)?;
@@ -265,23 +286,23 @@ fn fav_wizard(layout: &Layout, app: &mut AppState) -> Result<()> {
     }
     let all = cache::scan_skills(&cached.path)?;
     let names: Vec<String> = all.iter().map(|s| s.name.clone()).collect();
-    let defaults = vec![true; names.len()];
-    let idx = dialoguer::MultiSelect::new()
-        .with_prompt("选择要收藏的技能")
-        .items(&names)
-        .defaults(&defaults)
-        .interact()
-        .map_err(|e| Error::Msg(e.to_string()))?;
-    if idx.is_empty() {
-        println!("未选择技能，取消收藏");
+    let r = inquire::MultiSelect::new("选择要收藏的技能", names.clone())
+        .with_all_selected_by_default()
+        .with_help_message("输入过滤，空格勾选，→ 全选，← 全清，回车确认，ESC 取消")
+        .with_page_size(20)
+        .with_validator(inquire::min_length!(1, "至少选择一个技能"))
+        .prompt();
+    // ESC/Ctrl+C = 取消（与 wizard 各弹窗同款语义）
+    let Some(selected) = wizard::cancel_to_none(r)? else {
+        println!("已取消收藏");
         return Ok(());
-    }
+    };
     // 全选 = 整仓收藏（传空切片走全量覆盖语义，快照随仓库收缩也能刷新干净）；
     // 部分选 = 只收藏勾选项（upsert）
-    let picked: Vec<String> = if idx.len() == names.len() {
+    let picked: Vec<String> = if selected.len() == names.len() {
         Vec::new()
     } else {
-        idx.into_iter().map(|i| names[i].clone()).collect()
+        selected
     };
     let (key, n) = favorites::bookmark(layout, &mut app.registry, &spec, &picked)?;
     let n = if picked.is_empty() { all.len() } else { n };
@@ -309,55 +330,71 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
             if favorites::is_single_skill_repo(fav) {
                 (key.clone(), vec![fav.skills[0].name.clone()])
             } else {
-                // description 留空，待任务 5 接线
                 let choices: Vec<wizard::SkillChoice> = fav
                     .skills
                     .iter()
                     .map(|s| wizard::SkillChoice {
                         name: s.name.clone(),
-                        description: String::new(),
+                        description: s.description.clone(),
                     })
                     .collect();
                 let Some(p) = wizard::pick_skills(&choices)? else {
-                    println!("未选择技能，取消安装");
+                    println!("已取消安装");
                     return Ok(());
                 };
                 (key.clone(), p)
             }
         }
     };
-    // 第 2~4 步：agent（空选 = 取消）→ scope → method（ESC/Ctrl+C = 取消），展开去重为 targets
-    let Some(agent_ids) = wizard::pick_agents(&agents::detect_installed(), &[])? else {
-        println!("未选择目标，取消安装");
+    // 第 2~4 步：agent（ESC/Ctrl+C = 取消；确认后记忆本次选择）→ scope → method，展开去重为 targets
+    let detected = agents::detect_installed();
+    let remembered = crate::core::state::load(layout).last_selected_agents;
+    let Some(agent_ids) = wizard::pick_agents(&detected, &remembered)? else {
+        println!("已取消安装");
         return Ok(());
     };
+    crate::core::state::save_last_agents(layout, &agent_ids);
     let Some(scope) = wizard::pick_scope(&agent_ids)? else {
-        println!("未选择目标，取消安装");
+        println!("已取消安装");
         return Ok(());
     };
     let Some(method) = wizard::pick_method()? else {
-        println!("未选择目标，取消安装");
+        println!("已取消安装");
         return Ok(());
     };
     let targets = wizard::expand_targets(&agent_ids, &scope, cfg)?;
     if targets.is_empty() {
-        println!("未选择目标，取消安装");
+        println!("已取消安装");
         return Ok(());
     }
     println!(
-        "将安装 {} 个技能 → {} 个目标（{method:?}）",
+        "将安装 {} 个技能 → {} 个目标（{}）",
         picked.len(),
-        targets.len()
+        targets.len(),
+        cli_ui::method_label(method)
     );
     for s in &picked {
         for target in &targets {
             match favorites::fav_install(layout, cfg, &mut app.registry, &key, s, target, method) {
-                Ok(_) => println!("已安装 {s} → {target} ({method:?})"),
+                Ok(_) => println!(
+                    "{}",
+                    cli_ui::ok(format!(
+                        "已安装 {s} → {target}（{}）",
+                        cli_ui::method_label(method)
+                    ))
+                ),
                 Err(Error::Conflict(p)) => {
-                    let overwrite = dialoguer::Confirm::new()
-                        .with_prompt(format!("{p:?} 已存在，覆盖？"))
-                        .interact()
-                        .map_err(|e| Error::Msg(e.to_string()))?;
+                    // ESC/Ctrl+C 视为不覆盖（跳过该条），不中断批次（与 CLI install_loop 同款）
+                    let prompt = format!("{} 已存在，覆盖？", p.display());
+                    let overwrite =
+                        match inquire::Confirm::new(&prompt).with_default(false).prompt() {
+                            Ok(v) => v,
+                            Err(
+                                inquire::error::InquireError::OperationCanceled
+                                | inquire::error::InquireError::OperationInterrupted,
+                            ) => false,
+                            Err(e) => return Err(Error::Msg(e.to_string())),
+                        };
                     if overwrite {
                         let rec = install::to_rec(target);
                         let _ = remove::remove_install(layout, cfg, &mut app.registry, s, &rec);
@@ -370,9 +407,15 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
                             target,
                             method,
                         )?;
-                        println!("已覆盖安装 {s} → {target} ({method:?})");
+                        println!(
+                            "{}",
+                            cli_ui::ok(format!(
+                                "已覆盖安装 {s} → {target}（{}）",
+                                cli_ui::method_label(method)
+                            ))
+                        );
                     } else {
-                        println!("跳过 {s} → {target}");
+                        println!("{}", cli_ui::skip(format!("跳过 {s} → {target}")));
                     }
                 }
                 Err(e) => return Err(e),

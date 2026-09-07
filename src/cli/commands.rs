@@ -849,7 +849,10 @@ fn install_loop(
                         if overwrite {
                             let rec = install::to_rec(t);
                             let _ = remove::remove_install(layout, cfg, reg, s, &rec);
-                            install_fn(reg, s, t)?;
+                            if let Err(e) = install_fn(reg, s, t) {
+                                pb.finish_and_clear();
+                                return Err(e);
+                            }
                             ui::progress_or_print(&pb, ui::ok(format!("已覆盖安装 {s} → {t}")));
                             true
                         } else {
@@ -867,7 +870,10 @@ fn install_loop(
                 installed += 1;
                 // 逐条落盘（tmp+rename 原子写，代价低）：之后任一失败提前返回时，
                 // registry 都与磁盘已写入的副本保持一致，不留孤儿副本。
-                reg.save(layout)?;
+                if let Err(e) = reg.save(layout) {
+                    pb.finish_and_clear();
+                    return Err(e);
+                }
             }
         }
     }

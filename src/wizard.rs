@@ -60,7 +60,7 @@ impl std::fmt::Display for MethodChoice {
 
 /// 统一取消语义：ESC/Ctrl+C → Ok(None)（调用方视为「已取消」，退出码 0）；
 /// 其余错误（非 TTY、IO 等）照旧向上抛。
-fn cancel_to_none<T>(r: std::result::Result<T, InquireError>) -> Result<Option<T>> {
+pub(crate) fn cancel_to_none<T>(r: std::result::Result<T, InquireError>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
         Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => Ok(None),
