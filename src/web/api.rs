@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::Html,
     routing::{get, post},
@@ -103,13 +103,32 @@ fn expand_request_targets(
     Ok(targets.iter().map(crate::core::install::to_rec).collect())
 }
 
-async fn list_installs(State(s): S) -> Json<serde_json::Value> {
+#[derive(serde::Deserialize, Default)]
+struct ListInstallsQuery {
+    all: Option<bool>,
+}
+
+async fn list_installs(State(s): S, Query(q): Query<ListInstallsQuery>) -> Json<serde_json::Value> {
     let s = s.lock().unwrap();
     let reg = Registry::load(&s.layout).unwrap_or_default();
+    let show_all = q.all.unwrap_or(false);
+    let cwd = std::env::current_dir().ok();
+
+    let filtered_installs: Vec<&crate::core::registry::Install> = if show_all {
+        reg.installs.iter().collect()
+    } else if let Some(ref d) = cwd {
+        reg.installs
+            .iter()
+            .filter(|i| i.is_visible_in_dir(d))
+            .collect()
+    } else {
+        reg.installs.iter().collect()
+    };
+
     // 标签是技能级数据，不在 install 记录上；为前端展示注入每条 install 的 tags 字段
-    let mut installs = serde_json::to_value(&reg.installs).unwrap_or_default();
+    let mut installs = serde_json::to_value(&filtered_installs).unwrap_or_default();
     if let Some(arr) = installs.as_array_mut() {
-        for (jv, inst) in arr.iter_mut().zip(&reg.installs) {
+        for (jv, inst) in arr.iter_mut().zip(&filtered_installs) {
             jv["tags"] = serde_json::json!(reg.tags_of(&inst.source, &inst.skill));
         }
     }
@@ -637,6 +656,66 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v[0]["skill"], "alpha");
         assert_eq!(v[0]["tags"][0], "frontend");
+    }
+
+    #[tokio::test]
+    async fn list_installs_filters_other_project_unless_all() {
+        let state = test_state();
+        {
+            let mut reg = Registry::load(&state.layout).unwrap();
+            reg.installs.push(Install {
+                skill: "beta".into(),
+                source: "github/o/r".into(),
+                source_path: "skills/beta".into(),
+                target: TargetRec::Project {
+                    agent: "agents".into(),
+                    root: std::path::PathBuf::from("/nonexistent/other/project"),
+                },
+                method: Method::Copy,
+                commit: "c1".into(),
+                auto_update: None,
+                installed_at: "t".into(),
+            });
+            reg.save(&state.layout).unwrap();
+        }
+        let _keep = state.tmp.clone();
+        let app = router(state);
+
+        // 默认不带 ?all=true：只返回当前项目或全局的（alpha 是 global，beta 在外部路径被过滤）
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/installs")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["skill"], "alpha");
+
+        // 带 ?all=true：返回全部（包含 beta）
+        let resp_all = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/installs?all=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_all.status(), 200);
+        let body_all = axum::body::to_bytes(resp_all.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v_all: serde_json::Value = serde_json::from_slice(&body_all).unwrap();
+        assert_eq!(v_all.as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -21,6 +21,19 @@ fn ok(home: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// 断言在指定工作目录下运行成功，返回 stdout。
+fn ok_at(home: &std::path::Path, dir: &std::path::Path, args: &[&str]) -> String {
+    let mut c = skills_cmd(home);
+    c.current_dir(dir);
+    let out = c.args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?} 应成功: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
 /// 断言失败（非零退出），返回 stderr。
 fn fail(home: &std::path::Path, args: &[&str]) -> String {
     let out = run(home, args);
@@ -114,6 +127,91 @@ fn help_lists_all_subcommands() {
 fn list_on_empty_layout_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     ok(tmp.path(), &["list"]);
+}
+
+#[test]
+fn list_filters_by_project_scope_and_shows_all_with_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let proj_a = tmp.path().join("project_a");
+    let proj_b = tmp.path().join("project_b");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&proj_a).unwrap();
+    std::fs::create_dir_all(&proj_b).unwrap();
+
+    let reg_json = serde_json::json!({
+        "version": 3,
+        "sources": {
+            "local/src": {
+                "url": "",
+                "commit": "c1",
+                "fetched_at": "2026-08-20T00:00:00Z",
+                "auto_update": null
+            }
+        },
+        "installs": [
+            {
+                "skill": "global_skill",
+                "source": "local/src",
+                "source_path": "skills/global_skill",
+                "target": {"scope": "global", "agent": "agents"},
+                "method": "copy",
+                "commit": "c1",
+                "auto_update": null,
+                "installed_at": "2026-08-20T00:00:00Z"
+            },
+            {
+                "skill": "proj_a_skill",
+                "source": "local/src",
+                "source_path": "skills/proj_a_skill",
+                "target": {"scope": "project", "agent": "agents", "root": proj_a},
+                "method": "copy",
+                "commit": "c1",
+                "auto_update": null,
+                "installed_at": "2026-08-20T00:00:00Z"
+            },
+            {
+                "skill": "proj_b_skill",
+                "source": "local/src",
+                "source_path": "skills/proj_b_skill",
+                "target": {"scope": "project", "agent": "agents", "root": proj_b},
+                "method": "copy",
+                "commit": "c1",
+                "auto_update": null,
+                "installed_at": "2026-08-20T00:00:00Z"
+            }
+        ]
+    });
+    std::fs::write(home.join("registry.json"), reg_json.to_string()).unwrap();
+
+    // 在 project_a 目录下运行 list：默认只显示 global_skill 和 proj_a_skill
+    let out = ok_at(&home, &proj_a, &["list"]);
+    assert!(out.contains("global_skill"), "{out}");
+    assert!(out.contains("proj_a_skill"), "{out}");
+    assert!(!out.contains("proj_b_skill"), "{out}");
+
+    // 在 project_b 目录下运行 list：默认只显示 global_skill 和 proj_b_skill
+    let out = ok_at(&home, &proj_b, &["list"]);
+    assert!(out.contains("global_skill"), "{out}");
+    assert!(!out.contains("proj_a_skill"), "{out}");
+    assert!(out.contains("proj_b_skill"), "{out}");
+
+    // 使用 -a / --all 选项：显示全部项目技能
+    let out = ok_at(&home, &proj_a, &["list", "-a"]);
+    assert!(out.contains("global_skill"), "{out}");
+    assert!(out.contains("proj_a_skill"), "{out}");
+    assert!(out.contains("proj_b_skill"), "{out}");
+
+    let out = ok_at(&home, &proj_a, &["list", "--all"]);
+    assert!(out.contains("global_skill"), "{out}");
+    assert!(out.contains("proj_a_skill"), "{out}");
+    assert!(out.contains("proj_b_skill"), "{out}");
+
+    // 使用 -g 选项：仅显示全局技能
+    let out = ok_at(&home, &proj_a, &["list", "-g"]);
+    assert!(out.contains("global_skill"), "{out}");
+    assert!(!out.contains("proj_a_skill"), "{out}");
+    assert!(!out.contains("proj_b_skill"), "{out}");
 }
 
 // ---- tag：标签绑定 (source, skill)，与安装目标无关 ----

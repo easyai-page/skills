@@ -22,6 +22,9 @@ nav button { margin-right: 8px; }
   <p>
     <input id="add-source" placeholder="仓库地址（owner/repo、URL 或本地路径）" size="42">
     <button id="add-scan">扫描技能</button>
+    <label style="margin-left: 16px; cursor: pointer; user-select: none;">
+      <input type="checkbox" id="filter-all-installs"> 显示全部项目
+    </label>
   </p>
   <div id="add-panel"></div>
   <div id="installs"></div>
@@ -397,7 +400,8 @@ async function doInstall(source, skill, agents, scope, method) {
   }
 }
 async function refresh() {
-  const installs = await api('installs');
+  const showAll = document.getElementById('filter-all-installs')?.checked;
+  const installs = await api('installs' + (showAll ? '?all=true' : ''));
   document.getElementById('installs').replaceChildren(renderInstalls(installs));
   const sources = await api('sources');
   document.getElementById('sources').replaceChildren(renderSources(sources));
@@ -451,6 +455,11 @@ document.getElementById('nav-favorites').addEventListener('click', () => show('f
 document.getElementById('fav-add').addEventListener('click', addFav);
 document.getElementById('add-scan').addEventListener('click', scanSource);
 document.getElementById('nav-update').addEventListener('click', runUpdate);
+document.getElementById('filter-all-installs').addEventListener('change', async () => {
+  const showAll = document.getElementById('filter-all-installs').checked;
+  const installs = await api('installs' + (showAll ? '?all=true' : ''));
+  document.getElementById('installs').replaceChildren(renderInstalls(installs));
+});
 refresh();
 </script>
 </body>

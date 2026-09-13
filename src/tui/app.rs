@@ -1,5 +1,7 @@
 //! TUI 应用状态与纯函数 reducer（业务变更全部走 core 类型）。
 
+use std::path::PathBuf;
+
 use crate::core::favorites;
 use crate::core::registry::{Install, Method, Registry};
 
@@ -18,6 +20,7 @@ pub enum Action {
     NextView,
     PrevView,
     ToggleAutoUpdate,
+    ToggleShowAll,
     DeleteFav,
     Quit,
 }
@@ -33,6 +36,8 @@ pub struct AppState {
     pub registry: Registry,
     pub view: View,
     pub selected: usize,
+    pub show_all: bool,
+    pub current_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -41,11 +46,23 @@ impl AppState {
             registry,
             view: View::Installed,
             selected: 0,
+            show_all: false,
+            current_dir: std::env::current_dir().ok(),
         }
     }
 
     pub fn visible_rows(&self) -> Vec<&Install> {
-        self.registry.installs.iter().collect()
+        if self.show_all {
+            self.registry.installs.iter().collect()
+        } else if let Some(ref cwd) = self.current_dir {
+            self.registry
+                .installs
+                .iter()
+                .filter(|i| i.is_visible_in_dir(cwd))
+                .collect()
+        } else {
+            self.registry.installs.iter().collect()
+        }
     }
 
     /// 收藏视图展平行：多技能仓库 = 标题行 + 每技能一行；
@@ -116,6 +133,13 @@ impl AppState {
                             Some(false) => None,
                         };
                     }
+                }
+            }
+            Action::ToggleShowAll => {
+                if self.view == View::Installed {
+                    self.show_all = !self.show_all;
+                    let max = self.visible_rows().len().saturating_sub(1);
+                    self.selected = self.selected.min(max);
                 }
             }
             Action::DeleteFav => {
@@ -301,5 +325,67 @@ mod tests {
         assert_eq!(app.registry.installs[0].auto_update, Some(false));
         app.reduce(Action::ToggleAutoUpdate);
         assert_eq!(app.registry.installs[0].auto_update, None); // 三态循环 true→false→跟随
+    }
+
+    #[test]
+    fn toggle_show_all_filters_and_unfilters_visible_rows() {
+        let mut reg = Registry {
+            version: 3,
+            ..Default::default()
+        };
+        reg.installs.push(Install {
+            skill: "global_skill".into(),
+            source: "github/o/r".into(),
+            source_path: "skills/global_skill".into(),
+            target: TargetRec::Global {
+                agent: "agents".into(),
+            },
+            method: Method::Copy,
+            commit: "c1".into(),
+            auto_update: None,
+            installed_at: "t".into(),
+        });
+        reg.installs.push(Install {
+            skill: "proj_a_skill".into(),
+            source: "github/o/r".into(),
+            source_path: "skills/proj_a_skill".into(),
+            target: TargetRec::Project {
+                agent: "agents".into(),
+                root: PathBuf::from("/work/project_a"),
+            },
+            method: Method::Copy,
+            commit: "c1".into(),
+            auto_update: None,
+            installed_at: "t".into(),
+        });
+        reg.installs.push(Install {
+            skill: "proj_b_skill".into(),
+            source: "github/o/r".into(),
+            source_path: "skills/proj_b_skill".into(),
+            target: TargetRec::Project {
+                agent: "agents".into(),
+                root: PathBuf::from("/work/project_b"),
+            },
+            method: Method::Copy,
+            commit: "c1".into(),
+            auto_update: None,
+            installed_at: "t".into(),
+        });
+        let mut app = AppState::new(reg);
+        app.current_dir = Some(PathBuf::from("/work/project_a"));
+        // 默认不显示全部：只显示全局和本项目
+        assert_eq!(app.visible_rows().len(), 2);
+        assert_eq!(app.visible_rows()[0].skill, "global_skill");
+        assert_eq!(app.visible_rows()[1].skill, "proj_a_skill");
+
+        // 切换显示全部
+        app.reduce(Action::ToggleShowAll);
+        assert!(app.show_all);
+        assert_eq!(app.visible_rows().len(), 3);
+
+        // 再次切换回到仅本项目+全局
+        app.reduce(Action::ToggleShowAll);
+        assert!(!app.show_all);
+        assert_eq!(app.visible_rows().len(), 2);
     }
 }

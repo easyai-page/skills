@@ -60,6 +60,13 @@ pub struct Favorite {
     pub skills: Vec<FavSkill>,
 }
 
+impl Install {
+    /// 判定该安装项在给定工作目录下是否可见（全局有效，或属于当前项目目录/子目录）
+    pub fn is_visible_in_dir(&self, cwd: &std::path::Path) -> bool {
+        self.target.is_visible_in_dir(cwd)
+    }
+}
+
 impl TargetRec {
     /// TargetRec 是持久化形态（serde 落盘），Target 是运行时形态（install/remove/update 用）；
     /// 转换逻辑收敛到这里，避免各调用点重复手写 match。
@@ -73,6 +80,20 @@ impl TargetRec {
                 agent: agent.clone(),
                 scope: crate::core::paths::Scope::Project(root.clone()),
             },
+        }
+    }
+
+    /// 判定目标在给定工作目录下是否有效：
+    /// - 全局目标：对所有路径均有效（true）
+    /// - 项目目标：当且仅当当前工作目录处于项目的根目录或其子目录下时有效
+    pub fn is_visible_in_dir(&self, cwd: &std::path::Path) -> bool {
+        match self {
+            TargetRec::Global { .. } => true,
+            TargetRec::Project { root, .. } => {
+                let norm_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+                let norm_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                norm_cwd.starts_with(&norm_root) || cwd.starts_with(root)
+            }
         }
     }
 }
@@ -338,5 +359,28 @@ mod tests {
                 scope: crate::core::paths::Scope::Project(PathBuf::from("/x")),
             }
         );
+    }
+
+    #[test]
+    fn is_visible_in_dir_global_and_project() {
+        let global = TargetRec::Global {
+            agent: "agents".into(),
+        };
+        assert!(global.is_visible_in_dir(std::path::Path::new("/any/path")));
+
+        let proj = TargetRec::Project {
+            agent: "agents".into(),
+            root: PathBuf::from("/home/user/projectA"),
+        };
+        // 相同目录
+        assert!(proj.is_visible_in_dir(std::path::Path::new("/home/user/projectA")));
+        // 子目录
+        assert!(proj.is_visible_in_dir(std::path::Path::new("/home/user/projectA/src/components")));
+        // 外部路径 / 父目录
+        assert!(!proj.is_visible_in_dir(std::path::Path::new("/home/user")));
+        // 另一项目
+        assert!(!proj.is_visible_in_dir(std::path::Path::new("/home/user/projectB")));
+        // 类似前缀但不是子目录组件
+        assert!(!proj.is_visible_in_dir(std::path::Path::new("/home/user/projectA_backup")));
     }
 }

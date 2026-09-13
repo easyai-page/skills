@@ -123,6 +123,7 @@ fn event_loop(
                 KeyCode::Tab => Action::NextView,
                 KeyCode::BackTab => Action::PrevView,
                 KeyCode::Char('a') => Action::ToggleAutoUpdate,
+                KeyCode::Char('p') => Action::ToggleShowAll,
                 KeyCode::Char('d') => Action::DeleteFav,
                 _ => continue,
             };

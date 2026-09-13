@@ -33,9 +33,11 @@ pub fn run(cli: Cli) -> Result<()> {
             tag,
             target,
             global,
+            all,
         }) => {
             let reg = Registry::load(&layout)?;
             let t = target.as_deref().map(Target::parse).transpose()?;
+            let cwd = std::env::current_dir().ok();
             let rows: Vec<_> = reg
                 .installs
                 .iter()
@@ -46,7 +48,18 @@ pub fn run(cli: Cli) -> Result<()> {
                 })
                 .filter(|i| match &t {
                     Some(t) => install::to_rec(t) == i.target,
-                    None => !global || matches!(i.target, TargetRec::Global { .. }),
+                    None => {
+                        if global {
+                            matches!(i.target, TargetRec::Global { .. })
+                        } else if all {
+                            true
+                        } else {
+                            match &cwd {
+                                Some(d) => i.is_visible_in_dir(d),
+                                None => true,
+                            }
+                        }
+                    }
                 })
                 .collect();
             if rows.is_empty() {

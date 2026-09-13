@@ -51,6 +51,9 @@ pub enum Cmd {
         target: Option<String>,
         #[arg(short = 'g', long)]
         global: bool,
+        /// 显示全部安装（默认仅显示当前项目路径下及全局有效技能）
+        #[arg(short = 'a', long)]
+        all: bool,
     },
     /// 删除已安装技能（先查记录再核实磁盘）
     Remove {

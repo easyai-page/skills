@@ -61,6 +61,15 @@ pub fn draw(f: &mut Frame, app: &AppState) {
                 .header(
                     Row::new(vec!["技能", "方式", "目标", "分类", "自动更新"])
                         .style(Style::default().fg(Color::Cyan)),
+                )
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(if app.show_all {
+                            "已安装 [全部项目] (按 p 仅看本项目+全局，a 切换更新)"
+                        } else {
+                            "已安装 [本项目+全局] (按 p 查看全部项目，a 切换更新)"
+                        }),
                 ),
                 chunks[1],
             );
