@@ -7,7 +7,17 @@ body { font-family: system-ui; max-width: 960px; margin: 2rem auto; padding: 0 1
 table { border-collapse: collapse; width: 100%; }
 td, th { border: 1px solid #ddd; padding: 6px 10px; }
 nav button { margin-right: 8px; }
+td button { margin-right: 4px; }
+td button:last-child { margin-right: 0; }
 .on { color: green; } .off { color: #999; }
+.modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal-box { background: white; padding: 20px; border-radius: 8px; min-width: 360px; max-width: 500px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+.modal-box h3 { margin-top: 0; margin-bottom: 12px; }
+.modal-box p { margin: 8px 0; }
+.modal-actions { margin-top: 16px; text-align: right; }
+.modal-actions button { margin-left: 8px; }
+.btn-danger { color: #d32f2f; }
+.clickable-badge { cursor: pointer; text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -68,10 +78,11 @@ function show(id) {
   refresh();
 }
 function targetRef(i) { return i.target.scope==='global' ? i.target.agent : i.target.root; }
-function renderInstalls(installs) {
+let currentSources = {};
+function renderInstalls(installs, sources = currentSources) {
   const table = el('table');
   const head = el('tr');
-  for (const h of ['技能','方式','目标','分类','自动更新','']) head.appendChild(el('th', h));
+  for (const h of ['技能','方式','目标','分类','自动更新','操作']) head.appendChild(el('th', h));
   table.appendChild(head);
   for (const i of installs) {
     const tr = el('tr');
@@ -95,15 +106,219 @@ function renderInstalls(installs) {
       sel.addEventListener('change', () => setAU(i.skill, i.target.scope, targetRef(i), i.target.agent, sel.value));
       cell(tr, sel);
     } else {
-      tr.appendChild(el('td', '跟随包级'));
+      const srcRecord = (sources || {})[i.source] || {};
+      const srcAU = srcRecord.auto_update ? '开' : '关';
+      const badge = el('span', `跟随包级 (包: ${srcAU})`);
+      badge.className = 'clickable-badge';
+      badge.title = `点击切换所属仓库 [${i.source}] 自动更新策略（当前: ${srcAU}）`;
+      badge.addEventListener('click', async () => {
+        const next = !srcRecord.auto_update;
+        if (confirm(`是否切换所属仓库 [${i.source}] 自动更新策略为「${next ? '开' : '关'}」？`)) {
+          try {
+            await setSourceAU(i.source, next);
+            refresh();
+          } catch (e) {
+            alert('修改仓库更新策略失败: ' + e.message);
+          }
+        }
+      });
+      cell(tr, badge);
     }
+
+    const actCell = el('td');
+    const updBtn = el('button', '更新');
+    updBtn.addEventListener('click', () => updateSingle(i));
+    actCell.appendChild(updBtn);
+
+    const mgBtn = el('button', '管理');
+    mgBtn.addEventListener('click', () => openManageModal(i, sources || currentSources));
+    actCell.appendChild(mgBtn);
 
     const rmBtn = el('button', '删除');
     rmBtn.addEventListener('click', () => rm(i.skill, i.target.scope, targetRef(i), i.target.agent));
-    cell(tr, rmBtn);
+    actCell.appendChild(rmBtn);
+
+    tr.appendChild(actCell);
     table.appendChild(tr);
   }
   return table;
+}
+
+async function updateSingle(i, force = false) {
+  const body = { skill: i.skill, target: i.target, force };
+  try {
+    const r = await api('update', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    alert((r && r.done && r.done.join('\n')) || `${i.skill} 已是最新`);
+    refresh();
+  } catch (e) {
+    if (e.status === 409) {
+      if (confirm(e.message + '\n\n本地修改将被覆盖，是否强制更新？')) {
+        return updateSingle(i, true);
+      }
+      return;
+    }
+    alert('更新失败: ' + e.message);
+  }
+}
+
+async function doSwitchMethod(skill, target, method, force = false) {
+  try {
+    await api('switch-method', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ skill, target, method, force })
+    });
+    alert(`已转换为 ${method}`);
+    refresh();
+  } catch (e) {
+    if (e.status === 409) {
+      if (confirm(e.message + '\n\n本地修改将被丢弃，是否强制转换为软链接？')) {
+        return doSwitchMethod(skill, target, method, true);
+      }
+      return;
+    }
+    alert('转换安装方式失败: ' + e.message);
+  }
+}
+
+function openManageModal(i, sources) {
+  const existing = document.getElementById('manage-modal');
+  if (existing) existing.remove();
+
+  const mask = el('div');
+  mask.id = 'manage-modal';
+  mask.className = 'modal-mask';
+
+  const box = el('div');
+  box.className = 'modal-box';
+  box.appendChild(el('h3', `管理技能: ${i.skill}`));
+
+  const targetStr = i.target.scope === 'global' ? `global:${i.target.agent}` : `project:${i.target.root} (${i.target.agent})`;
+  const metaP = el('p');
+  metaP.appendChild(document.createTextNode(`所属仓库: ${i.source}`));
+  metaP.appendChild(document.createElement('br'));
+  metaP.appendChild(document.createTextNode(`目标: ${targetStr}`));
+  box.appendChild(metaP);
+
+  // 1. 安装方式
+  const methodP = el('p');
+  methodP.appendChild(el('strong', '安装方式: '));
+  for (const m of ['symlink', 'copy']) {
+    const label = el('label');
+    label.style.marginRight = '12px';
+    label.style.cursor = 'pointer';
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = 'manage-method';
+    radio.value = m;
+    radio.checked = i.method === m;
+    radio.addEventListener('change', () => {
+      if (confirm(`确认将 ${i.skill} 转换为 ${m}？`)) {
+        mask.remove();
+        doSwitchMethod(i.skill, i.target, m, false);
+      } else {
+        radio.checked = i.method === m;
+      }
+    });
+    label.appendChild(radio);
+    label.appendChild(document.createTextNode(' ' + m));
+    methodP.appendChild(label);
+  }
+  box.appendChild(methodP);
+
+  // 2. 自动更新策略
+  const auP = el('p');
+  auP.appendChild(el('strong', '自动更新策略: '));
+  if (i.method === 'copy') {
+    const sel = document.createElement('select');
+    for (const [v, label] of [['', '跟随包级'], ['true', '开'], ['false', '关']]) {
+      const opt = el('option', label);
+      opt.value = v;
+      opt.selected = v === '' ? i.auto_update === null : i.auto_update === (v === 'true');
+      sel.appendChild(opt);
+    }
+    sel.addEventListener('change', async () => {
+      try {
+        await setAU(i.skill, i.target.scope, targetRef(i), i.target.agent, sel.value);
+        alert('已更新策略');
+        mask.remove();
+        refresh();
+      } catch (e) {
+        alert('更新策略失败: ' + e.message);
+      }
+    });
+    auP.appendChild(sel);
+  } else {
+    const srcRecord = (sources || {})[i.source] || {};
+    const srcState = srcRecord.auto_update ? '开' : '关';
+    auP.appendChild(document.createTextNode(`软链接跟随所属仓库 [${i.source}] (当前: ${srcState}) `));
+    const toggleBtn = el('button', `切换仓库策略为 ${srcRecord.auto_update ? '关' : '开'}`);
+    toggleBtn.addEventListener('click', async () => {
+      try {
+        await setSourceAU(i.source, !srcRecord.auto_update);
+        alert('已修改所属仓库更新策略');
+        mask.remove();
+        refresh();
+      } catch (e) {
+        alert('修改仓库更新策略失败: ' + e.message);
+      }
+    });
+    auP.appendChild(toggleBtn);
+  }
+  box.appendChild(auP);
+
+  // 3. 动作按钮
+  const btnRow = el('div');
+  btnRow.style.marginTop = '16px';
+  const updBtn = el('button', '检查更新');
+  updBtn.addEventListener('click', () => { mask.remove(); updateSingle(i, false); });
+  btnRow.appendChild(updBtn);
+
+  const forceUpdBtn = el('button', '强制覆盖更新');
+  forceUpdBtn.style.marginLeft = '8px';
+  forceUpdBtn.addEventListener('click', () => {
+    if (confirm('确认强制覆盖更新（可能覆盖本地修改）？')) {
+      mask.remove();
+      updateSingle(i, true);
+    }
+  });
+  btnRow.appendChild(forceUpdBtn);
+
+  const delBtn = el('button', '删除此技能');
+  delBtn.className = 'btn-danger';
+  delBtn.style.marginLeft = '8px';
+  delBtn.addEventListener('click', () => {
+    mask.remove();
+    rm(i.skill, i.target.scope, targetRef(i), i.target.agent);
+  });
+  btnRow.appendChild(delBtn);
+  box.appendChild(btnRow);
+
+  // 底部关闭
+  const actions = el('div');
+  actions.className = 'modal-actions';
+  const closeBtn = el('button', '关闭');
+  closeBtn.addEventListener('click', () => mask.remove());
+  actions.appendChild(closeBtn);
+  box.appendChild(actions);
+
+  mask.addEventListener('click', (e) => {
+    if (e.target === mask) mask.remove();
+  });
+  const escHandler = (e) => {
+    if (e.key === 'Escape') {
+      mask.remove();
+      document.removeEventListener('keydown', escHandler);
+    }
+  };
+  document.addEventListener('keydown', escHandler);
+
+  mask.appendChild(box);
+  document.body.appendChild(mask);
 }
 function renderSources(sources) {
   const table = el('table');
@@ -401,11 +616,14 @@ async function doInstall(source, skill, agents, scope, method) {
 }
 async function refresh() {
   const showAll = document.getElementById('filter-all-installs')?.checked;
-  const installs = await api('installs' + (showAll ? '?all=true' : ''));
-  document.getElementById('installs').replaceChildren(renderInstalls(installs));
-  const sources = await api('sources');
-  document.getElementById('sources').replaceChildren(renderSources(sources));
-  const favs = await api('favorites');
+  const [installs, sources, favs] = await Promise.all([
+    api('installs' + (showAll ? '?all=true' : '')),
+    api('sources'),
+    api('favorites')
+  ]);
+  currentSources = sources || {};
+  document.getElementById('installs').replaceChildren(renderInstalls(installs, currentSources));
+  document.getElementById('sources').replaceChildren(renderSources(currentSources));
   document.getElementById('fav-list').replaceChildren(renderFavorites(favs));
 }
 // agent 必须取安装记录里的真实值：project scope 硬编码 'agents' 会让非 universal agent 的记录 404
@@ -458,7 +676,7 @@ document.getElementById('nav-update').addEventListener('click', runUpdate);
 document.getElementById('filter-all-installs').addEventListener('change', async () => {
   const showAll = document.getElementById('filter-all-installs').checked;
   const installs = await api('installs' + (showAll ? '?all=true' : ''));
-  document.getElementById('installs').replaceChildren(renderInstalls(installs));
+  document.getElementById('installs').replaceChildren(renderInstalls(installs, currentSources));
 });
 refresh();
 </script>
