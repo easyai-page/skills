@@ -187,7 +187,10 @@ async function doSwitchMethod(skill, target, method, force = false) {
 
 function openManageModal(i, sources) {
   const existing = document.getElementById('manage-modal');
-  if (existing) existing.remove();
+  if (existing) {
+    if (existing._cleanup) existing._cleanup();
+    else existing.remove();
+  }
 
   const mask = el('div');
   mask.id = 'manage-modal';
@@ -204,6 +207,18 @@ function openManageModal(i, sources) {
   metaP.appendChild(document.createTextNode(`目标: ${targetStr}`));
   box.appendChild(metaP);
 
+  const escHandler = (e) => {
+    if (e.key === 'Escape') {
+      closeModal();
+    }
+  };
+
+  const closeModal = () => {
+    document.removeEventListener('keydown', escHandler);
+    mask.remove();
+  };
+  mask._cleanup = closeModal;
+
   // 1. 安装方式
   const methodP = el('p');
   methodP.appendChild(el('strong', '安装方式: '));
@@ -218,7 +233,7 @@ function openManageModal(i, sources) {
     radio.checked = i.method === m;
     radio.addEventListener('change', () => {
       if (confirm(`确认将 ${i.skill} 转换为 ${m}？`)) {
-        mask.remove();
+        closeModal();
         doSwitchMethod(i.skill, i.target, m, false);
       } else {
         radio.checked = i.method === m;
@@ -245,7 +260,7 @@ function openManageModal(i, sources) {
       try {
         await setAU(i.skill, i.target.scope, targetRef(i), i.target.agent, sel.value);
         alert('已更新策略');
-        mask.remove();
+        closeModal();
         refresh();
       } catch (e) {
         alert('更新策略失败: ' + e.message);
@@ -261,7 +276,7 @@ function openManageModal(i, sources) {
       try {
         await setSourceAU(i.source, !srcRecord.auto_update);
         alert('已修改所属仓库更新策略');
-        mask.remove();
+        closeModal();
         refresh();
       } catch (e) {
         alert('修改仓库更新策略失败: ' + e.message);
@@ -275,14 +290,14 @@ function openManageModal(i, sources) {
   const btnRow = el('div');
   btnRow.style.marginTop = '16px';
   const updBtn = el('button', '检查更新');
-  updBtn.addEventListener('click', () => { mask.remove(); updateSingle(i, false); });
+  updBtn.addEventListener('click', () => { closeModal(); updateSingle(i, false); });
   btnRow.appendChild(updBtn);
 
   const forceUpdBtn = el('button', '强制覆盖更新');
   forceUpdBtn.style.marginLeft = '8px';
   forceUpdBtn.addEventListener('click', () => {
     if (confirm('确认强制覆盖更新（可能覆盖本地修改）？')) {
-      mask.remove();
+      closeModal();
       updateSingle(i, true);
     }
   });
@@ -292,7 +307,7 @@ function openManageModal(i, sources) {
   delBtn.className = 'btn-danger';
   delBtn.style.marginLeft = '8px';
   delBtn.addEventListener('click', () => {
-    mask.remove();
+    closeModal();
     rm(i.skill, i.target.scope, targetRef(i), i.target.agent);
   });
   btnRow.appendChild(delBtn);
@@ -302,19 +317,13 @@ function openManageModal(i, sources) {
   const actions = el('div');
   actions.className = 'modal-actions';
   const closeBtn = el('button', '关闭');
-  closeBtn.addEventListener('click', () => mask.remove());
+  closeBtn.addEventListener('click', () => closeModal());
   actions.appendChild(closeBtn);
   box.appendChild(actions);
 
   mask.addEventListener('click', (e) => {
-    if (e.target === mask) mask.remove();
+    if (e.target === mask) closeModal();
   });
-  const escHandler = (e) => {
-    if (e.key === 'Escape') {
-      mask.remove();
-      document.removeEventListener('keydown', escHandler);
-    }
-  };
   document.addEventListener('keydown', escHandler);
 
   mask.appendChild(box);

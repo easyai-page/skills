@@ -112,6 +112,8 @@ pub fn switch_install_method(
             make_symlink(&src_dir, &dest)?;
         }
         (Method::Symlink, Method::Copy) => {
+            let src_dir =
+                resolve_source_dir(layout, &inst_source, &inst_source_path.to_string_lossy())?;
             // 归属核验：如果目标存在，必须是链接，防止误删用户目录
             let meta = match std::fs::symlink_metadata(&dest) {
                 Ok(meta) => Some(meta),
@@ -127,8 +129,6 @@ pub fn switch_install_method(
                 }
                 remove_install_path(&dest)?;
             }
-            let src_dir =
-                resolve_source_dir(layout, &inst_source, &inst_source_path.to_string_lossy())?;
             std::fs::create_dir_all(&dest_dir)?;
             copy_install(&src_dir, &dest_dir, &dest)?;
         }
@@ -1252,5 +1252,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::NotInstalled(_)));
+    }
+
+    #[test]
+    fn switch_install_method_missing_cache_preserves_symlink() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let project_root = tmp.path().join("project");
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Project(project_root.clone()),
+        };
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Symlink,
+            "c1",
+        )
+        .unwrap();
+        let trec = to_rec(&target);
+        let dest = project_root.join(".agents/skills/alpha");
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+
+        // 模拟缓存被意外删除
+        std::fs::remove_dir_all(layout.cache_dir("github/o/r")).unwrap();
+
+        // 切换到 Copy 时，由于缓存不存在，应安全短路失败，且不能删除原有的软链接
+        let err =
+            switch_install_method(&layout, &cfg, &mut reg, "alpha", &trec, Method::Copy, false)
+                .unwrap_err();
+        assert!(matches!(err, Error::SourceNotDirectory(_)));
+        // 原有链接必须保留
+        assert!(dest.symlink_metadata().is_ok());
+        assert_eq!(reg.find("alpha", &trec).unwrap().method, Method::Symlink);
     }
 }
