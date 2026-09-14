@@ -41,6 +41,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tags", post(set_tags))
         .route("/api/remove", post(remove_install))
         .route("/api/update", post(run_update))
+        .route("/api/switch-method", post(switch_method))
         .route("/api/favorites", get(list_favorites).post(add_favorite))
         .route("/api/favorites/remove", post(remove_favorite))
         .route("/api/favorites/install", post(install_favorite))
@@ -374,14 +375,22 @@ async fn remove_install(State(s): S, Json(req): Json<RemoveReq>) -> StatusCode {
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct UpdateQuery {
+    force: Option<bool>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct UpdateReq {
+    skill: Option<String>,
+    target: Option<TargetRec>,
     force: Option<bool>,
 }
 
 async fn run_update(
     State(s): S,
     axum::extract::Query(query): axum::extract::Query<UpdateQuery>,
+    body: Option<Json<UpdateReq>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let s = s.lock().unwrap();
     // config 损坏时静默回退默认配置会把内置 target 解析到用户真实 home 目录并落盘，
@@ -400,8 +409,39 @@ async fn run_update(
             format!("加载 registry 失败: {e}"),
         )
     })?;
+
+    let (skill, target, force) = if let Some(Json(b)) = body {
+        (
+            b.skill,
+            b.target,
+            b.force.unwrap_or_else(|| query.force.unwrap_or(false)),
+        )
+    } else {
+        (None, None, query.force.unwrap_or(false))
+    };
+
+    if skill.is_some() != target.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "单项更新必须同时指定 skill 与 target".into(),
+        ));
+    }
+
+    if let (Some(skill), Some(target)) = (skill, target) {
+        let done =
+            crate::core::update::update_single(&s.layout, &cfg, &mut reg, &skill, &target, force)
+                .map_err(|e| match e {
+                crate::core::error::Error::Mismatch(msg) => (StatusCode::CONFLICT, msg),
+                crate::core::error::Error::NotInstalled(msg) => (StatusCode::NOT_FOUND, msg),
+                e => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("执行单项更新失败: {e}"),
+                ),
+            })?;
+        return Ok(Json(serde_json::json!({ "done": done })));
+    }
+
     let plan = crate::core::update::build_plan(&reg, None);
-    let force = query.force.unwrap_or(false);
     let done = crate::core::update::execute_plan(&s.layout, &cfg, &mut reg, &plan, force).map_err(
         |e| match e {
             // 副本本地修改：409（用户可决策的冲突），前端确认后带 ?force=true 重试
@@ -413,6 +453,54 @@ async fn run_update(
         },
     )?;
     Ok(Json(serde_json::json!({ "done": done })))
+}
+
+#[derive(serde::Deserialize)]
+struct SwitchMethodReq {
+    skill: String,
+    target: TargetRec,
+    method: Method,
+    force: Option<bool>,
+}
+
+async fn switch_method(
+    State(s): S,
+    Json(req): Json<SwitchMethodReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let s = s.lock().unwrap();
+    let cfg = crate::core::config::Config::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 config 失败: {e}"),
+        )
+    })?;
+    let mut reg = Registry::load(&s.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加载 registry 失败: {e}"),
+        )
+    })?;
+    let force = req.force.unwrap_or(false);
+
+    crate::core::install::switch_install_method(
+        &s.layout,
+        &cfg,
+        &mut reg,
+        &req.skill,
+        &req.target,
+        req.method,
+        force,
+    )
+    .map_err(|e| match e {
+        crate::core::error::Error::Mismatch(msg) => (StatusCode::CONFLICT, msg),
+        crate::core::error::Error::NotInstalled(msg) => (StatusCode::NOT_FOUND, msg),
+        e => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("切换安装方式失败: {e}"),
+        ),
+    })?;
+
+    Ok(StatusCode::OK)
 }
 
 async fn list_favorites(State(s): S) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -1451,5 +1539,375 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 404);
         drop(keep);
+    }
+
+    struct TestRepoEnv {
+        tmp: Arc<tempfile::TempDir>,
+        work: std::path::PathBuf,
+        bare: std::path::PathBuf,
+        layout: Layout,
+        target: TargetRec,
+    }
+
+    fn setup_api_repo(method: Method) -> TestRepoEnv {
+        let tmp = Arc::new(tempfile::tempdir().unwrap());
+        let work = tmp.path().join("work");
+        let bare = tmp.path().join("bare.git");
+        std::fs::create_dir_all(work.join("skills/alpha")).unwrap();
+        std::fs::write(
+            work.join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: A\n---\nv1\n",
+        )
+        .unwrap();
+        let git_run = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} 失败");
+        };
+        git_run(&["init", "-b", "main"]);
+        git_run(&["add", "."]);
+        git_run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "c1",
+        ]);
+        git_run(&["clone", "--bare", ".", bare.to_str().unwrap()]);
+
+        let layout = Layout::at(tmp.path().join(".skills"));
+        std::fs::create_dir_all(&layout.root).unwrap();
+        std::fs::write(
+            layout.config_path(),
+            format!("[targets]\nagents = {:?}\n", tmp.path().join("agents")),
+        )
+        .unwrap();
+        let cache = layout.cache_dir("github/o/r");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        let url = format!("file://{}", bare.display());
+        let c1 = crate::core::git::shallow_clone(&url, &cache).unwrap();
+
+        let cfg = crate::core::config::Config::load(&layout).unwrap();
+        let mut reg = Registry {
+            version: 3,
+            ..Default::default()
+        };
+        reg.sources.insert(
+            "github/o/r".into(),
+            crate::core::registry::SourceRecord {
+                url,
+                commit: c1.clone(),
+                fetched_at: "2026-08-20T00:00:00Z".into(),
+                auto_update: Some(true),
+            },
+        );
+        let target = TargetRec::Global {
+            agent: "agents".into(),
+        };
+        crate::core::install::install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target.to_target(),
+            method,
+            &c1,
+        )
+        .unwrap();
+        reg.save(&layout).unwrap();
+
+        TestRepoEnv {
+            tmp,
+            work,
+            bare,
+            layout,
+            target,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_single_via_api() {
+        let env = setup_api_repo(Method::Copy);
+        let dest = env.tmp.path().join("agents/alpha");
+
+        // 远端更新到 v2
+        std::fs::write(
+            env.work.join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: A\n---\nv2\n",
+        )
+        .unwrap();
+        let git_run = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&env.work)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} 失败");
+        };
+        git_run(&["add", "."]);
+        git_run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "c2",
+        ]);
+        git_run(&["push", env.bare.to_str().unwrap(), "main"]);
+
+        let state = AppState {
+            layout: env.layout.clone(),
+            tmp: env.tmp.clone(),
+        };
+        let app = router(state);
+
+        let req = post_json(
+            "/api/update",
+            serde_json::json!({
+                "skill": "alpha",
+                "target": env.target,
+                "force": false
+            }),
+        );
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["done"].as_array().unwrap().len() >= 2);
+        assert!(
+            std::fs::read_to_string(dest.join("SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_single_via_api_not_installed_returns_404() {
+        let env = setup_api_repo(Method::Copy);
+        let state = AppState {
+            layout: env.layout.clone(),
+            tmp: env.tmp.clone(),
+        };
+        let app = router(state);
+
+        let req = post_json(
+            "/api/update",
+            serde_json::json!({
+                "skill": "nonexistent",
+                "target": env.target,
+                "force": false
+            }),
+        );
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn update_single_via_api_rejects_mismatched_skill_and_target() {
+        let env = setup_api_repo(Method::Copy);
+        let state = AppState {
+            layout: env.layout.clone(),
+            tmp: env.tmp.clone(),
+        };
+        let app = router(state);
+
+        let req = post_json(
+            "/api/update",
+            serde_json::json!({
+                "skill": "alpha",
+                "force": false
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let req = post_json(
+            "/api/update",
+            serde_json::json!({
+                "target": env.target,
+                "force": false
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_single_via_api_mismatch_409_then_force_succeeds() {
+        let env = setup_api_repo(Method::Copy);
+        let dest = env.tmp.path().join("agents/alpha");
+
+        // 远端更新到 v2
+        std::fs::write(
+            env.work.join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: A\n---\nv2\n",
+        )
+        .unwrap();
+        let git_run = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&env.work)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} 失败");
+        };
+        git_run(&["add", "."]);
+        git_run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "c2",
+        ]);
+        git_run(&["push", env.bare.to_str().unwrap(), "main"]);
+
+        // 用户本地修改
+        std::fs::write(dest.join("SKILL.md"), "modified\n").unwrap();
+
+        let state = AppState {
+            layout: env.layout.clone(),
+            tmp: env.tmp.clone(),
+        };
+        let app = router(state);
+
+        // 无 force: 409
+        let req = post_json(
+            "/api/update",
+            serde_json::json!({
+                "skill": "alpha",
+                "target": env.target,
+                "force": false
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // force: 200
+        let req = post_json(
+            "/api/update",
+            serde_json::json!({
+                "skill": "alpha",
+                "target": env.target,
+                "force": true
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            std::fs::read_to_string(dest.join("SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_method_via_api() {
+        let env = setup_api_repo(Method::Symlink);
+        let dest = env.tmp.path().join("agents/alpha");
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+
+        let state = AppState {
+            layout: env.layout.clone(),
+            tmp: env.tmp.clone(),
+        };
+        let app = router(state);
+
+        let req = post_json(
+            "/api/switch-method",
+            serde_json::json!({
+                "skill": "alpha",
+                "target": env.target,
+                "method": "copy",
+                "force": false
+            }),
+        );
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let reg = Registry::load(&env.layout).unwrap();
+        assert_eq!(reg.installs[0].method, Method::Copy);
+        assert!(!dest.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(dest.join(".skills-manifest").is_file());
+    }
+
+    #[tokio::test]
+    async fn switch_method_via_api_checks_mismatch_and_force() {
+        let env = setup_api_repo(Method::Copy);
+        let dest = env.tmp.path().join("agents/alpha");
+        // 本地修改文件
+        std::fs::write(dest.join("SKILL.md"), "modified\n").unwrap();
+
+        let state = AppState {
+            layout: env.layout.clone(),
+            tmp: env.tmp.clone(),
+        };
+        let app = router(state);
+
+        // 无 force: 409
+        let req = post_json(
+            "/api/switch-method",
+            serde_json::json!({
+                "skill": "alpha",
+                "target": env.target,
+                "method": "symlink",
+                "force": false
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // force: 200
+        let req = post_json(
+            "/api/switch-method",
+            serde_json::json!({
+                "skill": "alpha",
+                "target": env.target,
+                "method": "symlink",
+                "force": true
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let reg = Registry::load(&env.layout).unwrap();
+        assert_eq!(reg.installs[0].method, Method::Symlink);
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[tokio::test]
+    async fn switch_method_via_api_not_installed_returns_404() {
+        let env = setup_api_repo(Method::Symlink);
+        let state = AppState {
+            layout: env.layout.clone(),
+            tmp: env.tmp.clone(),
+        };
+        let app = router(state);
+
+        let req = post_json(
+            "/api/switch-method",
+            serde_json::json!({
+                "skill": "nonexistent",
+                "target": env.target,
+                "method": "copy",
+                "force": false
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }
