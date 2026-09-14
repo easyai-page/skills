@@ -12,9 +12,10 @@ use crate::core::{
     error::{Error, Result},
     favorites, install,
     paths::Layout,
-    registry::Registry,
+    registry::{Method, Registry},
     remove,
     source::parse_source,
+    update,
 };
 use crate::wizard;
 use app::{Action, AppState, FavRow, View};
@@ -116,6 +117,30 @@ fn event_loop(
                 term.clear()?;
                 continue;
             }
+            if app.view == View::Installed {
+                if k.code == KeyCode::Enter {
+                    guard.suspend();
+                    let r = installed_action_menu(layout, cfg, app);
+                    if let Err(e) = r {
+                        eprintln!("操作异常: {e}");
+                        let _ = inquire::Text::new("按回车返回 TUI").prompt();
+                    }
+                    guard.resume()?;
+                    term.clear()?;
+                    continue;
+                }
+                if k.code == KeyCode::Char('d') {
+                    guard.suspend();
+                    let r = confirm_delete_installed(layout, cfg, app);
+                    if let Err(e) = r {
+                        eprintln!("删除失败: {e}");
+                        let _ = inquire::Text::new("按回车返回 TUI").prompt();
+                    }
+                    guard.resume()?;
+                    term.clear()?;
+                    continue;
+                }
+            }
             let action = match k.code {
                 KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
                 KeyCode::Up | KeyCode::Char('k') => Action::Up,
@@ -133,6 +158,228 @@ fn event_loop(
             app.reduce(action);
         }
     }
+    Ok(())
+}
+
+/// 确认并删除选中的已安装技能副本。
+fn confirm_delete_installed(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<()> {
+    let visible = app.visible_rows();
+    let Some(row) = visible.get(app.selected) else {
+        return Ok(());
+    };
+    let skill = row.skill.clone();
+    let target = row.target.clone();
+    let prompt_text = format!("确认删除 {} @ {}？", skill, target.to_target());
+    if !inquire::Confirm::new(&prompt_text)
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    match remove::remove_install(layout, cfg, &mut app.registry, &skill, &target) {
+        Ok(_) => {
+            app.registry.save(layout)?;
+            println!("已删除 {skill} @ {}", target.to_target());
+            let max = app.visible_rows().len().saturating_sub(1);
+            app.selected = app.selected.min(max);
+        }
+        Err(e) => {
+            eprintln!("删除失败: {e}");
+        }
+    }
+    let _ = inquire::Text::new("按回车返回 TUI").prompt();
+    Ok(())
+}
+
+/// 已安装技能管理动作菜单（回车弹出）。
+fn installed_action_menu(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<()> {
+    let visible = app.visible_rows();
+    let Some(row) = visible.get(app.selected) else {
+        return Ok(());
+    };
+    let skill = row.skill.clone();
+    let target = row.target.clone();
+    let method = row.method;
+    let auto_up = row.auto_update;
+    let source = row.source.clone();
+
+    println!("\n▶ 管理技能: {} @ {}", skill, target.to_target());
+    println!(
+        "  当前方式: {:?} | 自动更新: {} | 来源: {}",
+        method,
+        match auto_up {
+            Some(true) => "开",
+            Some(false) => "关",
+            None => "跟随包级",
+        },
+        source
+    );
+
+    let options = vec![
+        "1. 手动更新 (普通检查更新)",
+        "2. 强制覆盖更新 (忽略本地修改)",
+        "3. 配置自动更新策略",
+        "4. 转换安装方式 (symlink ⇄ copy)",
+        "5. 删除该技能副本",
+        "0. 返回",
+    ];
+
+    let choice = inquire::Select::new("选择操作", options)
+        .prompt()
+        .unwrap_or("0. 返回");
+
+    match choice {
+        s if s.starts_with("1.") => {
+            match update::update_single(layout, cfg, &mut app.registry, &skill, &target, false) {
+                Ok(done) => {
+                    if done.is_empty() {
+                        println!("当前已是最新版本");
+                    } else {
+                        for l in done {
+                            println!("{l}");
+                        }
+                    }
+                }
+                Err(Error::Mismatch(msg)) => {
+                    eprintln!("检测到本地修改:\n{msg}");
+                    if inquire::Confirm::new("是否放弃本地修改强制覆盖？")
+                        .with_default(false)
+                        .prompt()
+                        .unwrap_or(false)
+                    {
+                        match update::update_single(
+                            layout,
+                            cfg,
+                            &mut app.registry,
+                            &skill,
+                            &target,
+                            true,
+                        ) {
+                            Ok(done) => {
+                                for l in done {
+                                    println!("{l}");
+                                }
+                            }
+                            Err(e) => eprintln!("强制更新失败: {e}"),
+                        }
+                    }
+                }
+                Err(e) => eprintln!("更新失败: {e}"),
+            }
+            let _ = inquire::Text::new("按回车返回 TUI").prompt();
+        }
+        s if s.starts_with("2.") => {
+            if inquire::Confirm::new("确认强制更新并覆盖可能的本地修改？")
+                .with_default(false)
+                .prompt()
+                .unwrap_or(false)
+            {
+                match update::update_single(layout, cfg, &mut app.registry, &skill, &target, true) {
+                    Ok(done) => {
+                        for l in done {
+                            println!("{l}");
+                        }
+                    }
+                    Err(e) => eprintln!("强制更新失败: {e}"),
+                }
+                let _ = inquire::Text::new("按回车返回 TUI").prompt();
+            }
+        }
+        s if s.starts_with("3.") => {
+            if method == Method::Copy {
+                let policy_opts = vec!["跟随包级", "开启", "关闭"];
+                if let Ok(p) =
+                    inquire::Select::new("选择该副本的自动更新策略", policy_opts).prompt()
+                {
+                    let val = match p {
+                        "开启" => Some(true),
+                        "关闭" => Some(false),
+                        _ => None,
+                    };
+                    if let Some(inst) = app.registry.find_mut(&skill, &target) {
+                        inst.auto_update = val;
+                    }
+                    app.registry.save(layout)?;
+                    println!("已保存自动更新策略");
+                }
+            } else {
+                let src_au = app
+                    .registry
+                    .sources
+                    .get(&source)
+                    .and_then(|s| s.auto_update)
+                    .unwrap_or(false);
+                println!(
+                    "提示：软链接始终跟随所属仓库 [{source}]（当前包级: {}）",
+                    if src_au { "开" } else { "关" }
+                );
+                if inquire::Confirm::new(&format!("是否切换所属仓库 [{source}] 的自动更新开关？"))
+                    .prompt()
+                    .unwrap_or(false)
+                {
+                    if let Some(s) = app.registry.sources.get_mut(&source) {
+                        s.auto_update = Some(!src_au);
+                    }
+                    app.registry.save(layout)?;
+                    println!(
+                        "已更新仓库自动更新策略为: {}",
+                        if !src_au { "开" } else { "关" }
+                    );
+                }
+            }
+            let _ = inquire::Text::new("按回车返回 TUI").prompt();
+        }
+        s if s.starts_with("4.") => {
+            let new_m = match method {
+                Method::Symlink => Method::Copy,
+                Method::Copy => Method::Symlink,
+            };
+            let prompt = format!("确认从 {:?} 转换为 {:?}？", method, new_m);
+            if inquire::Confirm::new(&prompt).prompt().unwrap_or(false) {
+                match install::switch_install_method(
+                    layout,
+                    cfg,
+                    &mut app.registry,
+                    &skill,
+                    &target,
+                    new_m,
+                    false,
+                ) {
+                    Ok(_) => println!("已成功切换为 {:?}", new_m),
+                    Err(Error::Mismatch(msg)) => {
+                        eprintln!("检测到本地修改:\n{msg}");
+                        if inquire::Confirm::new("转换为软连接将丢弃本地修改，是否强制转换？")
+                            .with_default(false)
+                            .prompt()
+                            .unwrap_or(false)
+                        {
+                            match install::switch_install_method(
+                                layout,
+                                cfg,
+                                &mut app.registry,
+                                &skill,
+                                &target,
+                                new_m,
+                                true,
+                            ) {
+                                Ok(_) => println!("已强制切换为 {:?}", new_m),
+                                Err(e) => eprintln!("强制切换失败: {e}"),
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("切换失败: {e}"),
+                }
+                let _ = inquire::Text::new("按回车返回 TUI").prompt();
+            }
+        }
+        s if s.starts_with("5.") => {
+            confirm_delete_installed(layout, cfg, app)?;
+        }
+        _ => {}
+    }
+
     Ok(())
 }
 
@@ -463,5 +710,47 @@ mod tests {
         let reloaded = Registry::load(&layout).unwrap();
         assert_eq!(reloaded.installs[0].auto_update, Some(true));
         assert_eq!(reloaded.installs[0].skill, "s0");
+    }
+
+    #[test]
+    fn confirm_delete_and_action_menu_empty_rows_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::at(tmp.path().to_path_buf());
+        let cfg = Config::default();
+        let mut app = AppState::new(Registry {
+            version: 3,
+            ..Default::default()
+        });
+
+        // 无可见行时直接 Ok(()) 返回，不 panic，不卡住
+        assert!(confirm_delete_installed(&layout, &cfg, &mut app).is_ok());
+        assert!(installed_action_menu(&layout, &cfg, &mut app).is_ok());
+    }
+
+    #[test]
+    fn confirm_delete_installed_noop_when_not_confirmed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::at(tmp.path().to_path_buf());
+        let cfg = Config::default();
+        let mut reg = Registry {
+            version: 3,
+            ..Default::default()
+        };
+        reg.installs.push(Install {
+            skill: "s0".into(),
+            source: "github/o/r".into(),
+            source_path: "skills/s0".into(),
+            target: TargetRec::Global {
+                agent: "agents".into(),
+            },
+            method: Method::Copy,
+            commit: "c1".into(),
+            auto_update: None,
+            installed_at: "t".into(),
+        });
+        let mut app = AppState::new(reg);
+        // 非交互环境下 inquire prompt 返回错误，unwrap_or(false) 判定为未确认，不删除
+        assert!(confirm_delete_installed(&layout, &cfg, &mut app).is_ok());
+        assert_eq!(app.registry.installs.len(), 1);
     }
 }

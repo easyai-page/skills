@@ -66,9 +66,9 @@ pub fn draw(f: &mut Frame, app: &AppState) {
                     Block::default()
                         .borders(Borders::ALL)
                         .title(if app.show_all {
-                            "已安装 [全部项目] (按 p 仅看本项目+全局，a 切换更新)"
+                            "已安装 [全部项目] (Enter 管理/操作，d 删除，a 切换更新，p 切换过滤)"
                         } else {
-                            "已安装 [本项目+全局] (按 p 查看全部项目，a 切换更新)"
+                            "已安装 [本项目+全局] (Enter 管理/操作，d 删除，a 切换更新，p 切换过滤)"
                         }),
                 ),
                 chunks[1],
@@ -253,5 +253,33 @@ mod tests {
             app.view = view;
             term.draw(|f| draw(f, &app)).unwrap();
         }
+    }
+
+    #[test]
+    fn installed_view_title_contains_action_hints() {
+        let reg = Registry {
+            version: 3,
+            ..Default::default()
+        };
+        let mut app = AppState::new(reg);
+
+        // 默认显示本项目+全局
+        app.view = View::Installed;
+        app.show_all = false;
+        let backend = TestBackend::new(120, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buffer_str = format!("{:?}", term.backend().buffer());
+        assert!(buffer_str.contains("Enter 管理/操作，d 删除，a 切换更新，p 切换过滤"));
+        assert!(buffer_str.contains("已安装 [本项目+全局]"));
+
+        // 切换为全部项目
+        app.show_all = true;
+        let backend = TestBackend::new(120, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buffer_str = format!("{:?}", term.backend().buffer());
+        assert!(buffer_str.contains("Enter 管理/操作，d 删除，a 切换更新，p 切换过滤"));
+        assert!(buffer_str.contains("已安装 [全部项目]"));
     }
 }
