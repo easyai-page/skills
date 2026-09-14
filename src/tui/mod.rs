@@ -12,7 +12,7 @@ use crate::core::{
     error::{Error, Result},
     favorites, install,
     paths::Layout,
-    registry::{Method, Registry},
+    registry::{Method, Registry, TargetRec},
     remove,
     source::parse_source,
     update,
@@ -231,148 +231,13 @@ fn installed_action_menu(layout: &Layout, cfg: &Config, app: &mut AppState) -> R
         .unwrap_or("0. 返回");
 
     match choice {
-        s if s.starts_with("1.") => {
-            match update::update_single(layout, cfg, &mut app.registry, &skill, &target, false) {
-                Ok(done) => {
-                    if done.is_empty() {
-                        println!("当前已是最新版本");
-                    } else {
-                        for l in done {
-                            println!("{l}");
-                        }
-                    }
-                }
-                Err(Error::Mismatch(msg)) => {
-                    eprintln!("检测到本地修改:\n{msg}");
-                    if inquire::Confirm::new("是否放弃本地修改强制覆盖？")
-                        .with_default(false)
-                        .prompt()
-                        .unwrap_or(false)
-                    {
-                        match update::update_single(
-                            layout,
-                            cfg,
-                            &mut app.registry,
-                            &skill,
-                            &target,
-                            true,
-                        ) {
-                            Ok(done) => {
-                                for l in done {
-                                    println!("{l}");
-                                }
-                            }
-                            Err(e) => eprintln!("强制更新失败: {e}"),
-                        }
-                    }
-                }
-                Err(e) => eprintln!("更新失败: {e}"),
-            }
-            let _ = inquire::Text::new("按回车返回 TUI").prompt();
-        }
-        s if s.starts_with("2.") => {
-            if inquire::Confirm::new("确认强制更新并覆盖可能的本地修改？")
-                .with_default(false)
-                .prompt()
-                .unwrap_or(false)
-            {
-                match update::update_single(layout, cfg, &mut app.registry, &skill, &target, true) {
-                    Ok(done) => {
-                        for l in done {
-                            println!("{l}");
-                        }
-                    }
-                    Err(e) => eprintln!("强制更新失败: {e}"),
-                }
-                let _ = inquire::Text::new("按回车返回 TUI").prompt();
-            }
-        }
+        s if s.starts_with("1.") => action_single_update(layout, cfg, app, &skill, &target),
+        s if s.starts_with("2.") => action_force_update(layout, cfg, app, &skill, &target),
         s if s.starts_with("3.") => {
-            if method == Method::Copy {
-                let policy_opts = vec!["跟随包级", "开启", "关闭"];
-                if let Ok(p) =
-                    inquire::Select::new("选择该副本的自动更新策略", policy_opts).prompt()
-                {
-                    let val = match p {
-                        "开启" => Some(true),
-                        "关闭" => Some(false),
-                        _ => None,
-                    };
-                    if let Some(inst) = app.registry.find_mut(&skill, &target) {
-                        inst.auto_update = val;
-                    }
-                    app.registry.save(layout)?;
-                    println!("已保存自动更新策略");
-                }
-            } else {
-                let src_au = app
-                    .registry
-                    .sources
-                    .get(&source)
-                    .and_then(|s| s.auto_update)
-                    .unwrap_or(false);
-                println!(
-                    "提示：软链接始终跟随所属仓库 [{source}]（当前包级: {}）",
-                    if src_au { "开" } else { "关" }
-                );
-                if inquire::Confirm::new(&format!("是否切换所属仓库 [{source}] 的自动更新开关？"))
-                    .prompt()
-                    .unwrap_or(false)
-                {
-                    if let Some(s) = app.registry.sources.get_mut(&source) {
-                        s.auto_update = Some(!src_au);
-                    }
-                    app.registry.save(layout)?;
-                    println!(
-                        "已更新仓库自动更新策略为: {}",
-                        if !src_au { "开" } else { "关" }
-                    );
-                }
-            }
-            let _ = inquire::Text::new("按回车返回 TUI").prompt();
+            action_config_auto_update(layout, app, &skill, &target, method, &source)?;
         }
         s if s.starts_with("4.") => {
-            let new_m = match method {
-                Method::Symlink => Method::Copy,
-                Method::Copy => Method::Symlink,
-            };
-            let prompt = format!("确认从 {:?} 转换为 {:?}？", method, new_m);
-            if inquire::Confirm::new(&prompt).prompt().unwrap_or(false) {
-                match install::switch_install_method(
-                    layout,
-                    cfg,
-                    &mut app.registry,
-                    &skill,
-                    &target,
-                    new_m,
-                    false,
-                ) {
-                    Ok(_) => println!("已成功切换为 {:?}", new_m),
-                    Err(Error::Mismatch(msg)) => {
-                        eprintln!("检测到本地修改:\n{msg}");
-                        if inquire::Confirm::new("转换为软连接将丢弃本地修改，是否强制转换？")
-                            .with_default(false)
-                            .prompt()
-                            .unwrap_or(false)
-                        {
-                            match install::switch_install_method(
-                                layout,
-                                cfg,
-                                &mut app.registry,
-                                &skill,
-                                &target,
-                                new_m,
-                                true,
-                            ) {
-                                Ok(_) => println!("已强制切换为 {:?}", new_m),
-                                Err(e) => eprintln!("强制切换失败: {e}"),
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("切换失败: {e}"),
-                }
-                let _ = inquire::Text::new("按回车返回 TUI").prompt();
-            }
+            action_switch_method(layout, cfg, app, &skill, &target, method);
         }
         s if s.starts_with("5.") => {
             confirm_delete_installed(layout, cfg, app)?;
@@ -381,6 +246,172 @@ fn installed_action_menu(layout: &Layout, cfg: &Config, app: &mut AppState) -> R
     }
 
     Ok(())
+}
+
+fn action_single_update(
+    layout: &Layout,
+    cfg: &Config,
+    app: &mut AppState,
+    skill: &str,
+    target: &TargetRec,
+) {
+    match update::update_single(layout, cfg, &mut app.registry, skill, target, false) {
+        Ok(done) => {
+            if done.is_empty() {
+                println!("当前已是最新版本");
+            } else {
+                for l in done {
+                    println!("{l}");
+                }
+            }
+        }
+        Err(Error::Mismatch(msg)) => {
+            eprintln!("检测到本地修改:\n{msg}");
+            if inquire::Confirm::new("是否放弃本地修改强制覆盖？")
+                .with_default(false)
+                .prompt()
+                .unwrap_or(false)
+            {
+                match update::update_single(layout, cfg, &mut app.registry, skill, target, true) {
+                    Ok(done) => {
+                        for l in done {
+                            println!("{l}");
+                        }
+                    }
+                    Err(e) => eprintln!("强制更新失败: {e}"),
+                }
+            }
+        }
+        Err(e) => eprintln!("更新失败: {e}"),
+    }
+    let _ = inquire::Text::new("按回车返回 TUI").prompt();
+}
+
+fn action_force_update(
+    layout: &Layout,
+    cfg: &Config,
+    app: &mut AppState,
+    skill: &str,
+    target: &TargetRec,
+) {
+    if inquire::Confirm::new("确认强制更新并覆盖可能的本地修改？")
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false)
+    {
+        match update::update_single(layout, cfg, &mut app.registry, skill, target, true) {
+            Ok(done) => {
+                for l in done {
+                    println!("{l}");
+                }
+            }
+            Err(e) => eprintln!("强制更新失败: {e}"),
+        }
+        let _ = inquire::Text::new("按回车返回 TUI").prompt();
+    }
+}
+
+fn action_config_auto_update(
+    layout: &Layout,
+    app: &mut AppState,
+    skill: &str,
+    target: &TargetRec,
+    method: Method,
+    source: &str,
+) -> Result<()> {
+    if method == Method::Copy {
+        let policy_opts = vec!["跟随包级", "开启", "关闭"];
+        if let Ok(p) = inquire::Select::new("选择该副本的自动更新策略", policy_opts).prompt()
+        {
+            let val = match p {
+                "开启" => Some(true),
+                "关闭" => Some(false),
+                _ => None,
+            };
+            if let Some(inst) = app.registry.find_mut(skill, target) {
+                inst.auto_update = val;
+            }
+            app.registry.save(layout)?;
+            println!("已保存自动更新策略");
+        }
+    } else {
+        let src_au = app
+            .registry
+            .sources
+            .get(source)
+            .and_then(|s| s.auto_update)
+            .unwrap_or(false);
+        println!(
+            "提示：软链接始终跟随所属仓库 [{source}]（当前包级: {}）",
+            if src_au { "开" } else { "关" }
+        );
+        if inquire::Confirm::new(&format!("是否切换所属仓库 [{source}] 的自动更新开关？"))
+            .prompt()
+            .unwrap_or(false)
+        {
+            if let Some(s) = app.registry.sources.get_mut(source) {
+                s.auto_update = Some(!src_au);
+            }
+            app.registry.save(layout)?;
+            println!(
+                "已更新仓库自动更新策略为: {}",
+                if !src_au { "开" } else { "关" }
+            );
+        }
+    }
+    let _ = inquire::Text::new("按回车返回 TUI").prompt();
+    Ok(())
+}
+
+fn action_switch_method(
+    layout: &Layout,
+    cfg: &Config,
+    app: &mut AppState,
+    skill: &str,
+    target: &TargetRec,
+    method: Method,
+) {
+    let new_m = match method {
+        Method::Symlink => Method::Copy,
+        Method::Copy => Method::Symlink,
+    };
+    let prompt = format!("确认从 {:?} 转换为 {:?}？", method, new_m);
+    if inquire::Confirm::new(&prompt).prompt().unwrap_or(false) {
+        match install::switch_install_method(
+            layout,
+            cfg,
+            &mut app.registry,
+            skill,
+            target,
+            new_m,
+            false,
+        ) {
+            Ok(_) => println!("已成功切换为 {:?}", new_m),
+            Err(Error::Mismatch(msg)) => {
+                eprintln!("检测到本地修改:\n{msg}");
+                if inquire::Confirm::new("转换为软连接将丢弃本地修改，是否强制转换？")
+                    .with_default(false)
+                    .prompt()
+                    .unwrap_or(false)
+                {
+                    match install::switch_install_method(
+                        layout,
+                        cfg,
+                        &mut app.registry,
+                        skill,
+                        target,
+                        new_m,
+                        true,
+                    ) {
+                        Ok(_) => println!("已强制切换为 {:?}", new_m),
+                        Err(e) => eprintln!("强制切换失败: {e}"),
+                    }
+                }
+            }
+            Err(e) => eprintln!("切换失败: {e}"),
+        }
+        let _ = inquire::Text::new("按回车返回 TUI").prompt();
+    }
 }
 
 /// 安装向导（已在正常终端模式下运行）：选 source → 共享四步向导（技能 → agent → scope → 方式）→ 走 core 安装。

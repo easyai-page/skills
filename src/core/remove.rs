@@ -89,7 +89,7 @@ pub(crate) fn validate_record(rec: &Install) -> Result<()> {
     Ok(())
 }
 
-fn remove_recorded_link(
+pub(crate) fn verify_link_ownership(
     layout: &Layout,
     dest: &Path,
     meta: &std::fs::Metadata,
@@ -108,6 +108,16 @@ fn remove_recorded_link(
             "{dest:?} 指向 {actual:?}，与记录不符，已保留"
         )));
     }
+    Ok(())
+}
+
+fn remove_recorded_link(
+    layout: &Layout,
+    dest: &Path,
+    meta: &std::fs::Metadata,
+    rec: &Install,
+) -> Result<()> {
+    verify_link_ownership(layout, dest, meta, rec)?;
     remove_link_itself(dest, meta)
 }
 
@@ -186,7 +196,7 @@ fn same_link_target(actual: &Path, expected: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn remove_link_itself(dest: &Path, _meta: &std::fs::Metadata) -> Result<()> {
+pub(crate) fn remove_link_itself(dest: &Path, _meta: &std::fs::Metadata) -> Result<()> {
     // 我们的链接只指向缓存目录（目录软链接或 junction）：
     // RemoveDirectory 只删除 reparse point 本身，不会递归进缓存源。
     std::fs::remove_dir(dest)?;
@@ -194,7 +204,7 @@ fn remove_link_itself(dest: &Path, _meta: &std::fs::Metadata) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn remove_link_itself(dest: &Path, _meta: &std::fs::Metadata) -> Result<()> {
+pub(crate) fn remove_link_itself(dest: &Path, _meta: &std::fs::Metadata) -> Result<()> {
     std::fs::remove_file(dest)?;
     Ok(())
 }

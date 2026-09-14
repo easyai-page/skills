@@ -106,38 +106,76 @@ pub fn switch_install_method(
                 if !force {
                     check_copy_unmodified(&dest)?;
                 }
-                remove_install_path(&dest)?;
+                let backup = unique_backup_path(&dest_dir, dest.file_name().unwrap_or_default())?;
+                checked_rename(&dest, &backup)?;
+                match make_symlink(&src_dir, &dest) {
+                    Ok(()) => {
+                        if let Err(err) = remove_backup_dir(&backup) {
+                            eprintln!(
+                                "warning: 切换为软链接成功，但原副本备份 {} 清理失败（{err}），可手动删除",
+                                backup.display()
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        // 软链接创建失败，回滚备份
+                        match checked_rename(&backup, &dest) {
+                            Ok(()) => return Err(err),
+                            Err(rollback_err) => {
+                                return Err(Error::Msg(format!(
+                                    "切换为软链接失败（{err}），且回滚恢复原副本也失败（{rollback_err}）；\
+                                     原副本保留在备份 {}，请手动重命名回 {}",
+                                    backup.display(),
+                                    dest.display()
+                                )));
+                            }
+                        }
+                    }
+                }
+            } else {
+                std::fs::create_dir_all(&dest_dir)?;
+                make_symlink(&src_dir, &dest)?;
             }
-            std::fs::create_dir_all(&dest_dir)?;
-            make_symlink(&src_dir, &dest)?;
         }
         (Method::Symlink, Method::Copy) => {
             let src_dir =
                 resolve_source_dir(layout, &inst_source, &inst_source_path.to_string_lossy())?;
-            // 归属核验：如果目标存在，必须是链接，防止误删用户目录
             let meta = match std::fs::symlink_metadata(&dest) {
                 Ok(meta) => Some(meta),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                 Err(err) => return Err(Error::Io(err)),
             };
-            if let Some(meta) = meta {
-                if !meta.file_type().is_symlink() && !super::remove::is_junction(&dest) {
-                    return Err(Error::Mismatch(format!(
-                        "{dest:?} 不是链接，与安装方式 {:?} 不符，已保留",
-                        cur_method
-                    )));
-                }
-                remove_install_path(&dest)?;
+            if let Some(ref meta) = meta {
+                let rec = reg.find(skill, target).unwrap();
+                super::remove::validate_record(rec)?;
+                super::remove::verify_link_ownership(layout, &dest, meta, rec)?;
             }
             std::fs::create_dir_all(&dest_dir)?;
-            copy_install(&src_dir, &dest_dir, &dest)?;
+            let stage = stage_copy(&src_dir, &dest_dir, dest.file_name().unwrap_or_default())?;
+            if let Some(ref meta) = meta
+                && let Err(err) = super::remove::remove_link_itself(&dest, meta)
+            {
+                let _ = remove_install_path(&stage);
+                return Err(err);
+            }
+            if let Err(err) = checked_rename(&stage, &dest) {
+                let _ = remove_install_path(&stage);
+                if meta.is_some() {
+                    let _ = make_symlink(&src_dir, &dest);
+                }
+                return Err(Error::Io(err));
+            }
         }
         _ => unreachable!(),
     }
 
     // 更新 registry
+    let latest_commit = reg.sources.get(&inst_source).map(|s| s.commit.clone());
     if let Some(inst) = reg.find_mut(skill, target) {
         inst.method = new_method;
+        if let Some(commit) = latest_commit {
+            inst.commit = commit;
+        }
         if new_method == Method::Symlink {
             inst.auto_update = None; // 软连接始终跟随包级
         }
@@ -330,6 +368,8 @@ thread_local! {
     static RENAME_FAIL_MASK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// 置位时 remove_backup_dir 注入失败
     static BACKUP_CLEANUP_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 置位时 make_symlink 注入失败
+    static SYMLINK_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn unique_backup_path(dest_root: &Path, skill: &std::ffi::OsStr) -> Result<PathBuf> {
@@ -429,12 +469,20 @@ pub fn to_rec(target: &Target) -> TargetRec {
 
 #[cfg(unix)]
 fn make_symlink(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(test)]
+    if SYMLINK_FAILS.with(|fails| fails.get()) {
+        return Err(Error::Io(std::io::Error::other("测试注入的 symlink 失败")));
+    }
     std::os::unix::fs::symlink(src, dst)?;
     Ok(())
 }
 
 #[cfg(windows)]
 fn make_symlink(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(test)]
+    if SYMLINK_FAILS.with(|fails| fails.get()) {
+        return Err(Error::Io(std::io::Error::other("测试注入的 symlink 失败")));
+    }
     if std::os::windows::fs::symlink_dir(src, dst).is_ok() {
         return Ok(());
     }
@@ -1289,5 +1337,179 @@ mod tests {
         // 原有链接必须保留
         assert!(dest.symlink_metadata().is_ok());
         assert_eq!(reg.find("alpha", &trec).unwrap().method, Method::Symlink);
+    }
+
+    #[test]
+    fn switch_install_method_symlink_to_copy_updates_commit() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let project_root = tmp.path().join("project");
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Project(project_root.clone()),
+        };
+        reg.sources.insert(
+            "github/o/r".into(),
+            crate::core::registry::SourceRecord {
+                url: "https://github.com/o/r".into(),
+                commit: "c1".into(),
+                fetched_at: "now".into(),
+                auto_update: None,
+            },
+        );
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Symlink,
+            "c1",
+        )
+        .unwrap();
+        let trec = to_rec(&target);
+
+        // 假设源仓库更新到了 c2
+        reg.sources.get_mut("github/o/r").unwrap().commit = "c2".into();
+
+        // 切换到 Copy
+        switch_install_method(&layout, &cfg, &mut reg, "alpha", &trec, Method::Copy, false)
+            .unwrap();
+        let inst = reg.find("alpha", &trec).unwrap();
+        assert_eq!(inst.method, Method::Copy);
+        assert_eq!(inst.commit, "c2");
+        let dest = project_root.join(".agents/skills/alpha");
+        assert!(dest.join(COPY_MANIFEST).is_file());
+        assert!(!dest.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn switch_install_method_symlink_to_copy_refuses_non_symlink() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let project_root = tmp.path().join("project");
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Project(project_root.clone()),
+        };
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Symlink,
+            "c1",
+        )
+        .unwrap();
+        let trec = to_rec(&target);
+        let dest = project_root.join(".agents/skills/alpha");
+
+        // 模拟外部将软链接替换为了普通目录
+        #[cfg(unix)]
+        std::fs::remove_file(&dest).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(&dest).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("custom"), "user data").unwrap();
+
+        let err =
+            switch_install_method(&layout, &cfg, &mut reg, "alpha", &trec, Method::Copy, false)
+                .unwrap_err();
+        assert!(matches!(err, Error::Mismatch(_)), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("custom")).unwrap(),
+            "user data"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn switch_install_method_symlink_to_copy_refuses_foreign_link() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let project_root = tmp.path().join("project");
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Project(project_root.clone()),
+        };
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Symlink,
+            "c1",
+        )
+        .unwrap();
+        let trec = to_rec(&target);
+        let dest = project_root.join(".agents/skills/alpha");
+
+        // 模拟外部将软链接指向了其他位置
+        std::fs::remove_file(&dest).unwrap();
+        let foreign = tmp.path().join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::os::unix::fs::symlink(&foreign, &dest).unwrap();
+
+        let err =
+            switch_install_method(&layout, &cfg, &mut reg, "alpha", &trec, Method::Copy, false)
+                .unwrap_err();
+        assert!(matches!(err, Error::Mismatch(_)), "{err}");
+    }
+
+    #[test]
+    fn switch_install_method_copy_to_symlink_rollback_on_symlink_failure() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let project_root = tmp.path().join("project");
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Project(project_root.clone()),
+        };
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Copy,
+            "c1",
+        )
+        .unwrap();
+        let trec = to_rec(&target);
+        let dest = project_root.join(".agents/skills/alpha");
+        assert!(dest.join(COPY_MANIFEST).is_file());
+
+        // 注入 symlink 失败
+        SYMLINK_FAILS.with(|fails| fails.set(true));
+        let err = switch_install_method(
+            &layout,
+            &cfg,
+            &mut reg,
+            "alpha",
+            &trec,
+            Method::Symlink,
+            false,
+        )
+        .unwrap_err();
+        SYMLINK_FAILS.with(|fails| fails.set(false));
+
+        assert!(matches!(err, Error::Io(_)), "{err}");
+        // 原 copy 副本被回滚恢复，所有权标识仍在
+        assert!(dest.join(COPY_MANIFEST).is_file());
+        assert!(!dest.symlink_metadata().unwrap().file_type().is_symlink());
+        // 且同目录下没有临时备份残留
+        let parent = dest.parent().unwrap();
+        assert!(
+            !dir_names(parent)
+                .iter()
+                .any(|name| name.contains("-update-backup-")),
+            "回滚成功后不应有备份残留"
+        );
     }
 }

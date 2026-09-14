@@ -252,7 +252,6 @@ pub fn update_single(
         return Err(Error::NotInstalled(missing));
     }
     let done = execute_plan(layout, cfg, reg, &plan, force)?;
-    reg.save(layout)?;
     Ok(done)
 }
 
