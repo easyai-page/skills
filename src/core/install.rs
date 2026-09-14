@@ -62,6 +62,101 @@ pub fn install_skill(
     Ok(rec)
 }
 
+/// 将已安装技能在 Symlink 和 Copy 之间原子切换。
+/// Copy -> Symlink 时：若存在本地修改且 !force 则返回 Error::Mismatch 拒绝转换。
+/// 转换成功后更新 registry 记录并原子落盘。
+#[allow(dead_code)]
+pub fn switch_install_method(
+    layout: &Layout,
+    cfg: &Config,
+    reg: &mut Registry,
+    skill: &str,
+    target: &TargetRec,
+    new_method: Method,
+    force: bool,
+) -> Result<()> {
+    let (inst_source, inst_source_path, cur_method) = {
+        let inst = reg
+            .find(skill, target)
+            .ok_or_else(|| Error::NotInstalled(skill.to_string()))?;
+        if inst.method == new_method {
+            return Ok(());
+        }
+        (inst.source.clone(), inst.source_path.clone(), inst.method)
+    };
+
+    let t = target.to_target();
+    let dest_dir = t.install_dir(cfg)?;
+    let dest = dest_dir.join(skill);
+
+    match (cur_method, new_method) {
+        (Method::Copy, Method::Symlink) => {
+            let src_dir =
+                resolve_source_dir(layout, &inst_source, &inst_source_path.to_string_lossy())?;
+            // 归属与修改保护
+            let meta = match std::fs::symlink_metadata(&dest) {
+                Ok(meta) => Some(meta),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if let Some(meta) = meta {
+                let rec = reg.find(skill, target).unwrap();
+                super::remove::validate_record(rec)?;
+                super::remove::verify_copy_ownership(&dest, &meta, rec)?;
+                if !force {
+                    check_copy_unmodified(&dest)?;
+                }
+                remove_install_path(&dest)?;
+            }
+            std::fs::create_dir_all(&dest_dir)?;
+            make_symlink(&src_dir, &dest)?;
+        }
+        (Method::Symlink, Method::Copy) => {
+            // 归属核验：如果目标存在，必须是链接，防止误删用户目录
+            let meta = match std::fs::symlink_metadata(&dest) {
+                Ok(meta) => Some(meta),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if let Some(meta) = meta {
+                if !meta.file_type().is_symlink() && !super::remove::is_junction(&dest) {
+                    return Err(Error::Mismatch(format!(
+                        "{dest:?} 不是链接，与安装方式 {:?} 不符，已保留",
+                        cur_method
+                    )));
+                }
+                remove_install_path(&dest)?;
+            }
+            let src_dir =
+                resolve_source_dir(layout, &inst_source, &inst_source_path.to_string_lossy())?;
+            std::fs::create_dir_all(&dest_dir)?;
+            copy_install(&src_dir, &dest_dir, &dest)?;
+        }
+        _ => unreachable!(),
+    }
+
+    // 更新 registry
+    if let Some(inst) = reg.find_mut(skill, target) {
+        inst.method = new_method;
+        if new_method == Method::Symlink {
+            inst.auto_update = None; // 软连接始终跟随包级
+        }
+    }
+    reg.save(layout)?;
+    Ok(())
+}
+
+fn check_copy_unmodified(dest: &Path) -> Result<()> {
+    let lines = super::manifest::detect_local_modifications(dest)?;
+    if !lines.is_empty() {
+        return Err(Error::Mismatch(format!(
+            "copy 副本存在本地修改，切换将覆盖并丢失这些改动：\n{}\n确认覆盖请强制重试（--force）",
+            lines.join("\n")
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_skill_name(skill: &str) -> Result<()> {
     let path = Path::new(skill);
     let mut components = path.components();
@@ -967,5 +1062,195 @@ mod tests {
         assert!(reg.installs.is_empty());
         assert!(!dest_root.join("alpha").exists());
         assert_eq!(std::fs::read_dir(dest_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn switch_install_method_symlink_to_copy() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let project_root = tmp.path().join("project");
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Project(project_root.clone()),
+        };
+        // 先装 symlink
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Symlink,
+            "c1",
+        )
+        .unwrap();
+        let trec = to_rec(&target);
+        assert_eq!(reg.find("alpha", &trec).unwrap().method, Method::Symlink);
+
+        // 切换到 Copy
+        switch_install_method(&layout, &cfg, &mut reg, "alpha", &trec, Method::Copy, false)
+            .unwrap();
+        let inst = reg.find("alpha", &trec).unwrap();
+        assert_eq!(inst.method, Method::Copy);
+        let dest = project_root.join(".agents/skills/alpha");
+        assert!(dest.join(COPY_MANIFEST).is_file());
+        assert!(!dest.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn switch_install_method_copy_to_symlink_checks_mismatch() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let project_root = tmp.path().join("project");
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Project(project_root.clone()),
+        };
+        // 先装 Copy
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Copy,
+            "c1",
+        )
+        .unwrap();
+        let trec = to_rec(&target);
+        let dest = project_root.join(".agents/skills/alpha");
+        // 改动文件
+        std::fs::write(dest.join("SKILL.md"), "modified").unwrap();
+
+        // 未 force 切换拒绝
+        let err = switch_install_method(
+            &layout,
+            &cfg,
+            &mut reg,
+            "alpha",
+            &trec,
+            Method::Symlink,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Mismatch(_)));
+
+        // force 切换成功
+        switch_install_method(
+            &layout,
+            &cfg,
+            &mut reg,
+            "alpha",
+            &trec,
+            Method::Symlink,
+            true,
+        )
+        .unwrap();
+        let inst = reg.find("alpha", &trec).unwrap();
+        assert_eq!(inst.method, Method::Symlink);
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn switch_install_method_copy_to_symlink_clean_succeeds() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let project_root = tmp.path().join("project");
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Project(project_root.clone()),
+        };
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Copy,
+            "c1",
+        )
+        .unwrap();
+        let trec = to_rec(&target);
+        let dest = project_root.join(".agents/skills/alpha");
+        assert!(dest.join(COPY_MANIFEST).is_file());
+
+        // 未修改状态下无需 force 即可成功切换为 Symlink
+        switch_install_method(
+            &layout,
+            &cfg,
+            &mut reg,
+            "alpha",
+            &trec,
+            Method::Symlink,
+            false,
+        )
+        .unwrap();
+        let inst = reg.find("alpha", &trec).unwrap();
+        assert_eq!(inst.method, Method::Symlink);
+        assert_eq!(inst.auto_update, None);
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!dest.join(COPY_MANIFEST).exists());
+    }
+
+    #[test]
+    fn switch_install_method_idempotent() {
+        let (tmp, layout, cfg, mut reg) = setup();
+        let project_root = tmp.path().join("project");
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Project(project_root.clone()),
+        };
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Symlink,
+            "c1",
+        )
+        .unwrap();
+        let trec = to_rec(&target);
+
+        // 重复切换到同一种方式直接返回 Ok(())
+        switch_install_method(
+            &layout,
+            &cfg,
+            &mut reg,
+            "alpha",
+            &trec,
+            Method::Symlink,
+            false,
+        )
+        .unwrap();
+        let inst = reg.find("alpha", &trec).unwrap();
+        assert_eq!(inst.method, Method::Symlink);
+    }
+
+    #[test]
+    fn switch_install_method_not_installed_returns_error() {
+        let (_tmp, layout, cfg, mut reg) = setup();
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
+        };
+        let trec = to_rec(&target);
+
+        let err = switch_install_method(
+            &layout,
+            &cfg,
+            &mut reg,
+            "nonexistent",
+            &trec,
+            Method::Copy,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::NotInstalled(_)));
     }
 }

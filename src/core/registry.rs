@@ -166,6 +166,13 @@ impl Registry {
             .find(|i| i.skill == skill && &i.target == target)
     }
 
+    #[allow(dead_code)]
+    pub fn find_mut(&mut self, skill: &str, target: &TargetRec) -> Option<&mut Install> {
+        self.installs
+            .iter_mut()
+            .find(|i| i.skill == skill && &i.target == target)
+    }
+
     pub fn remove(&mut self, skill: &str, target: &TargetRec) -> Option<Install> {
         let pos = self
             .installs

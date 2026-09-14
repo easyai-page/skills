@@ -150,12 +150,12 @@ pub(crate) fn verify_copy_ownership(
 
 /// Windows junction 是挂载点型 reparse point，按链接语义识别。
 #[cfg(windows)]
-fn is_junction(dest: &Path) -> bool {
+pub(crate) fn is_junction(dest: &Path) -> bool {
     junction::exists(dest).unwrap_or(false)
 }
 
 #[cfg(not(windows))]
-fn is_junction(_dest: &Path) -> bool {
+pub(crate) fn is_junction(_dest: &Path) -> bool {
     false
 }
 
