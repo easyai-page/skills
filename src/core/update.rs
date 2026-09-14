@@ -2,6 +2,7 @@
 //! symlink 跟随仓库级策略；显式 update <skill> --target 无视配置强制更新。
 
 use super::error::{Error, Result};
+use super::paths::Layout;
 use super::registry::{Install, Method, Registry, SourceRecord, TargetRec};
 
 pub fn repo_should_update(src: &SourceRecord) -> bool {
@@ -228,6 +229,31 @@ fn pre_scan_local_modifications(
          确认覆盖请强制重试（CLI 加 --force，Web 端在确认框同意后自动重试）",
         report.join("\n")
     )))
+}
+
+/// 对指定已安装项执行单项手动更新（无视自动更新开关强制更新）。
+/// force=false 时若本地副本有修改返回 Error::Mismatch；force=true 则覆盖更新。
+/// 成功后原子落盘保存 registry，返回更新摘要行。
+#[allow(dead_code)]
+pub fn update_single(
+    layout: &Layout,
+    cfg: &crate::core::config::Config,
+    reg: &mut Registry,
+    skill: &str,
+    target: &TargetRec,
+    force: bool,
+) -> Result<Vec<String>> {
+    let sel = Selection {
+        skill: skill.to_string(),
+        target: target.clone(),
+    };
+    let plan = build_plan(reg, Some(&sel));
+    if let Some(missing) = plan.missing {
+        return Err(Error::NotInstalled(missing));
+    }
+    let done = execute_plan(layout, cfg, reg, &plan, force)?;
+    reg.save(layout)?;
+    Ok(done)
 }
 
 #[cfg(test)]
@@ -828,5 +854,103 @@ mod tests {
                 .contains("v2")
         );
         assert_eq!(reg.installs[0].commit, "c2");
+    }
+
+    #[test]
+    fn update_single_updates_specified_copy_and_saves() {
+        let (tmp, layout, cfg, mut reg, _c1) = setup_with_repo(Method::Copy);
+        let dest = cfg.targets["agents"].join("alpha");
+        let work = tmp.path().join("work");
+        let bare = tmp.path().join("bare.git");
+        std::fs::write(
+            work.join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: A\n---\nv2\n",
+        )
+        .unwrap();
+        git(&work, &["add", "-A"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "c2",
+            ],
+        );
+        git(&work, &["push", bare.to_str().unwrap(), "main"]);
+
+        let target = TargetRec::Global {
+            agent: "agents".into(),
+        };
+        let done = update_single(&layout, &cfg, &mut reg, "alpha", &target, false).unwrap();
+        assert!(done.iter().any(|l| l.contains("副本 alpha")));
+        assert!(
+            std::fs::read_to_string(dest.join("SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+        let new_commit = reg.sources["github/o/r"].commit.clone();
+        assert_eq!(reg.installs[0].commit, new_commit);
+
+        // 验证 registry 已原子落盘保存
+        let loaded = Registry::load(&layout).unwrap();
+        assert_eq!(loaded.installs[0].commit, new_commit);
+    }
+
+    #[test]
+    fn update_single_fails_on_local_modification_without_force() {
+        let (tmp, layout, cfg, mut reg, _c1) = setup_with_repo(Method::Copy);
+        let dest = cfg.targets["agents"].join("alpha");
+        let work = tmp.path().join("work");
+        let bare = tmp.path().join("bare.git");
+        std::fs::write(
+            work.join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: A\n---\nv2\n",
+        )
+        .unwrap();
+        git(&work, &["add", "-A"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "c2",
+            ],
+        );
+        git(&work, &["push", bare.to_str().unwrap(), "main"]);
+
+        // 本地修改文件
+        std::fs::write(dest.join("SKILL.md"), "tampered").unwrap();
+
+        let target = TargetRec::Global {
+            agent: "agents".into(),
+        };
+        let err = update_single(&layout, &cfg, &mut reg, "alpha", &target, false).unwrap_err();
+        match err {
+            Error::Mismatch(msg) => assert!(msg.contains("本地修改")),
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+
+        // force=true 时覆盖成功
+        let done = update_single(&layout, &cfg, &mut reg, "alpha", &target, true).unwrap();
+        assert!(done.iter().any(|l| l.contains("副本 alpha")));
+    }
+
+    #[test]
+    fn update_single_returns_not_installed_for_missing_skill() {
+        let (_t, layout, cfg, mut reg) = setup_installed(Method::Copy);
+        let target = TargetRec::Global {
+            agent: "agents".into(),
+        };
+        let err =
+            update_single(&layout, &cfg, &mut reg, "nonexistent", &target, false).unwrap_err();
+        assert!(matches!(err, Error::NotInstalled(_)));
     }
 }
