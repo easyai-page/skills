@@ -434,6 +434,7 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
         .map(|s| wizard::SkillChoice {
             name: s.name.clone(),
             description: s.description.clone(),
+            group: s.group.clone(),
         })
         .collect();
     let Some(picked) = wizard::pick_skills(&choices)? else {
@@ -615,6 +616,7 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
                     .map(|s| wizard::SkillChoice {
                         name: s.name.clone(),
                         description: s.description.clone(),
+                        group: None,
                     })
                     .collect();
                 let Some(p) = wizard::pick_skills(&choices)? else {

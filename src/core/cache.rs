@@ -14,6 +14,7 @@ pub struct SkillEntry {
     pub name: String,
     pub description: String, // 解析自 SKILL.md frontmatter；收藏快照与展示层消费
     pub rel_path: PathBuf,
+    pub group: Option<String>,
 }
 
 /// 确保 source 已缓存。git 源已缓存则复用（不重复下载，交给 update 刷新）；
@@ -137,7 +138,169 @@ pub fn scan_skills(root: &Path) -> Result<Vec<SkillEntry>> {
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.rel_path.cmp(&b.rel_path)));
+
+    let (plugin_map, has_manifest) = load_plugin_groupings(root);
+    if has_manifest {
+        for skill in &mut out {
+            if let Some(group) = plugin_map.get(&skill.rel_path) {
+                skill.group = Some(group.clone());
+            } else {
+                skill.group = Some("Other".to_string());
+            }
+        }
+    } else {
+        let categories: std::collections::HashSet<_> = out
+            .iter()
+            .filter_map(|s| {
+                let comps: Vec<_> = s
+                    .rel_path
+                    .iter()
+                    .map(|c| c.to_string_lossy().to_string())
+                    .collect();
+                if comps.len() >= 2 && comps[0] != "skills" {
+                    Some(comps[0].clone())
+                } else if comps.len() >= 3 && comps[0] == "skills" {
+                    Some(comps[1].clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if categories.len() >= 2 {
+            for skill in &mut out {
+                let comps: Vec<_> = skill
+                    .rel_path
+                    .iter()
+                    .map(|c| c.to_string_lossy().to_string())
+                    .collect();
+                let cat = if comps.len() >= 2 && comps[0] != "skills" {
+                    Some(kebab_to_title(&comps[0]))
+                } else if comps.len() >= 3 && comps[0] == "skills" {
+                    Some(kebab_to_title(&comps[1]))
+                } else {
+                    Some("Other".to_string())
+                };
+                skill.group = cat;
+            }
+        }
+    }
+
     Ok(out)
+}
+
+#[derive(serde::Deserialize, Default)]
+struct MarketplaceManifest {
+    #[serde(default)]
+    metadata: Option<MarketplaceMetadata>,
+    #[serde(default)]
+    plugins: Vec<MarketplacePluginEntry>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct MarketplaceMetadata {
+    #[serde(default)]
+    plugin_root: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct MarketplacePluginEntry {
+    name: Option<String>,
+    source: Option<serde_json::Value>,
+    #[serde(default)]
+    skills: Vec<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct SinglePluginManifest {
+    name: Option<String>,
+    #[serde(default)]
+    skills: Vec<String>,
+}
+
+pub(crate) fn kebab_to_title(s: &str) -> String {
+    s.split('-')
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_rel_path(p: &str) -> PathBuf {
+    let trimmed = p.trim().trim_start_matches("./").trim_start_matches(".\\");
+    let replaced = trimmed.replace('\\', "/");
+    let clean = replaced.trim_matches('/');
+    PathBuf::from(clean)
+}
+
+fn load_plugin_groupings(root: &Path) -> (std::collections::HashMap<PathBuf, String>, bool) {
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    let mut has_manifest = false;
+
+    let marketplace_path = root.join(".claude-plugin").join("marketplace.json");
+    if marketplace_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&marketplace_path)
+        && let Ok(manifest) = serde_json::from_str::<MarketplaceManifest>(&content)
+    {
+        has_manifest = true;
+        let plugin_root = manifest
+            .metadata
+            .and_then(|m| m.plugin_root)
+            .unwrap_or_default();
+        let plugin_root_buf = normalize_rel_path(&plugin_root);
+
+        for plugin in manifest.plugins {
+            let name = match plugin.name {
+                Some(n) if !n.trim().is_empty() => kebab_to_title(n.trim()),
+                _ => continue,
+            };
+            let source_str = match plugin.source {
+                Some(serde_json::Value::String(s)) => s,
+                _ => String::new(),
+            };
+            let source_buf = normalize_rel_path(&source_str);
+            let base = if plugin_root_buf.as_os_str().is_empty() {
+                source_buf
+            } else if source_buf.as_os_str().is_empty() {
+                plugin_root_buf.clone()
+            } else {
+                plugin_root_buf.join(source_buf)
+            };
+
+            for skill_path in plugin.skills {
+                let skill_buf = normalize_rel_path(&skill_path);
+                let full_rel = if base.as_os_str().is_empty() {
+                    skill_buf
+                } else {
+                    base.join(skill_buf)
+                };
+                map.insert(full_rel, name.clone());
+            }
+        }
+    }
+
+    let single_plugin_path = root.join(".claude-plugin").join("plugin.json");
+    if single_plugin_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&single_plugin_path)
+        && let Ok(manifest) = serde_json::from_str::<SinglePluginManifest>(&content)
+    {
+        has_manifest = true;
+        let name = manifest
+            .name
+            .map(|n| kebab_to_title(n.trim()))
+            .unwrap_or_else(|| "Core Skills".to_string());
+        for skill_path in manifest.skills {
+            let full_rel = normalize_rel_path(&skill_path);
+            map.entry(full_rel).or_insert_with(|| name.clone());
+        }
+    }
+
+    (map, has_manifest)
 }
 
 fn relative_path(root: &Path, path: &Path) -> PathBuf {
@@ -176,6 +339,7 @@ fn read_entry(dir: &Path, rel_path: PathBuf) -> Result<Option<SkillEntry>> {
             name,
             description,
             rel_path,
+            group: None,
         })),
         _ => {
             eprintln!(
@@ -476,5 +640,61 @@ mod tests {
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "real");
+    }
+
+    #[test]
+    fn scan_groups_skills_via_marketplace_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        // 创建 .claude-plugin/marketplace.json
+        std::fs::create_dir_all(root.path().join(".claude-plugin")).unwrap();
+        std::fs::write(
+            root.path().join(".claude-plugin/marketplace.json"),
+            r#"{
+                "name": "hyperframes",
+                "plugins": [
+                    {
+                        "name": "core-skills",
+                        "source": "./",
+                        "skills": [
+                            "./skills/hyperframes",
+                            "./skills/hyperframes-animation"
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        for s in [
+            "skills/hyperframes",
+            "skills/hyperframes-animation",
+            "skills/slideshow",
+        ] {
+            let p = root.path().join(s);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(
+                p.join("SKILL.md"),
+                format!(
+                    "---\nname: {}\ndescription: desc\n---\n",
+                    p.file_name().unwrap().to_str().unwrap()
+                ),
+            )
+            .unwrap();
+        }
+
+        let skills = scan_skills(root.path()).unwrap();
+        assert_eq!(skills.len(), 3);
+
+        let core1 = skills.iter().find(|s| s.name == "hyperframes").unwrap();
+        assert_eq!(core1.group.as_deref(), Some("Core Skills"));
+
+        let core2 = skills
+            .iter()
+            .find(|s| s.name == "hyperframes-animation")
+            .unwrap();
+        assert_eq!(core2.group.as_deref(), Some("Core Skills"));
+
+        let other = skills.iter().find(|s| s.name == "slideshow").unwrap();
+        assert_eq!(other.group.as_deref(), Some("Other"));
     }
 }

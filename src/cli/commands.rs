@@ -141,6 +141,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     .map(|e| wizard::SkillChoice {
                         name: e.name.clone(),
                         description: e.description.clone(),
+                        group: e.group.clone(),
                     })
                     .collect();
                 match wizard::pick_skills(&choices)? {
@@ -453,6 +454,7 @@ pub fn run(cli: Cli) -> Result<()> {
                             .map(|s| wizard::SkillChoice {
                                 name: s.name.clone(),
                                 description: s.description.clone(),
+                                group: None,
                             })
                             .collect();
                         match wizard::pick_skills(&choices)? {

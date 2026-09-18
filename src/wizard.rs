@@ -7,16 +7,23 @@ use crate::core::config::Config;
 use crate::core::error::{Error, Result};
 use crate::core::paths::{Scope, Target};
 use crate::core::registry::Method;
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute, terminal,
+};
 use inquire::error::InquireError;
+use std::io::{IsTerminal, Write as IoWrite, stdout};
 // 仅测试用到（生产代码经 Scope::Project 携带 PathBuf，不直接引用）
 #[cfg(test)]
 use std::path::PathBuf;
 
-/// 技能选项：多选行显示 "name — description"。
-#[derive(Clone)]
+/// 技能选项：多选行显示 "name — description"，支持插件/目录分组。
+#[derive(Clone, Debug)]
 pub struct SkillChoice {
     pub name: String,
     pub description: String,
+    pub group: Option<String>,
 }
 
 impl std::fmt::Display for SkillChoice {
@@ -68,37 +75,553 @@ pub(crate) fn cancel_to_none<T>(r: std::result::Result<T, InquireError>) -> Resu
     }
 }
 
-/// 技能多选：打字过滤、→ 全选、← 全清；单技能直接返回它，不弹窗。
+#[derive(Clone, Debug)]
+pub struct TreeItem {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub group: Option<String>,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct TreeGroup {
+    pub name: String,
+    pub collapsed: bool,
+    pub item_indices: Vec<usize>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CheckState {
+    None,
+    Partial,
+    All,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VisibleRow {
+    SelectAll,
+    Group {
+        group_idx: usize,
+    },
+    Item {
+        item_idx: usize,
+        is_last_in_group: bool,
+    },
+}
+
+pub struct TreeSelectState {
+    pub items: Vec<TreeItem>,
+    pub groups: Vec<TreeGroup>,
+    pub cursor: usize,
+}
+
+impl TreeSelectState {
+    pub fn new(items: Vec<TreeItem>) -> Self {
+        let mut group_names = Vec::new();
+        for it in &items {
+            if let Some(g) = &it.group
+                && !group_names.contains(g)
+            {
+                group_names.push(g.clone());
+            }
+        }
+        if let Some(pos) = group_names
+            .iter()
+            .position(|g| g == "Other" || g == "其它内置 Agent")
+        {
+            let o = group_names.remove(pos);
+            group_names.push(o);
+        }
+
+        let mut groups = Vec::new();
+        for g_name in group_names {
+            let item_indices: Vec<usize> = items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| it.group.as_deref() == Some(&g_name))
+                .map(|(idx, _)| idx)
+                .collect();
+            groups.push(TreeGroup {
+                name: g_name,
+                collapsed: false,
+                item_indices,
+            });
+        }
+
+        Self {
+            items,
+            groups,
+            cursor: 0,
+        }
+    }
+
+    pub fn has_groups(&self) -> bool {
+        !self.groups.is_empty()
+    }
+
+    pub fn select_all_state(&self) -> CheckState {
+        let total = self.items.len();
+        if total == 0 {
+            return CheckState::None;
+        }
+        let sel = self.items.iter().filter(|i| i.selected).count();
+        if sel == 0 {
+            CheckState::None
+        } else if sel == total {
+            CheckState::All
+        } else {
+            CheckState::Partial
+        }
+    }
+
+    pub fn group_state(&self, group_idx: usize) -> CheckState {
+        let group = &self.groups[group_idx];
+        if group.item_indices.is_empty() {
+            return CheckState::None;
+        }
+        let sel = group
+            .item_indices
+            .iter()
+            .filter(|&&idx| self.items[idx].selected)
+            .count();
+        if sel == 0 {
+            CheckState::None
+        } else if sel == group.item_indices.len() {
+            CheckState::All
+        } else {
+            CheckState::Partial
+        }
+    }
+
+    pub fn visible_rows(&self) -> Vec<VisibleRow> {
+        let mut rows = vec![VisibleRow::SelectAll];
+        if self.has_groups() {
+            for (g_idx, group) in self.groups.iter().enumerate() {
+                rows.push(VisibleRow::Group { group_idx: g_idx });
+                if !group.collapsed {
+                    let total_in_grp = group.item_indices.len();
+                    for (i, &item_idx) in group.item_indices.iter().enumerate() {
+                        rows.push(VisibleRow::Item {
+                            item_idx,
+                            is_last_in_group: i + 1 == total_in_grp,
+                        });
+                    }
+                }
+            }
+        } else {
+            let total = self.items.len();
+            for i in 0..total {
+                rows.push(VisibleRow::Item {
+                    item_idx: i,
+                    is_last_in_group: i + 1 == total,
+                });
+            }
+        }
+        rows
+    }
+
+    pub fn move_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn move_down(&mut self) {
+        let max_idx = self.visible_rows().len().saturating_sub(1);
+        if self.cursor < max_idx {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn collapse(&mut self) {
+        let rows = self.visible_rows();
+        if self.cursor >= rows.len() {
+            return;
+        }
+        match rows[self.cursor] {
+            VisibleRow::Group { group_idx } => {
+                self.groups[group_idx].collapsed = true;
+            }
+            VisibleRow::Item { item_idx, .. } => {
+                if let Some(ref grp_name) = self.items[item_idx].group
+                    && let Some(g_idx) = self.groups.iter().position(|g| &g.name == grp_name)
+                {
+                    self.groups[g_idx].collapsed = true;
+                    let new_rows = self.visible_rows();
+                    if let Some(pos) = new_rows.iter().position(
+                        |r| matches!(r, VisibleRow::Group { group_idx: idx } if *idx == g_idx),
+                    ) {
+                        self.cursor = pos;
+                    }
+                }
+            }
+            VisibleRow::SelectAll => {}
+        }
+    }
+
+    pub fn expand(&mut self) {
+        let rows = self.visible_rows();
+        if self.cursor >= rows.len() {
+            return;
+        }
+        if let VisibleRow::Group { group_idx } = rows[self.cursor] {
+            self.groups[group_idx].collapsed = false;
+        }
+    }
+
+    pub fn toggle_current(&mut self) {
+        let rows = self.visible_rows();
+        if self.cursor >= rows.len() {
+            return;
+        }
+        match rows[self.cursor] {
+            VisibleRow::SelectAll => {
+                let should_clear = self.select_all_state() == CheckState::All;
+                for item in &mut self.items {
+                    item.selected = !should_clear;
+                }
+            }
+            VisibleRow::Group { group_idx } => {
+                let should_clear = self.group_state(group_idx) == CheckState::All;
+                for &idx in &self.groups[group_idx].item_indices {
+                    self.items[idx].selected = !should_clear;
+                }
+            }
+            VisibleRow::Item { item_idx, .. } => {
+                self.items[item_idx].selected = !self.items[item_idx].selected;
+            }
+        }
+    }
+
+    pub fn current_description(&self) -> String {
+        let rows = self.visible_rows();
+        if self.cursor >= rows.len() {
+            return String::new();
+        }
+        match rows[self.cursor] {
+            VisibleRow::SelectAll => {
+                format!("选择或清空全部 {} 个选项。", self.items.len())
+            }
+            VisibleRow::Group { group_idx } => {
+                let g = &self.groups[group_idx];
+                format!(
+                    "选择或清空「{}」分类下的全部 {} 个条目。",
+                    g.name,
+                    g.item_indices.len()
+                )
+            }
+            VisibleRow::Item { item_idx, .. } => {
+                let it = &self.items[item_idx];
+                if it.description.is_empty() {
+                    it.label.clone()
+                } else {
+                    it.description.clone()
+                }
+            }
+        }
+    }
+
+    pub fn selected_ids(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .filter(|i| i.selected)
+            .map(|i| i.id.clone())
+            .collect()
+    }
+}
+
+struct RawModeGuard {
+    active: bool,
+}
+
+impl RawModeGuard {
+    fn new() -> Result<Self> {
+        terminal::enable_raw_mode()
+            .map_err(|e| Error::Msg(format!("无法启用终端 raw 模式: {e}")))?;
+        let mut out = stdout();
+        let _ = execute!(out, cursor::Hide);
+        Ok(Self { active: true })
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut out = stdout();
+            let _ = execute!(out, cursor::Show);
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+}
+
+fn render_tree_prompt(
+    title: &str,
+    state: &TreeSelectState,
+    max_visible: usize,
+    warning: Option<&str>,
+    term_width: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    lines.push(format!(
+        "{}  {}",
+        console::style("◆").green(),
+        console::style(title).bold()
+    ));
+
+    let rail = console::style("│").dim();
+    lines.push(format!("{rail}"));
+
+    let rows = state.visible_rows();
+    let is_cur_sel_all = state.cursor == 0;
+    let prefix = if is_cur_sel_all {
+        console::style("❯").cyan().to_string()
+    } else {
+        " ".to_string()
+    };
+    let all_icon = match state.select_all_state() {
+        CheckState::All => console::style("●").green().to_string(),
+        CheckState::Partial => console::style("◐").yellow().to_string(),
+        CheckState::None => console::style("○").dim().to_string(),
+    };
+    let sel_count = state.items.iter().filter(|i| i.selected).count();
+    let sel_all_label = if is_cur_sel_all {
+        console::style("全选 (Select All)")
+            .underlined()
+            .bold()
+            .to_string()
+    } else {
+        console::style("全选 (Select All)").bold().to_string()
+    };
+    lines.push(format!(
+        "{rail} {prefix} {all_icon} {sel_all_label} {}",
+        console::style(format!("({}/{})", sel_count, state.items.len())).dim()
+    ));
+    lines.push(format!("{rail}   {}", console::style("─".repeat(36)).dim()));
+
+    let content_len = rows.len().saturating_sub(1);
+    if content_len > 0 {
+        let (window_start, window_end) = if content_len <= max_visible {
+            (0, content_len)
+        } else {
+            let cur_item = state.cursor.saturating_sub(1);
+            let half = max_visible / 2;
+            let start = if cur_item > half {
+                (cur_item - half).min(content_len.saturating_sub(max_visible))
+            } else {
+                0
+            };
+            let end = (start + max_visible).min(content_len);
+            (start, end)
+        };
+
+        if window_start > 0 {
+            lines.push(format!(
+                "{rail}  {}",
+                console::style(format!("↑ 还有 {} 项", window_start)).dim()
+            ));
+        }
+
+        for idx in window_start..window_end {
+            let row_idx = idx + 1;
+            let is_cur = state.cursor == row_idx;
+            let pfx = if is_cur {
+                console::style("❯").cyan().to_string()
+            } else {
+                " ".to_string()
+            };
+
+            match rows[row_idx] {
+                VisibleRow::SelectAll => unreachable!(),
+                VisibleRow::Group { group_idx } => {
+                    let grp = &state.groups[group_idx];
+                    let arrow = if grp.collapsed {
+                        console::style("▸").dim().to_string()
+                    } else {
+                        console::style("▾").dim().to_string()
+                    };
+                    let grp_icon = match state.group_state(group_idx) {
+                        CheckState::All => console::style("●").green().to_string(),
+                        CheckState::Partial => console::style("◐").yellow().to_string(),
+                        CheckState::None => console::style("○").dim().to_string(),
+                    };
+                    let grp_sel = grp
+                        .item_indices
+                        .iter()
+                        .filter(|&&i| state.items[i].selected)
+                        .count();
+                    let name_styled = if is_cur {
+                        console::style(&grp.name).underlined().bold().to_string()
+                    } else {
+                        console::style(&grp.name).bold().to_string()
+                    };
+                    lines.push(format!(
+                        "{rail} {pfx} {arrow} {grp_icon} {name_styled} {}",
+                        console::style(format!("({}/{})", grp_sel, grp.item_indices.len())).dim()
+                    ));
+                }
+                VisibleRow::Item {
+                    item_idx,
+                    is_last_in_group,
+                } => {
+                    let it = &state.items[item_idx];
+                    let tree = if state.has_groups() {
+                        if is_last_in_group {
+                            console::style("└─ ").dim().to_string()
+                        } else {
+                            console::style("├─ ").dim().to_string()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let it_icon = if it.selected {
+                        console::style("●").green().to_string()
+                    } else {
+                        console::style("○").dim().to_string()
+                    };
+                    let label_styled = if is_cur {
+                        console::style(&it.label).underlined().to_string()
+                    } else {
+                        it.label.clone()
+                    };
+                    lines.push(format!("{rail} {pfx} {tree}{it_icon} {label_styled}"));
+                }
+            }
+        }
+
+        if window_end < content_len {
+            lines.push(format!(
+                "{rail}  {}",
+                console::style(format!("↓ 还有 {} 项", content_len - window_end)).dim()
+            ));
+        }
+    }
+
+    lines.push(format!("{rail}"));
+    lines.push(format!("{rail}  {}", console::style("说明").dim()));
+    let desc = state.current_description();
+    let max_desc_width = term_width.saturating_sub(6).max(20);
+    let truncated_desc = console::truncate_str(&desc, max_desc_width, "…");
+    lines.push(format!("{rail}  {}", console::style(truncated_desc).dim()));
+
+    lines.push(format!("{rail}"));
+    if let Some(w) = warning {
+        lines.push(format!(
+            "{rail}  {}",
+            console::style(format!("⚠️ {w}")).yellow().bold()
+        ));
+    }
+    let help = if state.has_groups() {
+        "↑↓ 移动，←→ 折叠/展开，空格 勾选，回车 确认，ESC 取消"
+    } else {
+        "↑↓ 移动，空格 勾选，回车 确认，ESC 取消"
+    };
+    lines.push(format!("{rail}  {}", console::style(help).dim()));
+    lines.push(format!("{}", console::style("└").dim()));
+
+    lines
+}
+
+fn run_tree_select(title: &str, mut state: TreeSelectState) -> Result<Option<Vec<String>>> {
+    let _guard = RawModeGuard::new()?;
+    let mut last_render_height = 0;
+    let mut warning = None;
+    let mut stdout = stdout();
+
+    loop {
+        let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
+        let max_visible = (term_rows as usize).saturating_sub(12).clamp(5, 18);
+
+        let lines = render_tree_prompt(title, &state, max_visible, warning, term_cols as usize);
+        let height = lines.len();
+
+        let mut buffer = String::new();
+        if last_render_height > 0 {
+            buffer.push_str(&format!("\x1b[{}A\x1b[J", last_render_height));
+        }
+        for line in &lines {
+            buffer.push_str(line);
+            buffer.push('\r');
+            buffer.push('\n');
+        }
+        stdout
+            .write_all(buffer.as_bytes())
+            .map_err(|e| Error::Msg(e.to_string()))?;
+        stdout.flush().map_err(|e| Error::Msg(e.to_string()))?;
+        last_render_height = height;
+
+        if let Event::Key(key) = event::read().map_err(|e| Error::Msg(e.to_string()))? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            warning = None;
+
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+                    if last_render_height > 0 {
+                        let clear = format!("\x1b[{}A\x1b[J", last_render_height);
+                        let _ = stdout.write_all(clear.as_bytes());
+                        let _ = stdout.flush();
+                    }
+                    return Ok(None);
+                }
+                (KeyCode::Up, _) => {
+                    state.move_up();
+                }
+                (KeyCode::Down, _) => {
+                    state.move_down();
+                }
+                (KeyCode::Left, _) => {
+                    state.collapse();
+                }
+                (KeyCode::Right, _) => {
+                    state.expand();
+                }
+                (KeyCode::Char(' '), _) => {
+                    state.toggle_current();
+                }
+                (KeyCode::Enter, _) => {
+                    let selected = state.selected_ids();
+                    if selected.is_empty() {
+                        warning = Some("至少选择一项");
+                    } else {
+                        if last_render_height > 0 {
+                            let clear = format!("\x1b[{}A\x1b[J", last_render_height);
+                            let _ = stdout.write_all(clear.as_bytes());
+                            let _ = stdout.flush();
+                        }
+                        return Ok(Some(selected));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// 技能多选：树状层级、折叠展开、Select All、组全选；单技能直接返回它，不弹窗。
 /// 返回 None = 用户 ESC/Ctrl+C 取消。
 pub fn pick_skills(skills: &[SkillChoice]) -> Result<Option<Vec<String>>> {
+    if skills.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
     if skills.len() == 1 {
         return Ok(Some(vec![skills[0].name.clone()]));
     }
-    let r = inquire::MultiSelect::new("选择要安装的技能", skills.to_vec())
-        .with_help_message("输入过滤，空格勾选，→ 全选，← 全清，回车确认，ESC 取消")
-        .with_page_size(20)
-        .with_validator(inquire::min_length!(1, "至少选择一个技能"))
-        .prompt();
-    cancel_to_none(r).map(|o| o.map(|picked| picked.into_iter().map(|c| c.name).collect()))
-}
-
-/// agent 选项：行内显示 id（名称）→ 项目目录，检测到的带标记。
-pub struct AgentChoice {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub project_dir: &'static str,
-    pub detected: bool,
-}
-
-impl std::fmt::Display for AgentChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mark = if self.detected { "  ✓已检测" } else { "" };
-        write!(
-            f,
-            "{}（{}）→ {}{}",
-            self.id, self.name, self.project_dir, mark
-        )
+    if !std::io::stdin().is_terminal() {
+        return Ok(Some(skills.iter().map(|s| s.name.clone()).collect()));
     }
+    let items = skills
+        .iter()
+        .map(|s| TreeItem {
+            id: s.name.clone(),
+            label: s.name.clone(),
+            description: s.description.clone(),
+            group: s.group.clone(),
+            selected: false,
+        })
+        .collect();
+    let state = TreeSelectState::new(items);
+    run_tree_select("选择要安装的技能", state)
 }
 
 /// 预选决策：上次选择的记忆（过滤已失效 id）> 检测到的 > ["agents"]。
@@ -127,7 +650,7 @@ pub fn detected_first(detected: &[&str]) -> Vec<&'static agents::AgentSpec> {
     out
 }
 
-/// agent 多选：恰好检测到 1 个时不弹窗直接用；否则搜索式多选，
+/// agent 多选：恰好检测到 1 个时不弹窗直接用；否则树状分组多选（已检测展开，其他折叠），
 /// 预选 = agent_defaults（记忆 > 检测 > agents）。返回 None = 取消。
 /// 只列内置 agent（config 自定义 target 无法检测本机安装，走 -a 参数指定）。
 pub fn pick_agents(
@@ -145,28 +668,43 @@ pub fn pick_agents(
     }
     let specs = detected_first(detected);
     let want = agent_defaults(detected, last_selected);
-    let default_idx: Vec<usize> = specs
+
+    if !std::io::stdin().is_terminal() {
+        return Ok(Some(want));
+    }
+
+    let items = specs
         .iter()
-        .enumerate()
-        .filter(|(_, a)| want.iter().any(|w| w == a.id))
-        .map(|(i, _)| i)
-        .collect();
-    let options: Vec<AgentChoice> = specs
-        .iter()
-        .map(|a| AgentChoice {
-            id: a.id,
-            name: a.name,
-            project_dir: a.project_dir,
-            detected: detected.contains(&a.id),
+        .map(|a| {
+            let is_detected = detected.contains(&a.id);
+            let mark = if is_detected { "  ✓已检测" } else { "" };
+            let group_name = if is_detected {
+                "已检测到的 Agent".to_string()
+            } else {
+                "其它内置 Agent".to_string()
+            };
+            TreeItem {
+                id: a.id.to_string(),
+                label: format!("{}（{}）→ {}{}", a.id, a.name, a.project_dir, mark),
+                description: format!(
+                    "项目目录: {} | 默认全局: {}",
+                    a.project_dir,
+                    a.global_dir.unwrap_or("无全局目录")
+                ),
+                group: Some(group_name),
+                selected: want.iter().any(|w| w == a.id),
+            }
         })
         .collect();
-    let r = inquire::MultiSelect::new("安装到哪些 agent", options)
-        .with_default(&default_idx)
-        .with_help_message("输入过滤，空格勾选，→ 全选，← 全清，回车确认，ESC 取消")
-        .with_page_size(20)
-        .with_validator(inquire::min_length!(1, "至少选择一个 agent"))
-        .prompt();
-    cancel_to_none(r).map(|o| o.map(|cs| cs.into_iter().map(|c| c.id.to_string()).collect()))
+
+    let mut state = TreeSelectState::new(items);
+    // 将未检测到的 70+ 个 agent 默认折叠收起，避免刷屏；已检测到的置顶展开
+    for g in &mut state.groups {
+        if g.name == "其它内置 Agent" {
+            g.collapsed = true;
+        }
+    }
+    run_tree_select("安装到哪些 agent", state)
 }
 
 /// scope 单选：项目（默认）/ 全局。所有 agent 都不支持全局时直接返回项目，不弹窗。
@@ -250,11 +788,120 @@ mod tests {
         let skills = vec![SkillChoice {
             name: "alpha".to_string(),
             description: "A 技能".to_string(),
+            group: None,
         }];
         assert_eq!(
             pick_skills(&skills).unwrap(),
             Some(vec!["alpha".to_string()])
         );
+    }
+
+    #[test]
+    fn tree_select_all_toggle_and_group_cascade() {
+        let choices = [
+            SkillChoice {
+                name: "s1".into(),
+                description: "d1".into(),
+                group: Some("G1".into()),
+            },
+            SkillChoice {
+                name: "s2".into(),
+                description: "d2".into(),
+                group: Some("G1".into()),
+            },
+            SkillChoice {
+                name: "s3".into(),
+                description: "d3".into(),
+                group: Some("G2".into()),
+            },
+        ];
+        let items = choices
+            .iter()
+            .map(|c| TreeItem {
+                id: c.name.clone(),
+                label: c.name.clone(),
+                description: c.description.clone(),
+                group: c.group.clone(),
+                selected: false,
+            })
+            .collect();
+        let mut state = TreeSelectState::new(items);
+
+        assert_eq!(state.select_all_state(), CheckState::None);
+        assert_eq!(state.group_state(0), CheckState::None);
+        assert_eq!(state.group_state(1), CheckState::None);
+
+        // 光标在 Select All (0)，按空格全选
+        assert_eq!(state.cursor, 0);
+        state.toggle_current();
+        assert_eq!(state.select_all_state(), CheckState::All);
+        assert_eq!(state.group_state(0), CheckState::All);
+        assert_eq!(state.group_state(1), CheckState::All);
+        assert_eq!(state.selected_ids().len(), 3);
+
+        // 再次按空格，全部清空
+        state.toggle_current();
+        assert_eq!(state.select_all_state(), CheckState::None);
+        assert_eq!(state.selected_ids().len(), 0);
+
+        // 移到 G1 分组行 (索引 1)，按空格全选 G1
+        state.move_down();
+        assert_eq!(state.cursor, 1);
+        state.toggle_current();
+        assert_eq!(state.group_state(0), CheckState::All);
+        assert_eq!(state.group_state(1), CheckState::None);
+        assert_eq!(state.select_all_state(), CheckState::Partial);
+        assert_eq!(state.selected_ids(), vec!["s1", "s2"]);
+
+        // 移到 s1 (索引 2)，按空格取消勾选
+        state.move_down();
+        assert_eq!(state.cursor, 2);
+        state.toggle_current();
+        assert_eq!(state.group_state(0), CheckState::Partial);
+        assert_eq!(state.selected_ids(), vec!["s2"]);
+    }
+
+    #[test]
+    fn tree_collapse_and_expand_from_child() {
+        let choices = [
+            SkillChoice {
+                name: "s1".into(),
+                description: "d1".into(),
+                group: Some("G1".into()),
+            },
+            SkillChoice {
+                name: "s2".into(),
+                description: "d2".into(),
+                group: Some("G2".into()),
+            },
+        ];
+        let items = choices
+            .iter()
+            .map(|c| TreeItem {
+                id: c.name.clone(),
+                label: c.name.clone(),
+                description: c.description.clone(),
+                group: c.group.clone(),
+                selected: false,
+            })
+            .collect();
+        let mut state = TreeSelectState::new(items);
+
+        // 初始展开：SelectAll (0), G1 (1), s1 (2), G2 (3), s2 (4) -> 5 行
+        assert_eq!(state.visible_rows().len(), 5);
+
+        // 光标移动到 s1 (2)，按左键折叠其所属组 G1，光标应跳到 G1 (1)
+        state.cursor = 2;
+        state.collapse();
+        assert!(state.groups[0].collapsed);
+        assert_eq!(state.cursor, 1);
+        // 折叠后可见行：SelectAll (0), G1 (1), G2 (2), s2 (3) -> 4 行
+        assert_eq!(state.visible_rows().len(), 4);
+
+        // 在 G1 (1) 上按右键展开
+        state.expand();
+        assert!(!state.groups[0].collapsed);
+        assert_eq!(state.visible_rows().len(), 5);
     }
 
     #[test]
