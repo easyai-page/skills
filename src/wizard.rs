@@ -18,20 +18,22 @@ use std::io::{IsTerminal, Write as IoWrite, stdout};
 #[cfg(test)]
 use std::path::PathBuf;
 
-/// 技能选项：多选行显示 "name — description"，支持插件/目录分组。
+/// 技能选项：多选行显示 "name — description"，支持插件/目录分组与已安装标注。
 #[derive(Clone, Debug)]
 pub struct SkillChoice {
     pub name: String,
     pub description: String,
     pub group: Option<String>,
+    pub installed: bool,
 }
 
 impl std::fmt::Display for SkillChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tag = if self.installed { " (已安装)" } else { "" };
         if self.description.is_empty() {
-            write!(f, "{}", self.name)
+            write!(f, "{}{tag}", self.name)
         } else {
-            write!(f, "{} — {}", self.name, self.description)
+            write!(f, "{}{tag} — {}", self.name, self.description)
         }
     }
 }
@@ -598,6 +600,32 @@ fn run_tree_select(title: &str, mut state: TreeSelectState) -> Result<Option<Vec
     }
 }
 
+/// 将技能选项转换为树状多选条目，并应用智能预选规则：
+/// 1. 若存在未安装项：默认勾选所有未安装项，已安装项不勾选；
+/// 2. 若全部已安装（或全部未安装）：默认全选；
+/// 3. 已安装的项在 label 尾部标注 " (已安装)"。
+pub fn build_skill_tree_items(skills: &[SkillChoice]) -> Vec<TreeItem> {
+    let has_uninstalled = skills.iter().any(|s| !s.installed);
+    skills
+        .iter()
+        .map(|s| {
+            let selected = if has_uninstalled { !s.installed } else { true };
+            let label = if s.installed {
+                format!("{} (已安装)", s.name)
+            } else {
+                s.name.clone()
+            };
+            TreeItem {
+                id: s.name.clone(),
+                label,
+                description: s.description.clone(),
+                group: s.group.clone(),
+                selected,
+            }
+        })
+        .collect()
+}
+
 /// 技能多选：树状层级、折叠展开、Select All、组全选；单技能直接返回它，不弹窗。
 /// 返回 None = 用户 ESC/Ctrl+C 取消。
 pub fn pick_skills(skills: &[SkillChoice]) -> Result<Option<Vec<String>>> {
@@ -610,16 +638,7 @@ pub fn pick_skills(skills: &[SkillChoice]) -> Result<Option<Vec<String>>> {
     if !std::io::stdin().is_terminal() {
         return Ok(Some(skills.iter().map(|s| s.name.clone()).collect()));
     }
-    let items = skills
-        .iter()
-        .map(|s| TreeItem {
-            id: s.name.clone(),
-            label: s.name.clone(),
-            description: s.description.clone(),
-            group: s.group.clone(),
-            selected: false,
-        })
-        .collect();
+    let items = build_skill_tree_items(skills);
     let state = TreeSelectState::new(items);
     run_tree_select("选择要安装的技能", state)
 }
@@ -789,11 +808,75 @@ mod tests {
             name: "alpha".to_string(),
             description: "A 技能".to_string(),
             group: None,
+            installed: false,
         }];
         assert_eq!(
             pick_skills(&skills).unwrap(),
             Some(vec!["alpha".to_string()])
         );
+    }
+
+    #[test]
+    fn skill_tree_preselection_rules() {
+        // 场景 1：部分已安装，部分未安装 -> 预选所有未安装项，已安装项不预选
+        let choices = [
+            SkillChoice {
+                name: "s1".into(),
+                description: "d1".into(),
+                group: None,
+                installed: true,
+            },
+            SkillChoice {
+                name: "s2".into(),
+                description: "d2".into(),
+                group: None,
+                installed: false,
+            },
+        ];
+        let items = build_skill_tree_items(&choices);
+        assert_eq!(items.len(), 2);
+        assert!(!items[0].selected);
+        assert!(items[0].label.contains("(已安装)"));
+        assert!(items[1].selected);
+        assert!(!items[1].label.contains("(已安装)"));
+
+        // 场景 2：全部未安装 -> 默认全选
+        let all_uninstalled = [
+            SkillChoice {
+                name: "s1".into(),
+                description: "d1".into(),
+                group: None,
+                installed: false,
+            },
+            SkillChoice {
+                name: "s2".into(),
+                description: "d2".into(),
+                group: None,
+                installed: false,
+            },
+        ];
+        let items2 = build_skill_tree_items(&all_uninstalled);
+        assert!(items2.iter().all(|i| i.selected));
+        assert!(items2.iter().all(|i| !i.label.contains("(已安装)")));
+
+        // 场景 3：全部已安装 -> 默认全选（供用户整体覆盖更新）
+        let all_installed = [
+            SkillChoice {
+                name: "s1".into(),
+                description: "d1".into(),
+                group: None,
+                installed: true,
+            },
+            SkillChoice {
+                name: "s2".into(),
+                description: "d2".into(),
+                group: None,
+                installed: true,
+            },
+        ];
+        let items3 = build_skill_tree_items(&all_installed);
+        assert!(items3.iter().all(|i| i.selected));
+        assert!(items3.iter().all(|i| i.label.contains("(已安装)")));
     }
 
     #[test]
@@ -803,16 +886,19 @@ mod tests {
                 name: "s1".into(),
                 description: "d1".into(),
                 group: Some("G1".into()),
+                installed: false,
             },
             SkillChoice {
                 name: "s2".into(),
                 description: "d2".into(),
                 group: Some("G1".into()),
+                installed: false,
             },
             SkillChoice {
                 name: "s3".into(),
                 description: "d3".into(),
                 group: Some("G2".into()),
+                installed: false,
             },
         ];
         let items = choices
@@ -868,11 +954,13 @@ mod tests {
                 name: "s1".into(),
                 description: "d1".into(),
                 group: Some("G1".into()),
+                installed: false,
             },
             SkillChoice {
                 name: "s2".into(),
                 description: "d2".into(),
                 group: Some("G2".into()),
+                installed: false,
             },
         ];
         let items = choices

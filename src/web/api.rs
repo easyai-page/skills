@@ -249,9 +249,10 @@ async fn install_from_source(
                     if !overwrite {
                         return Err((StatusCode::CONFLICT, format!("{p:?} 已存在")));
                     }
-                    // 与 CLI 的覆盖路径一致：先按记录删（无记录则忽略），再重装
+                    // 与 CLI 的覆盖路径一致：先按记录删（无记录则忽略），再确保冲突路径清理后重装
                     let _ =
                         crate::core::remove::remove_install(&s.layout, &cfg, &mut reg, name, trec);
+                    let _ = crate::core::remove::force_clean_conflict_path(&p);
                     crate::core::install::install_skill(
                         &s.layout,
                         &cfg,

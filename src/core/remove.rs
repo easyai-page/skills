@@ -52,6 +52,23 @@ pub fn remove_install(
     Ok(RemoveOutcome::Removed)
 }
 
+/// 在用户明确同意覆盖的前提下，强制清理可能存在的冲突路径
+/// （兼容受管记录已清理但磁盘仍残留、或用户手动创建的非受管文件/软链接）
+pub fn force_clean_conflict_path(dest: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(meta) => {
+            if meta.is_dir() && !meta.file_type().is_symlink() && !is_junction(dest) {
+                std::fs::remove_dir_all(dest)?;
+            } else {
+                remove_link_itself(dest, &meta)?;
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(Error::Io(err)),
+    }
+}
+
 /// 技能的最后一个副本删除后清理其标签：标签只对已安装技能可见、可改
 /// （tag 命令要求已安装），留着就成无法管理的孤儿数据。
 fn prune_skill_tags(reg: &mut Registry, rec: &Install) {
@@ -523,6 +540,26 @@ mod tests {
             assert!(matches!(err, Error::Mismatch(_)));
             assert!(dest.exists());
             assert_eq!(reg.installs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn force_clean_conflict_path_handles_unmanaged_dir_and_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_target = tmp.path().join("dir");
+        std::fs::create_dir_all(dir_target.join("nested")).unwrap();
+        assert!(dir_target.exists());
+        force_clean_conflict_path(&dir_target).unwrap();
+        assert!(!dir_target.exists());
+
+        #[cfg(unix)]
+        {
+            let link_target = tmp.path().join("link");
+            let target_dest = tmp.path().join("nonexistent");
+            std::os::unix::fs::symlink(&target_dest, &link_target).unwrap();
+            assert!(link_target.symlink_metadata().is_ok());
+            force_clean_conflict_path(&link_target).unwrap();
+            assert!(link_target.symlink_metadata().is_err());
         }
     }
 }

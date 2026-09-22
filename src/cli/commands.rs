@@ -136,12 +136,22 @@ pub fn run(cli: Cli) -> Result<()> {
             } else if yes {
                 all_names.clone()
             } else if std::io::stdin().is_terminal() {
+                let cwd = std::env::current_dir().unwrap_or_default();
                 let choices: Vec<wizard::SkillChoice> = all_skills
                     .iter()
-                    .map(|e| wizard::SkillChoice {
-                        name: e.name.clone(),
-                        description: e.description.clone(),
-                        group: e.group.clone(),
+                    .map(|e| {
+                        let installed = reg
+                            .installs
+                            .iter()
+                            .any(|i| i.skill == e.name && i.is_visible_in_dir(&cwd))
+                            || cwd.join(".agents/skills").join(&e.name).exists()
+                            || cwd.join(".claude/skills").join(&e.name).exists();
+                        wizard::SkillChoice {
+                            name: e.name.clone(),
+                            description: e.description.clone(),
+                            group: e.group.clone(),
+                            installed,
+                        }
                     })
                     .collect();
                 match wizard::pick_skills(&choices)? {
@@ -448,13 +458,23 @@ pub fn run(cli: Cli) -> Result<()> {
                     } else if yes || !std::io::stdin().is_terminal() {
                         fav_names.clone()
                     } else {
+                        let cwd = std::env::current_dir().unwrap_or_default();
                         let choices: Vec<wizard::SkillChoice> = reg.favorites[&key]
                             .skills
                             .iter()
-                            .map(|s| wizard::SkillChoice {
-                                name: s.name.clone(),
-                                description: s.description.clone(),
-                                group: None,
+                            .map(|s| {
+                                let installed = reg
+                                    .installs
+                                    .iter()
+                                    .any(|i| i.skill == s.name && i.is_visible_in_dir(&cwd))
+                                    || cwd.join(".agents/skills").join(&s.name).exists()
+                                    || cwd.join(".claude/skills").join(&s.name).exists();
+                                wizard::SkillChoice {
+                                    name: s.name.clone(),
+                                    description: s.description.clone(),
+                                    group: None,
+                                    installed,
+                                }
                             })
                             .collect();
                         match wizard::pick_skills(&choices)? {
@@ -864,6 +884,7 @@ fn install_loop(
                         if overwrite {
                             let rec = install::to_rec(t);
                             let _ = remove::remove_install(layout, cfg, reg, s, &rec);
+                            let _ = remove::force_clean_conflict_path(&p);
                             if let Err(e) = install_fn(reg, s, t) {
                                 pb.finish_and_clear();
                                 return Err(e);

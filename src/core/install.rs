@@ -58,6 +58,9 @@ pub fn install_skill(
         auto_update: None,
         installed_at: chrono::Utc::now().to_rfc3339(),
     };
+    let trec = to_rec(target);
+    reg.installs
+        .retain(|i| !(i.skill == skill && i.target == trec));
     reg.installs.push(rec.clone());
     Ok(rec)
 }
@@ -1511,5 +1514,44 @@ mod tests {
                 .any(|name| name.contains("-update-backup-")),
             "回滚成功后不应有备份残留"
         );
+    }
+
+    #[test]
+    fn install_skill_is_idempotent_in_registry() {
+        let (_t, layout, cfg, mut reg) = setup();
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
+        };
+        let _ = install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Copy,
+            "c1",
+        )
+        .unwrap();
+        assert_eq!(reg.installs.len(), 1);
+
+        let dest = cfg.targets["agents"].join("alpha");
+        std::fs::remove_dir_all(&dest).unwrap();
+        let _ = install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Copy,
+            "c2",
+        )
+        .unwrap();
+        assert_eq!(reg.installs.len(), 1);
+        assert_eq!(reg.installs[0].commit, "c2");
     }
 }

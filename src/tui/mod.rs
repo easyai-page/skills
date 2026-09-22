@@ -429,12 +429,23 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
         return Err(Error::Msg("仓库中没有可安装的技能".into()));
     }
     // 第 1 步：技能（ESC/Ctrl+C = 取消）
+    let cwd = std::env::current_dir().unwrap_or_default();
     let choices: Vec<wizard::SkillChoice> = all
         .iter()
-        .map(|s| wizard::SkillChoice {
-            name: s.name.clone(),
-            description: s.description.clone(),
-            group: s.group.clone(),
+        .map(|s| {
+            let installed = app
+                .registry
+                .installs
+                .iter()
+                .any(|i| i.skill == s.name && i.is_visible_in_dir(&cwd))
+                || cwd.join(".agents/skills").join(&s.name).exists()
+                || cwd.join(".claude/skills").join(&s.name).exists();
+            wizard::SkillChoice {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                group: s.group.clone(),
+                installed,
+            }
         })
         .collect();
     let Some(picked) = wizard::pick_skills(&choices)? else {
@@ -519,6 +530,7 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
                     if overwrite {
                         let rec = install::to_rec(target);
                         let _ = remove::remove_install(layout, cfg, reg, &entry.name, &rec);
+                        let _ = remove::force_clean_conflict_path(&p);
                         install::install_skill(
                             layout,
                             cfg,
@@ -610,13 +622,24 @@ fn fav_install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Resu
             if favorites::is_single_skill_repo(fav) {
                 (key.clone(), vec![fav.skills[0].name.clone()])
             } else {
+                let cwd = std::env::current_dir().unwrap_or_default();
                 let choices: Vec<wizard::SkillChoice> = fav
                     .skills
                     .iter()
-                    .map(|s| wizard::SkillChoice {
-                        name: s.name.clone(),
-                        description: s.description.clone(),
-                        group: None,
+                    .map(|s| {
+                        let installed = app
+                            .registry
+                            .installs
+                            .iter()
+                            .any(|i| i.skill == s.name && i.is_visible_in_dir(&cwd))
+                            || cwd.join(".agents/skills").join(&s.name).exists()
+                            || cwd.join(".claude/skills").join(&s.name).exists();
+                        wizard::SkillChoice {
+                            name: s.name.clone(),
+                            description: s.description.clone(),
+                            group: None,
+                            installed,
+                        }
                     })
                     .collect();
                 let Some(p) = wizard::pick_skills(&choices)? else {
