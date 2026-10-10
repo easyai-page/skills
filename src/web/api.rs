@@ -225,7 +225,7 @@ async fn install_from_source(
             url: spec.url.clone().unwrap_or_default(),
             commit: cached.commit.clone(),
             fetched_at: chrono::Utc::now().to_rfc3339(),
-            auto_update: None,
+            auto_update: Some(true), // 包级默认开，落盘写显式值
         });
     let mut installed = Vec::new();
     for name in &req.skills {

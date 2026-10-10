@@ -46,7 +46,7 @@ pub fn bookmark(
         url: spec.url.clone().unwrap_or_default(),
         commit: cached.commit.clone(),
         fetched_at: chrono::Utc::now().to_rfc3339(),
-        auto_update: None,
+        auto_update: Some(true), // 包级默认开，落盘写显式值
     });
     let count = picked.len();
     let now = chrono::Utc::now().to_rfc3339();
@@ -183,7 +183,7 @@ pub fn fav_install(
                 url: spec.url.clone().unwrap_or_default(),
                 commit: String::new(),
                 fetched_at: now.clone(),
-                auto_update: None,
+                auto_update: Some(true), // 包级默认开，落盘写显式值
             });
         src.commit = cached.commit.clone();
         src.fetched_at = now;

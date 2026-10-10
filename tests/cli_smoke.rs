@@ -486,13 +486,16 @@ fn auto_update_requires_exactly_one_policy_flag() {
     );
     let after = std::fs::read_to_string(home.join("registry.json")).unwrap();
     assert_eq!(before, after, "失败调用不得改 registry");
-    // 正常三选一：on → inherit 清除
+    // 正常三选一：on → inherit 回到默认（默认开，落盘归一为 true）
     ok(home, &["auto-update", "--source", "local/src", "--on"]);
     let reg = std::fs::read_to_string(home.join("registry.json")).unwrap();
     assert!(reg.contains("\"auto_update\": true"), "{reg}");
     ok(home, &["auto-update", "--source", "local/src", "--inherit"]);
     let reg = std::fs::read_to_string(home.join("registry.json")).unwrap();
-    assert!(!reg.contains("\"auto_update\": true"), "{reg}");
+    assert!(
+        reg.contains("\"auto_update\": true"),
+        "inherit 恢复默认（开）: {reg}"
+    );
 }
 
 // ---- 次要：remove 去重与错误传播 ----

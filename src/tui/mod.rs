@@ -340,7 +340,7 @@ fn action_config_auto_update(
             .sources
             .get(source)
             .and_then(|s| s.auto_update)
-            .unwrap_or(false);
+            .unwrap_or(true);
         println!(
             "提示：软链接始终跟随所属仓库 [{source}]（当前包级: {}）",
             if src_au { "开" } else { "关" }
@@ -491,7 +491,7 @@ fn install_wizard(layout: &Layout, cfg: &Config, app: &mut AppState) -> Result<(
             url: spec.url.clone().unwrap_or_default(),
             commit: cached.commit.clone(),
             fetched_at: chrono::Utc::now().to_rfc3339(),
-            auto_update: None,
+            auto_update: Some(true), // 包级默认开，落盘写显式值
         });
     for s in &picked {
         let entry = all.iter().find(|e| &e.name == s).expect("刚校验过存在");

@@ -107,7 +107,7 @@ impl TargetRec {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Registry {
     pub version: u32,
     #[serde(default)]
@@ -146,6 +146,12 @@ impl Registry {
         }
         let mut reg: Registry = serde_json::from_value(value)?;
         reg.version = 3;
+        // 历史 null 归一：包级 auto_update 默认开，加载即提升为显式 true
+        for src in reg.sources.values_mut() {
+            if src.auto_update.is_none() {
+                src.auto_update = Some(true);
+            }
+        }
         Ok(reg)
     }
 
@@ -163,8 +169,16 @@ impl Registry {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // 包级 auto_update 默认开：None（含 --inherit 清除覆盖）落盘统一归一为显式 true；
+        // 副本级 None 保留（语义 = 跟随包级，不能归一）
+        let mut out = self.clone();
+        for src in out.sources.values_mut() {
+            if src.auto_update.is_none() {
+                src.auto_update = Some(true);
+            }
+        }
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        std::fs::write(&tmp, serde_json::to_string_pretty(&out)?)?;
         std::fs::rename(&tmp, &path)?; // 同目录 rename，原子替换
         Ok(())
     }
@@ -309,6 +323,28 @@ mod tests {
         };
         let back: TargetRec = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn legacy_null_source_auto_update_normalized_to_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::at(tmp.path().to_path_buf());
+        // 历史文件：包级 auto_update 为 null（缺省默认），副本级也是 null（跟随包级）
+        std::fs::write(
+            layout.registry_path(),
+            r#"{"version":3,"sources":{"github/a/b":{"url":"u","commit":"c","fetched_at":"t","auto_update":null}},"installs":[{"skill":"a","source":"github/a/b","source_path":"s","target":{"scope":"global","agent":"agents"},"method":"copy","commit":"c","auto_update":null,"installed_at":"t"}]}"#,
+        )
+        .unwrap();
+        // load：包级 null 归一为显式 true
+        let reg = Registry::load(&layout).unwrap();
+        assert_eq!(reg.sources["github/a/b"].auto_update, Some(true));
+        // 副本级 null 保持不动（语义 = 跟随包级）
+        assert_eq!(reg.installs[0].auto_update, None);
+        // save：落盘统一为显式 true（包级），副本级 null 保留
+        reg.save(&layout).unwrap();
+        let raw = std::fs::read_to_string(layout.registry_path()).unwrap();
+        assert!(raw.contains("\"auto_update\": true"), "{raw}");
+        assert!(raw.contains("\"auto_update\": null"), "{raw}");
     }
 
     #[test]
