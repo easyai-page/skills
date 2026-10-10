@@ -30,7 +30,7 @@ bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包�
 
 **核心概念**（详见 `docs/superpowers/specs/2026-08-20-skills-manager-design.md` 与 `docs/superpowers/specs/2026-09-05-add-wizard-redesign-design.md`）：
 
-- **source（技能包）**：git 仓库或本地目录，缓存到 `$SKILLS_HOME`（默认 `~/.skills/`）下 `<host>/<owner>/<repo>/`（GitHub 归到 `github/`，本地路径归到 `local/`）。缓存按来源去重，已缓存则 `add` 复用、`update` 才刷新；git 缓存一律 depth=1 浅克隆。
+- **source（技能包）**：git 仓库或本地目录，缓存到 `$SKILLS_HOME`（默认 `~/.skills/`）下 `<host>/<owner>/<repo>/`（GitHub 归到 `github/`，本地路径归到 `local/`）。缓存按来源去重，已缓存则 `add` 复用、`update` 才刷新；git 缓存一律全克隆（完整历史），早期 depth=1 浅克隆的遗留缓存会在 update 时自动补全为完整历史。
 - **skill**：含 `SKILL.md` 的目录，名字取 frontmatter 的 `name`；扫描只认根级或两层目录内、frontmatter 完整（name+description）的条目，非法条目跳过并警告。
 - **target = agent × scope**（`src/core/paths.rs`）：agent 来自内置注册表（`src/core/agents.rs`，78 条，移植自 vercel-labs/skills 的 agents.ts 数据 + 自加 "agents" universal 条目）或 config.toml 自定义；scope 为 `global`（agent 全局目录）或 `project:<绝对路径>`（装到 `<root>/<agent.project_dir>`，多个 universal agent 共享 `.agents/skills`）。命令行语法 `agent@global` / `agent@project:<abs>`，兼容旧写法 `global:<agent>` / `project:<abs>`（后者 = agents + 项目根）；Display 输出新格式。`config.toml [targets]` 只做覆盖扩展：同名 id 覆盖内置全局路径，新 id = 自定义 agent（仅全局，无项目目录）。
 - **install**：一条「技能 × 目标」记录，方式二选一——`symlink`（默认，指向缓存）或 `copy`（独立副本，根目录带 `.skills-manifest`：sha256 基线，既证明副本归属又用于本地修改检测）。

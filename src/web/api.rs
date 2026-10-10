@@ -1255,7 +1255,7 @@ mod tests {
         let cache = layout.cache_dir("github/o/r");
         std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
         let url = format!("file://{}", bare.display());
-        let c1 = crate::core::git::shallow_clone(&url, &cache).unwrap();
+        let c1 = crate::core::git::clone_repo(&url, &cache).unwrap();
 
         let cfg = crate::core::config::Config::load(&layout).unwrap();
         let mut reg = Registry {
@@ -1591,7 +1591,7 @@ mod tests {
         let cache = layout.cache_dir("github/o/r");
         std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
         let url = format!("file://{}", bare.display());
-        let c1 = crate::core::git::shallow_clone(&url, &cache).unwrap();
+        let c1 = crate::core::git::clone_repo(&url, &cache).unwrap();
 
         let cfg = crate::core::config::Config::load(&layout).unwrap();
         let mut reg = Registry {

@@ -44,7 +44,7 @@ pub fn ensure_cached(layout: &Layout, spec: &SourceSpec) -> Result<Cached> {
             .ok_or_else(|| Error::Msg(format!("缓存路径没有父目录: {}", dest.display())))?,
     )?;
     match (&spec.url, &spec.local_path) {
-        (Some(url), None) => match git::shallow_clone(url, &dest) {
+        (Some(url), None) => match git::clone_repo(url, &dest) {
             Ok(commit) => Ok(Cached {
                 path: dest,
                 commit,

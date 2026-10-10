@@ -1,4 +1,3 @@
-use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -17,11 +16,6 @@ fn gerr<E: std::error::Error>(e: E) -> Error {
     Error::Git(msg)
 }
 
-/// 保持缓存为 depth=1 浅克隆，fetch 时浅边界随远端前移。
-fn depth_one() -> gix::remote::fetch::Shallow {
-    gix::remote::fetch::Shallow::DepthAtRemote(NonZeroU32::new(1).expect("非零"))
-}
-
 /// 打开缓存仓库并关闭 reflog：缓存克隆是内部状态，reflog 没有意义；
 /// 且写 reflog 需要 committer 身份，在未配置 git 身份的机器上（CI、全新服务器）会直接失败。
 fn open_cache_repo(path: &Path) -> Result<gix::Repository> {
@@ -30,12 +24,10 @@ fn open_cache_repo(path: &Path) -> Result<gix::Repository> {
     Ok(repo)
 }
 
-/// 浅克隆 url 到 dest（含工作区 checkout），返回 HEAD commit 全 hash。
-pub fn shallow_clone(url: &str, dest: &Path) -> Result<String> {
+/// 全克隆 url 到 dest（完整历史，含工作区 checkout），返回 HEAD commit 全 hash。
+pub fn clone_repo(url: &str, dest: &Path) -> Result<String> {
     let url = gix::url::parse(url.into()).map_err(gerr)?;
-    let mut prep = gix::prepare_clone(url, dest)
-        .map_err(gerr)?
-        .with_shallow(depth_one());
+    let mut prep = gix::prepare_clone(url, dest).map_err(gerr)?;
     let (mut checkout, _) = prep
         .fetch_then_checkout(gix::progress::Discard, &AtomicBool::new(false))
         .map_err(gerr)?;
@@ -65,7 +57,9 @@ pub fn fetch_and_reset(path: &Path) -> Result<Option<String>> {
         .map_err(gerr)?
         .prepare_fetch(gix::progress::Discard, Default::default())
         .map_err(gerr)?
-        .with_shallow(depth_one())
+        // undo() 把浅边界推到无穷远：遗留的 depth=1 浅克隆缓存借此补全完整历史，
+        // 对已是全克隆的仓库无影响
+        .with_shallow(gix::remote::fetch::Shallow::undo())
         .receive(gix::progress::Discard, &AtomicBool::new(false))
         .map_err(gerr)?;
 
@@ -561,17 +555,41 @@ mod tests {
     }
 
     #[test]
-    fn shallow_clone_returns_head_commit() {
-        let (_tmp, _work, bare) = make_bare_repo();
+    fn clone_returns_head_commit_with_full_history() {
+        let (_tmp, work, bare) = make_bare_repo();
+        // 再补一个 commit，让历史长度能区分全克隆与 depth=1
+        std::fs::write(work.join("second.txt"), "second\n").unwrap();
+        git(&work, &["add", "second.txt"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "c2",
+            ],
+        );
+        git(&work, &["push", bare.to_str().unwrap(), "main"]);
         let dst = tempfile::tempdir().unwrap();
         let dest = dst.path().join("clone");
-        let commit = shallow_clone(&format!("file://{}", bare.display()), &dest).unwrap();
+        let commit = clone_repo(&format!("file://{}", bare.display()), &dest).unwrap();
         assert_eq!(commit.len(), 40, "应为完整 sha1");
         // 与 git CLI 看到的 HEAD 一致
         assert_eq!(git_out(&bare, &["rev-parse", "main"]), commit);
         assert_eq!(head_commit(&dest).unwrap(), commit);
         assert!(dest.join(".git").exists());
-        assert!(dest.join(".git/shallow").exists(), "应为 depth=1 浅克隆");
+        assert!(
+            !dest.join(".git/shallow").exists(),
+            "全克隆不应存在浅边界文件"
+        );
+        assert_eq!(
+            git_out(&dest, &["rev-list", "HEAD", "--count"]),
+            "2",
+            "应包含完整历史"
+        );
         // 工作区真正 checkout 出文件
         assert_eq!(
             std::fs::read_to_string(dest.join("skills/alpha/SKILL.md")).unwrap(),
@@ -583,7 +601,7 @@ mod tests {
     fn fetch_and_reset_reports_change_only_when_moved() {
         let (tmp, work, bare) = make_bare_repo();
         let dest = tmp.path().join("clone");
-        let c1 = shallow_clone(&format!("file://{}", bare.display()), &dest).unwrap();
+        let c1 = clone_repo(&format!("file://{}", bare.display()), &dest).unwrap();
         // 无新提交 → None，工作区不动
         assert_eq!(fetch_and_reset(&dest).unwrap(), None);
         assert_eq!(
@@ -614,11 +632,15 @@ mod tests {
         assert_eq!(c2, c2_remote);
         assert_ne!(c1, c2);
         assert_eq!(head_commit(&dest).unwrap(), c2);
-        // gix 0.66 会保留旧浅边界并追加新边界（其公开实现明确不做 Git CLI 的 pruning）。
-        let shallow = std::fs::read_to_string(dest.join(".git/shallow")).unwrap();
+        // 全克隆语义：fetch 不产生浅边界，完整历史可用
         assert!(
-            shallow.lines().any(|line| line == c2),
-            "新 HEAD 应位于浅边界中: {shallow}"
+            !dest.join(".git/shallow").exists(),
+            "全克隆不应存在浅边界文件"
+        );
+        assert_eq!(
+            git_out(&dest, &["rev-list", "HEAD", "--count"]),
+            "2",
+            "fetch 后应持有完整历史"
         );
         // hard reset 语义：工作区/索引跟随远端
         assert_eq!(
@@ -639,10 +661,59 @@ mod tests {
     }
 
     #[test]
+    fn fetch_and_reset_unshallows_legacy_shallow_cache() {
+        // 遗留场景：旧版工具留下 depth=1 浅克隆缓存，update 的 fetch 应自动补全完整历史
+        let (tmp, work, bare) = make_bare_repo();
+        std::fs::write(work.join("skills/alpha/SKILL.md"), "v2\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "c2",
+            ],
+        );
+        git(&work, &["push", bare.to_str().unwrap(), "main"]);
+        let c2 = git_out(&bare, &["rev-parse", "main"]);
+
+        // 用 git CLI 造 depth=1 浅克隆，模拟旧版缓存（当前代码已改为全克隆）
+        let dest = tmp.path().join("clone");
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "--depth",
+                "1",
+                &format!("file://{}", bare.display()),
+                dest.to_str().unwrap(),
+            ],
+        );
+        assert!(dest.join(".git/shallow").exists(), "前置：浅克隆缓存");
+
+        // 远端无新 commit 时 fetch 照常执行，同样应完成解浅
+        assert_eq!(fetch_and_reset(&dest).unwrap(), None);
+        assert!(
+            !dest.join(".git/shallow").exists(),
+            "fetch 后浅边界应被移除"
+        );
+        assert_eq!(
+            git_out(&dest, &["rev-list", "HEAD", "--count"]),
+            "2",
+            "历史应补全为完整"
+        );
+        assert_eq!(head_commit(&dest).unwrap(), c2);
+    }
+
+    #[test]
     fn fetch_and_reset_uses_non_origin_default_remote() {
         let (tmp, work, bare) = make_bare_repo();
         let dest = tmp.path().join("clone");
-        let c1 = shallow_clone(&format!("file://{}", bare.display()), &dest).unwrap();
+        let c1 = clone_repo(&format!("file://{}", bare.display()), &dest).unwrap();
         git(&dest, &["remote", "rename", "origin", "upstream"]);
 
         std::fs::write(work.join("new.txt"), "new\n").unwrap();
@@ -729,7 +800,7 @@ mod tests {
         let _env = IdentitylessEnv::new();
         let (tmp, work, bare) = make_bare_repo();
         let dest = tmp.path().join("clone");
-        shallow_clone(&format!("file://{}", bare.display()), &dest).unwrap();
+        clone_repo(&format!("file://{}", bare.display()), &dest).unwrap();
 
         std::fs::write(work.join("new.txt"), "new\n").unwrap();
         git(&work, &["add", "new.txt"]);
@@ -757,7 +828,7 @@ mod tests {
         let (_tmp, _work, bare) = make_bare_repo();
         let dst = tempfile::tempdir().unwrap();
         let dest = dst.path().join("clone");
-        shallow_clone(&format!("file://{}", bare.display()), &dest).unwrap();
+        clone_repo(&format!("file://{}", bare.display()), &dest).unwrap();
         let existing = dest.join("stale.txt");
         let repo = gix::open(&dest).unwrap();
 
@@ -769,7 +840,7 @@ mod tests {
     fn checkout_transaction_rolls_back_after_switch_failures() {
         let (tmp, work, bare) = make_bare_repo();
         let dest = tmp.path().join("clone");
-        let c1 = shallow_clone(&format!("file://{}", bare.display()), &dest).unwrap();
+        let c1 = clone_repo(&format!("file://{}", bare.display()), &dest).unwrap();
         let old_index = std::fs::read(dest.join(".git/index")).unwrap();
 
         std::fs::write(work.join("skills/alpha/SKILL.md"), "v2\n").unwrap();

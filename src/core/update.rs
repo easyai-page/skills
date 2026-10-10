@@ -418,7 +418,7 @@ mod tests {
         (tmp, layout, cfg, reg)
     }
 
-    /// 真 git 远端 + 浅克隆缓存，可走完 execute_plan 的 fetch 路径。返回初始 commit。
+    /// 真 git 远端 + 全克隆缓存，可走完 execute_plan 的 fetch 路径。返回初始 commit。
     fn setup_with_repo(method: Method) -> (tempfile::TempDir, Layout, Config, Registry, String) {
         let tmp = tempfile::tempdir().unwrap();
         let work = tmp.path().join("work");
@@ -449,7 +449,7 @@ mod tests {
         let cache = layout.cache_dir("github/o/r");
         std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
         let url = format!("file://{}", bare.display());
-        let c1 = crate::core::git::shallow_clone(&url, &cache).unwrap();
+        let c1 = crate::core::git::clone_repo(&url, &cache).unwrap();
 
         let mut cfg = Config::default();
         cfg.targets
