@@ -89,6 +89,15 @@ impl TargetRec {
     pub fn is_visible_in_dir(&self, cwd: &std::path::Path) -> bool {
         match self {
             TargetRec::Global { .. } => true,
+            TargetRec::Project { .. } => self.is_project_of(cwd),
+        }
+    }
+
+    /// 严格判定目标是否为 cwd 所在项目的项目级安装（全局安装一律 false，
+    /// 区别于 is_visible_in_dir）——裸 update 的项目过滤用
+    pub fn is_project_of(&self, cwd: &std::path::Path) -> bool {
+        match self {
+            TargetRec::Global { .. } => false,
             TargetRec::Project { root, .. } => {
                 let norm_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
                 let norm_root = root.canonicalize().unwrap_or_else(|_| root.clone());
@@ -389,5 +398,21 @@ mod tests {
         assert!(!proj.is_visible_in_dir(std::path::Path::new("/home/user/projectB")));
         // 类似前缀但不是子目录组件
         assert!(!proj.is_visible_in_dir(std::path::Path::new("/home/user/projectA_backup")));
+    }
+
+    #[test]
+    fn is_project_of_excludes_global() {
+        let global = TargetRec::Global {
+            agent: "agents".into(),
+        };
+        assert!(!global.is_project_of(std::path::Path::new("/any/path")));
+
+        let proj = TargetRec::Project {
+            agent: "agents".into(),
+            root: PathBuf::from("/home/user/projectA"),
+        };
+        assert!(proj.is_project_of(std::path::Path::new("/home/user/projectA/src")));
+        assert!(!proj.is_project_of(std::path::Path::new("/home/user/projectB")));
+        assert!(!proj.is_project_of(std::path::Path::new("/home/user")));
     }
 }

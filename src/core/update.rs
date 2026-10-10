@@ -6,13 +6,13 @@ use super::paths::Layout;
 use super::registry::{Install, Method, Registry, SourceRecord, TargetRec};
 
 pub fn repo_should_update(src: &SourceRecord) -> bool {
-    src.auto_update.unwrap_or(false)
+    src.auto_update.unwrap_or(true)
 }
 
 pub fn copy_should_update(reg: &Registry, inst: &Install) -> bool {
     inst.auto_update
         .or(reg.sources.get(&inst.source).and_then(|s| s.auto_update))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 pub struct Selection {
@@ -38,7 +38,13 @@ pub struct CopyDecision {
 }
 
 /// 构建更新计划。selection = Some 时只针对该副本，且无视配置强制更新。
-pub fn build_plan(reg: &Registry, selection: Option<&Selection>) -> Plan {
+/// scope_dir = Some(cwd) 时（裸 update）只更新 cwd 所在项目的项目级安装
+/// （严格不含全局安装），且只拉取在该项目内有安装的包；None = 全量（--all / Web）。
+pub fn build_plan(
+    reg: &Registry,
+    selection: Option<&Selection>,
+    scope_dir: Option<&std::path::Path>,
+) -> Plan {
     let mut plan = Plan::default();
     let mut pull: Vec<String> = Vec::new();
     match selection {
@@ -61,11 +67,29 @@ pub fn build_plan(reg: &Registry, selection: Option<&Selection>) -> Plan {
         },
         None => {
             for (key, src) in &reg.sources {
-                if repo_should_update(src) {
-                    pull.push(key.clone());
+                if !repo_should_update(src) {
+                    continue;
                 }
+                // 项目过滤下，没在该项目内安装的包不拉取
+                if let Some(cwd) = scope_dir {
+                    let installed_here = reg
+                        .installs
+                        .iter()
+                        .any(|i| &i.source == key && i.target.is_project_of(cwd));
+                    if !installed_here {
+                        continue;
+                    }
+                }
+                pull.push(key.clone());
             }
             for inst in &reg.installs {
+                let in_scope = match scope_dir {
+                    Some(cwd) => inst.target.is_project_of(cwd),
+                    None => true,
+                };
+                if !in_scope {
+                    continue;
+                }
                 let repo_in_plan = pull.contains(&inst.source);
                 match inst.method {
                     Method::Symlink => {
@@ -247,7 +271,7 @@ pub fn update_single(
         skill: skill.to_string(),
         target: target.clone(),
     };
-    let plan = build_plan(reg, Some(&sel));
+    let plan = build_plan(reg, Some(&sel), None);
     if let Some(missing) = plan.missing {
         return Err(Error::NotInstalled(missing));
     }
@@ -304,12 +328,15 @@ mod tests {
     }
 
     #[test]
-    fn repo_update_follows_source_flag_default_false() {
-        assert!(!repo_should_update(
+    fn repo_update_follows_source_flag_default_on() {
+        assert!(repo_should_update(
             &reg_with(None, vec![]).sources["github/o/r"]
-        ));
+        )); // 默认开
         assert!(repo_should_update(
             &reg_with(Some(true), vec![]).sources["github/o/r"]
+        ));
+        assert!(!repo_should_update(
+            &reg_with(Some(false), vec![]).sources["github/o/r"]
         ));
     }
 
@@ -322,7 +349,7 @@ mod tests {
         let reg = reg_with(Some(true), vec![(Method::Copy, None)]);
         assert!(copy_should_update(&reg, &reg.installs[0])); // 跟随包级
         let reg = reg_with(None, vec![(Method::Copy, None)]);
-        assert!(!copy_should_update(&reg, &reg.installs[0])); // 默认 false
+        assert!(copy_should_update(&reg, &reg.installs[0])); // 默认开（跟随包级，包级默认开）
     }
 
     #[test]
@@ -336,7 +363,7 @@ mod tests {
                 (Method::Copy, None),
             ],
         );
-        let plan = build_plan(&reg, None);
+        let plan = build_plan(&reg, None, None);
         assert_eq!(plan.sources.len(), 1);
         let copy_decisions: Vec<_> = plan
             .copies
@@ -353,10 +380,80 @@ mod tests {
             Some(false),
             vec![(Method::Symlink, None), (Method::Copy, None)],
         );
-        let plan2 = build_plan(&reg2, None);
+        let plan2 = build_plan(&reg2, None, None);
         assert!(plan2.sources.is_empty());
         assert!(plan2.symlinks.is_empty());
         assert!(plan2.copies.iter().all(|c| !c.update));
+    }
+
+    #[test]
+    fn plan_scoped_to_current_project_only() {
+        // 裸 update 的项目过滤：只更新 cwd 所在项目的项目级安装（严格不含全局），
+        // 且只拉取在该项目内有安装的包
+        let proj = |root: &str| TargetRec::Project {
+            agent: "agents".into(),
+            root: std::path::PathBuf::from(root),
+        };
+        let inst = |skill: &str, source: &str, target: TargetRec, method: Method| Install {
+            skill: skill.into(),
+            source: source.into(),
+            source_path: format!("skills/{skill}").into(),
+            target,
+            method,
+            commit: "c1".into(),
+            auto_update: None,
+            installed_at: "t".into(),
+        };
+        let mut reg = reg_with(None, vec![]); // 包级默认开
+        reg.sources.insert(
+            "github/o/other".into(),
+            SourceRecord {
+                url: "https://github.com/o/other".into(),
+                commit: "c1".into(),
+                fetched_at: "t".into(),
+                auto_update: None,
+            },
+        );
+        reg.installs = vec![
+            inst("in_proj", "github/o/r", proj("/proj/a"), Method::Symlink),
+            inst("in_proj_copy", "github/o/r", proj("/proj/a"), Method::Copy),
+            inst(
+                "global_one",
+                "github/o/r",
+                TargetRec::Global {
+                    agent: "agents".into(),
+                },
+                Method::Symlink,
+            ),
+            inst(
+                "other_proj",
+                "github/o/other",
+                proj("/proj/b"),
+                Method::Symlink,
+            ),
+        ];
+
+        // cwd 在项目 A 内（含子目录）：只含 A 的项目级安装；other 包在 A 内无安装，不拉
+        let plan = build_plan(&reg, None, Some(std::path::Path::new("/proj/a/src")));
+        assert_eq!(plan.sources, vec!["github/o/r".to_string()]);
+        assert_eq!(plan.symlinks, vec!["in_proj".to_string()]);
+        assert_eq!(
+            plan.copies
+                .iter()
+                .map(|c| c.skill.as_str())
+                .collect::<Vec<_>>(),
+            vec!["in_proj_copy"]
+        );
+        assert!(plan.copies[0].update);
+
+        // cwd 不在任何项目内：空计划
+        let plan = build_plan(&reg, None, Some(std::path::Path::new("/elsewhere")));
+        assert!(plan.sources.is_empty() && plan.symlinks.is_empty() && plan.copies.is_empty());
+
+        // 不过滤（--all / Web）：全部
+        let plan = build_plan(&reg, None, None);
+        assert_eq!(plan.sources.len(), 2);
+        assert_eq!(plan.symlinks.len(), 3);
     }
 
     #[test]
@@ -368,7 +465,7 @@ mod tests {
                 agent: "agents".into(),
             },
         };
-        let plan = build_plan(&reg, Some(&sel));
+        let plan = build_plan(&reg, Some(&sel), None);
         assert!(plan.copies[0].update); // 显式指定无视配置
         assert_eq!(plan.sources.len(), 1); // 且会拉仓库
     }
@@ -611,7 +708,7 @@ mod tests {
                 agent: "agents".into(),
             },
         };
-        let plan = build_plan(&reg, Some(&sel));
+        let plan = build_plan(&reg, Some(&sel), None);
         assert!(plan.missing.is_some());
         assert!(plan.sources.is_empty() && plan.copies.is_empty() && plan.symlinks.is_empty());
         let err = execute_plan(&layout, &cfg, &mut reg, &plan, false).unwrap_err();
@@ -660,7 +757,7 @@ mod tests {
                     agent: "agents".into(),
                 },
             };
-            let plan = build_plan(&reg, Some(&sel)); // auto_update 全为 None，显式强制
+            let plan = build_plan(&reg, Some(&sel), None); // auto_update 全为 None，显式强制
             assert!(plan.missing.is_none());
             execute_plan(&layout, &cfg, &mut reg, &plan, false).unwrap();
 
@@ -687,7 +784,7 @@ mod tests {
         let (_t, layout, cfg, mut reg, c1) = setup_with_repo(Method::Copy);
         reg.sources.get_mut("github/o/r").unwrap().auto_update = Some(true);
         reg.installs[0].auto_update = Some(true);
-        let plan = build_plan(&reg, None);
+        let plan = build_plan(&reg, None, None);
         assert_eq!(plan.sources, vec!["github/o/r".to_string()]);
 
         let done = execute_plan(&layout, &cfg, &mut reg, &plan, false).unwrap();

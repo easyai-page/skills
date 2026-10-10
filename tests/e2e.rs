@@ -177,8 +177,9 @@ fn update_respects_two_level_policy() {
         ],
     );
     git(&work, &["push", bare.to_str().unwrap(), "main"]);
-    // update：alpha 跳过，beta 更新
-    skills(&home).args(["update"]).assert().success();
+    // update --all：忽略项目过滤的全量更新（安装目标是全局，裸 update 只更新当前项目），
+    // alpha 被副本级策略跳过，beta 更新
+    skills(&home).args(["update", "--all"]).assert().success();
     let alpha_md = std::fs::read_to_string(agents_dir.join("alpha/SKILL.md")).unwrap();
     assert!(alpha_md.contains("技能 alpha"), "alpha 副本应被跳过");
     // 显式强制更新 alpha

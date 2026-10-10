@@ -88,11 +88,15 @@ pub fn draw(f: &mut Frame, app: &AppState) {
                 .iter()
                 .map(|(k, s)| {
                     format!(
-                        "{k}\t{}\tauto_update={:?}\n",
+                        "{k}\t{}\tauto_update={}\n",
                         // chars().take(7)：按字符截断，避免多字节 UTF-8
                         // 在字节边界切片导致 panic。
                         s.commit.chars().take(7).collect::<String>(),
-                        s.auto_update
+                        match s.auto_update {
+                            Some(true) => "开",
+                            Some(false) => "关",
+                            None => "开（默认）",
+                        }
                     )
                 })
                 .collect();

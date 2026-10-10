@@ -281,8 +281,17 @@ pub fn run(cli: Cli) -> Result<()> {
                     "--all 是显式全量更新，不能与技能名/--target 同用".into(),
                 ));
             }
+            // 裸 update 只更新当前项目内的安装（严格不含全局）；--all 显式全量
+            let scoped = skills.is_empty() && target.is_none() && !all;
             let plan = match (&skills[..], target.as_deref()) {
-                ([], None) => update::build_plan(&reg, None),
+                ([], None) => {
+                    let scope = if all {
+                        None
+                    } else {
+                        std::env::current_dir().ok()
+                    };
+                    update::build_plan(&reg, None, scope.as_deref())
+                }
                 ([], Some(_)) => {
                     return Err(Error::Msg(
                         "--target 需搭配技能名：skills update <技能> --target <目标>".into(),
@@ -302,7 +311,7 @@ pub fn run(cli: Cli) -> Result<()> {
                             skill: s.clone(),
                             target: rec.clone(),
                         };
-                        let p = update::build_plan(&reg, Some(&sel));
+                        let p = update::build_plan(&reg, Some(&sel), None);
                         if let Some(missing) = p.missing {
                             // 显式指定却未安装：dry-run 也必须明确报错，不再静默略过
                             return Err(Error::NotInstalled(missing));
@@ -328,6 +337,13 @@ pub fn run(cli: Cli) -> Result<()> {
                         c.reason
                     );
                 }
+                if scoped
+                    && plan.sources.is_empty()
+                    && plan.symlinks.is_empty()
+                    && plan.copies.is_empty()
+                {
+                    println!("（当前项目内无可更新项；裸 update 仅更新当前项目，全量用 --all）");
+                }
                 return Ok(());
             }
             let done = match update::execute_plan(&layout, &cfg, &mut reg, &plan, force) {
@@ -352,8 +368,12 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
                 Err(err) => return Err(err),
             };
+            let nothing_done = done.is_empty();
             for line in done {
                 println!("{line}");
+            }
+            if scoped && nothing_done {
+                println!("（当前项目内无可更新项；裸 update 仅更新当前项目，全量用 --all）");
             }
             Ok(())
         }

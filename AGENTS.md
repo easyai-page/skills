@@ -39,7 +39,7 @@ bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包�
 
 **状态文件**（都在 `$SKILLS_HOME` 下）：`registry.json`（version 3：sources + installs + skill_tags，tmp+rename 原子写；install 的 target 记为 `{"scope":"global","agent":"..."}` / `{"scope":"project","agent":"...","root":"..."}`）、`config.toml`（可选，只做覆盖扩展；无配置文件也能工作）与 `state.json`（version 1：UI 记忆，当前仅 last_selected_agents；损坏/缺失自动降级为空，写失败仅警告）。**registry v3 不兼容旧版**：v3 起 target 改为 agent×scope 格式，不做迁移——version != 3 直接拒绝加载，提示备份后删除重建（旧记录无法用旧二进制之外的途径自动转换，按提示操作即可）。标签绑定 (source, skill)，与安装目标无关。
 
-**两级更新策略**：包级 `sources[key].auto_update` 控制是否 fetch；copy 副本级 `auto_update` 可覆盖包级（`--inherit` 清除覆盖）；symlink 永远跟随包级。裸 `update` 按策略全量跑；`update <skill> --target <t>` 显式强制更新该副本（参数配对有严格校验，不静默吞参）。
+**两级更新策略**：包级 `sources[key].auto_update` 控制是否 fetch（**默认开**，`auto-update --source <包> --off` 关闭）；copy 副本级 `auto_update` 可覆盖包级（`--inherit` 清除覆盖，默认跟随包级）；symlink 永远跟随包级。裸 `update` 按策略**只更新当前项目内的安装**（严格不含全局；cwd 不在任何已安装项目内则无操作并提示）；`update --all` 显式全量（忽略项目过滤，仍按策略）；`update <skill> --target <t>` 显式强制更新该副本（参数配对有严格校验，不静默吞参）。Web 界面的更新为全量（无项目上下文）。
 
 ## 必须守住的安全不变量
 

@@ -442,7 +442,8 @@ async fn run_update(
         return Ok(Json(serde_json::json!({ "done": done })));
     }
 
-    let plan = crate::core::update::build_plan(&reg, None);
+    // Web 是全局管理界面、无当前项目上下文，更新保持全量（不过滤项目）
+    let plan = crate::core::update::build_plan(&reg, None, None);
     let done = crate::core::update::execute_plan(&s.layout, &cfg, &mut reg, &plan, force).map_err(
         |e| match e {
             // 副本本地修改：409（用户可决策的冲突），前端确认后带 ?force=true 重试
