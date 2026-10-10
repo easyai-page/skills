@@ -33,7 +33,7 @@ bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包�
 - **source（技能包）**：git 仓库或本地目录，缓存到 `$SKILLS_HOME`（默认 `~/.skills/`）下 `<host>/<owner>/<repo>/`（GitHub 归到 `github/`，本地路径归到 `local/`）。缓存按来源去重，已缓存则 `add` 复用、`update` 才刷新；git 缓存一律全克隆（完整历史），早期 depth=1 浅克隆的遗留缓存会在 update 时自动补全为完整历史。
 - **skill**：含 `SKILL.md` 的目录，名字取 frontmatter 的 `name`；扫描只认根级或两层目录内、frontmatter 完整（name+description）的条目，非法条目跳过并警告。
 - **target = agent × scope**（`src/core/paths.rs`）：agent 来自内置注册表（`src/core/agents.rs`，78 条，移植自 vercel-labs/skills 的 agents.ts 数据 + 自加 "agents" universal 条目）或 config.toml 自定义；scope 为 `global`（agent 全局目录）或 `project:<绝对路径>`（装到 `<root>/<agent.project_dir>`，多个 universal agent 共享 `.agents/skills`）。命令行语法 `agent@global` / `agent@project:<abs>`，兼容旧写法 `global:<agent>` / `project:<abs>`（后者 = agents + 项目根）；Display 输出新格式。`config.toml [targets]` 只做覆盖扩展：同名 id 覆盖内置全局路径，新 id = 自定义 agent（仅全局，无项目目录）。
-- **install**：一条「技能 × 目标」记录，方式二选一——`symlink`（默认，指向缓存）或 `copy`（独立副本，根目录带 `.skills-manifest`：sha256 基线，既证明副本归属又用于本地修改检测）。
+- **install**：一条「技能 × 目标」记录，方式二选一——`symlink`（默认，指向缓存）或 `copy`（独立副本，根目录带 `.skills-manifest`：sha256 基线，既证明副本归属又用于本地修改检测）。重复安装同一技能：受管旧安装（有记录且实况归属核验通过）直接覆盖重装（`ln -sf` / `cp -rf` 语义，copy→copy 走原子替换）；非受管路径冲突返回 `Conflict` 由前端决策（CLI `-y` 跳过、交互确认覆盖、Web 409 确认链）。
 
 交互终端下裸 `add` 走四步向导（`src/wizard.rs`，CLI/TUI 共用）：选技能 → 选 agent（搜索式多选，检测到的置顶；预选 = 上次选择记忆 > 检测到的 > agents；恰好检测到 1 个时跳过该步不弹窗）→ 选 scope（项目/全局；所选 agent 均不支持全局时不问，直接项目）→ 选安装方式。显式参数不弹窗：`-s` 选技能（支持 `'*'` 全选）、`-a/--agent` 选 agent（支持 `'*'` 全内置）、`--all` = 全技能 + 全 agent、`-g` 全局、`-t` 直接给 target 列表、`--method` 指定方式；`-y` = 全技能 + 检测到的 agent（无检测 → agents）+ 项目 + 默认方式；非交互（管道/脚本）兜底 = 全技能 + agents + 项目。按 install_dir 去重：同目录的多个 agent 只装一份。空技能包（无可安装技能）先报错不弹窗。
 
@@ -46,7 +46,7 @@ bash scripts/pack-release.sh <target> <version>  # 本地验证 release 打包�
 改动 install/update/remove/git 时不得破坏这些语义（都有对应测试锁定）：
 
 1. **原子性**：copy 安装走 staging 目录 + rename 提交；更新走「暂存 → 旧副本 rename 备份 → 提交 → 删备份」，失败回滚，回滚也失败时错误必须带备份路径。git 侧 `fetch_and_reset` 的 worktree/index/ref 切换同样是事务式（`git.rs` 的 `CheckoutTransaction`），任一阶段失败完整回滚并校验恢复结果。
-2. **归属核验**：remove/update 只动带 `.skills-manifest` 标识的 copy 副本；实况与记录不符（不是目录、是链接、指向不对、记录损坏）返回 `Error::Mismatch` 并保留现场，绝不误删用户数据。
+2. **归属核验**：remove/update 只动带 `.skills-manifest` 标识的 copy 副本；实况与记录不符（不是目录、是链接、指向不对、记录损坏）返回 `Error::Mismatch` 并保留现场，绝不误删用户数据。add 的受管覆盖重装复用同一套核验（`verify_link_ownership`/`verify_copy_ownership`），核验不过即 Mismatch。
 3. **本地修改保护**：非 force 的 update 先做全量预扫描，任何 copy 副本偏离 manifest 基线（内容被改/文件缺失/基线外新增）即整体 `Mismatch` 中止，不产生部分变更；用户确认后以 force 重跑并重写基线。
 4. **registry 与磁盘一致**：CLI add 逐条落盘（每装成一个副本就 save 一次），中途失败不留 list/remove 管不到的孤儿副本。
 5. **config 分支先于 `Config::load` 分发**（`commands.rs` 顶部注释）：配置损坏时 `config set` 是唯一自愈出口；`config set` 对已知标量键写入前校验，且原配置可解析时写入后也必须可解析，防止写出锁死全部 CLI 的值。

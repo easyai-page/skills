@@ -13,7 +13,9 @@ static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// remove 只依赖其存在性确认副本归属；manifest 模块负责 files 基线的写入与校验。
 pub(crate) use super::manifest::COPY_MANIFEST;
 
-/// 把技能从缓存安装到一个目标；目标已有同名目录时返回 Error::Conflict 交由前端决策。
+/// 把技能从缓存安装到一个目标。目标已存在同名技能时：受管旧安装（registry 有记录且
+/// 实况与记录一致）直接覆盖重装（ln -sf / cp -rf 语义）；非受管路径返回 Error::Conflict
+/// 交由前端决策。
 // 参数即安装一次副本的全部上下文（布局/配置/记录/来源/目标/方法/版本），
 // 打包成结构体只是把同样多的字段挪个位置，不降低复杂度，故保留平铺签名。
 #[allow(clippy::too_many_arguments)]
@@ -32,37 +34,79 @@ pub fn install_skill(
     let src_dir = resolve_source_dir(layout, source_key, source_path)?;
     let dest_root = target.install_dir(cfg)?;
     let dest = dest_root.join(skill);
-    ensure_destination_absent(&dest)?;
-    std::fs::create_dir_all(&dest_root)?;
+    let trec = to_rec(target);
 
-    match method {
-        Method::Copy => copy_install(&src_dir, &dest_root, &dest)?,
-        Method::Symlink => {
-            ensure_destination_absent(&dest)?;
-            make_symlink(&src_dir, &dest).map_err(|err| match err {
-                Error::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => {
-                    Error::Conflict(dest.clone())
+    match std::fs::symlink_metadata(&dest) {
+        Ok(meta) => match reg.find(skill, &trec) {
+            Some(old) => {
+                let old = old.clone();
+                overwrite_managed(layout, &src_dir, &dest_root, &dest, &meta, &old, method)?;
+            }
+            None => return Err(Error::Conflict(dest.clone())),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(&dest_root)?;
+            match method {
+                Method::Copy => copy_install(&src_dir, &dest_root, &dest)?,
+                Method::Symlink => {
+                    make_symlink(&src_dir, &dest).map_err(|err| match err {
+                        Error::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => {
+                            Error::Conflict(dest.clone())
+                        }
+                        err => err,
+                    })?;
                 }
-                err => err,
-            })?;
+            }
         }
+        Err(err) => return Err(Error::Io(err)),
     }
 
     let rec = Install {
         skill: skill.into(),
         source: source_key.into(),
         source_path: PathBuf::from(source_path),
-        target: to_rec(target),
+        target: trec.clone(),
         method,
         commit: commit.into(),
         auto_update: None,
         installed_at: chrono::Utc::now().to_rfc3339(),
     };
-    let trec = to_rec(target);
     reg.installs
         .retain(|i| !(i.skill == skill && i.target == trec));
     reg.installs.push(rec.clone());
     Ok(rec)
+}
+
+/// 覆盖受管的既有安装：先按旧记录核验实况归属（核验不过即 Mismatch，保留现场，
+/// 绝不误删非本工具的数据），再按新方式替换。copy→copy 走 update 同款原子替换。
+fn overwrite_managed(
+    layout: &Layout,
+    src_dir: &Path,
+    dest_root: &Path,
+    dest: &Path,
+    meta: &std::fs::Metadata,
+    old: &Install,
+    method: Method,
+) -> Result<()> {
+    match old.method {
+        Method::Symlink => super::remove::verify_link_ownership(layout, dest, meta, old)?,
+        Method::Copy => super::remove::verify_copy_ownership(dest, meta, old)?,
+    }
+    match (old.method, method) {
+        (Method::Copy, Method::Copy) => replace_copy_install(src_dir, dest_root, dest),
+        (Method::Symlink, Method::Symlink) => {
+            super::remove::remove_link_itself(dest, meta)?;
+            make_symlink(src_dir, dest)
+        }
+        (Method::Copy, Method::Symlink) => {
+            std::fs::remove_dir_all(dest)?;
+            make_symlink(src_dir, dest)
+        }
+        (Method::Symlink, Method::Copy) => {
+            super::remove::remove_link_itself(dest, meta)?;
+            copy_install(src_dir, dest_root, dest)
+        }
+    }
 }
 
 /// 将已安装技能在 Symlink 和 Copy 之间原子切换。
@@ -630,7 +674,39 @@ mod tests {
     }
 
     #[test]
-    fn conflict_returns_decision_request() {
+    fn unmanaged_conflict_returns_decision_request() {
+        // 非受管路径（registry 无记录）：保持 Conflict 交前端决策，绝不自动覆盖
+        let (_t, layout, cfg, mut reg) = setup();
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
+        };
+        let dest = cfg.targets["agents"].join("alpha");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("user.txt"), "mine").unwrap();
+        let err = install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Copy,
+            "c1",
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)));
+        assert_eq!(
+            std::fs::read_to_string(dest.join("user.txt")).unwrap(),
+            "mine",
+            "非受管路径内容不得被动"
+        );
+    }
+
+    #[test]
+    fn managed_reinstall_overwrites_copy() {
+        // 受管 copy 重装 = cp -rf 语义：本地改动与多余文件全部回到源状态
         let (_t, layout, cfg, mut reg) = setup();
         let target = Target {
             agent: "agents".into(),
@@ -648,7 +724,125 @@ mod tests {
             "c1",
         )
         .unwrap();
-        // 再装同名技能 -> 返回冲突，由调用方决定
+        let dest = cfg.targets["agents"].join("alpha");
+        std::fs::write(dest.join("SKILL.md"), "local mod").unwrap();
+        std::fs::write(dest.join("extra.txt"), "extra").unwrap();
+
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Copy,
+            "c2",
+        )
+        .unwrap();
+
+        assert!(
+            std::fs::read_to_string(dest.join("SKILL.md"))
+                .unwrap()
+                .contains("name: alpha"),
+            "内容应回到源状态"
+        );
+        assert!(!dest.join("extra.txt").exists(), "多余文件应被清除");
+        assert!(dest.join(COPY_MANIFEST).is_file(), "manifest 应重写");
+        assert_eq!(reg.installs.len(), 1, "记录应替换而非新增");
+        assert_eq!(reg.installs[0].commit, "c2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_reinstall_overwrites_symlink() {
+        // 受管 symlink 重装 = ln -sf 语义：直接重指向
+        let (_t, layout, cfg, mut reg) = setup();
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
+        };
+        for _ in 0..2 {
+            install_skill(
+                &layout,
+                &cfg,
+                &mut reg,
+                "github/o/r",
+                "alpha",
+                "skills/alpha",
+                &target,
+                Method::Symlink,
+                "c1",
+            )
+            .unwrap();
+        }
+        let dest = cfg.targets["agents"].join("alpha");
+        let link = std::fs::read_link(&dest).unwrap();
+        assert_eq!(link, layout.cache_dir("github/o/r").join("skills/alpha"));
+        assert_eq!(reg.installs.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_reinstall_switches_method() {
+        // copy → symlink、symlink → copy 的重装同样直接覆盖
+        let (_t, layout, cfg, mut reg) = setup();
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
+        };
+        let dest = cfg.targets["agents"].join("alpha");
+        let reinstall = |reg: &mut Registry, method| {
+            install_skill(
+                &layout,
+                &cfg,
+                reg,
+                "github/o/r",
+                "alpha",
+                "skills/alpha",
+                &target,
+                method,
+                "c1",
+            )
+            .map(|_| ())
+        };
+
+        reinstall(&mut reg, Method::Copy).unwrap();
+        reinstall(&mut reg, Method::Symlink).unwrap();
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(reg.installs[0].method, Method::Symlink);
+
+        reinstall(&mut reg, Method::Copy).unwrap();
+        assert!(!dest.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(dest.join(COPY_MANIFEST).is_file());
+        assert_eq!(reg.installs[0].method, Method::Copy);
+        assert_eq!(reg.installs.len(), 1);
+    }
+
+    #[test]
+    fn managed_reinstall_refuses_when_disk_diverges_from_record() {
+        // 记录是 copy，但磁盘目录缺所有权标识（用户删后重建）→ Mismatch 保留现场
+        let (_t, layout, cfg, mut reg) = setup();
+        let target = Target {
+            agent: "agents".into(),
+            scope: Scope::Global,
+        };
+        install_skill(
+            &layout,
+            &cfg,
+            &mut reg,
+            "github/o/r",
+            "alpha",
+            "skills/alpha",
+            &target,
+            Method::Copy,
+            "c1",
+        )
+        .unwrap();
+        let dest = cfg.targets["agents"].join("alpha");
+        std::fs::remove_file(dest.join(COPY_MANIFEST)).unwrap();
+        std::fs::write(dest.join("user.txt"), "mine").unwrap();
+
         let err = install_skill(
             &layout,
             &cfg,
@@ -661,7 +855,12 @@ mod tests {
             "c1",
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Conflict(_)));
+        assert!(matches!(err, Error::Mismatch(_)));
+        assert_eq!(
+            std::fs::read_to_string(dest.join("user.txt")).unwrap(),
+            "mine",
+            "归属不明时保留现场"
+        );
     }
 
     #[test]

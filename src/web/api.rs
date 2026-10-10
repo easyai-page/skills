@@ -638,10 +638,11 @@ async fn install_favorite(
                 if !overwrite {
                     return Err((StatusCode::CONFLICT, format!("{p:?} 已存在")));
                 }
-                // 与 CLI 的覆盖路径一致：先按记录删（无记录则忽略），再重装
+                // 与 CLI 的覆盖路径一致：先按记录删（无记录则忽略），再确保冲突路径清理后重装
                 let _ = crate::core::remove::remove_install(
                     &s.layout, &cfg, &mut reg, &req.skill, trec,
                 );
+                let _ = crate::core::remove::force_clean_conflict_path(&p);
                 do_install(&mut reg).map_err(|e| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1021,21 +1022,33 @@ mod tests {
             })
         };
         let app = router(state);
-        let resp = app
-            .clone()
-            .oneshot(post_json("/api/install", body(false)))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        // 已存在 → 409，前端确认后带 overwrite=true 重试（同 favorites/install 确认链）
+        // 非受管路径（无安装记录的用户目录）→ 409，前端确认后带 overwrite=true 重试
+        std::fs::create_dir_all(tmp_root.join("agents/sa")).unwrap();
+        std::fs::write(tmp_root.join("agents/sa/user.txt"), "mine").unwrap();
         let resp = app
             .clone()
             .oneshot(post_json("/api/install", body(false)))
             .await
             .unwrap();
         assert_eq!(resp.status(), 409);
+        assert_eq!(
+            std::fs::read_to_string(tmp_root.join("agents/sa/user.txt")).unwrap(),
+            "mine",
+            "409 时不得动用户数据"
+        );
         let resp = app
+            .clone()
             .oneshot(post_json("/api/install", body(true)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(
+            !tmp_root.join("agents/sa/user.txt").exists(),
+            "确认覆盖后替换整个目录"
+        );
+        // 受管重装 → 静默覆盖，不再 409
+        let resp = app
+            .oneshot(post_json("/api/install", body(false)))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
@@ -1492,6 +1505,10 @@ mod tests {
         let src = make_local_source(&state.tmp);
         let agents = state.tmp.path().join("agents");
         let keep = state.tmp.clone();
+        // 清掉夹具预置的安装记录，制造「无记录的非受管路径」
+        let mut reg = Registry::load(&state.layout).unwrap();
+        reg.installs.clear();
+        reg.save(&state.layout).unwrap();
         let app = router(state);
         // 先收藏
         let resp = app
@@ -1516,15 +1533,20 @@ mod tests {
                 }),
             )
         };
-        // 首次安装 200
-        let resp = app.clone().oneshot(install(false)).await.unwrap();
-        assert_eq!(resp.status(), 200);
-        assert!(agents.join("alpha/SKILL.md").exists());
-        // 冲突 409
+        // 非受管路径（无安装记录的用户目录）→ 409，overwrite 重试 200
+        std::fs::create_dir_all(agents.join("alpha")).unwrap();
+        std::fs::write(agents.join("alpha/user.txt"), "mine").unwrap();
         let resp = app.clone().oneshot(install(false)).await.unwrap();
         assert_eq!(resp.status(), 409);
-        // overwrite 重试 200
         let resp = app.clone().oneshot(install(true)).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(agents.join("alpha/SKILL.md").exists());
+        assert!(
+            !agents.join("alpha/user.txt").exists(),
+            "确认覆盖后替换整个目录"
+        );
+        // 受管重装 → 静默覆盖，不再 409
+        let resp = app.clone().oneshot(install(false)).await.unwrap();
         assert_eq!(resp.status(), 200);
         // 未收藏的技能 404
         let resp = app

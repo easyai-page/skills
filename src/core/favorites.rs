@@ -501,7 +501,8 @@ mod tests {
     }
 
     #[test]
-    fn fav_install_conflict_returns_decision_request() {
+    fn fav_install_reinstall_overwrites() {
+        // 受管重装直接覆盖（ln -sf / cp -rf 语义），不再返回 Conflict
         let (_t, layout, cfg, mut reg, src) = setup_with_cfg();
         bookmark(&layout, &mut reg, &local_spec(&src), &[]).unwrap();
         let t = Target {
@@ -518,7 +519,7 @@ mod tests {
             Method::Copy,
         )
         .unwrap();
-        let err = fav_install(
+        fav_install(
             &layout,
             &cfg,
             &mut reg,
@@ -527,7 +528,7 @@ mod tests {
             &t,
             Method::Copy,
         )
-        .unwrap_err();
-        assert!(matches!(err, Error::Conflict(_)), "{err}");
+        .unwrap();
+        assert_eq!(reg.installs.len(), 1, "重装应覆盖记录而非新增");
     }
 }
