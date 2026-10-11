@@ -102,41 +102,18 @@ fn remove_cache_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// 扫描根级或最多两层目录内的 SKILL.md。
+/// 递归扫描任意深度目录内的 SKILL.md：发现技能目录即剪枝（不再深入其子目录），
+/// 跳过 `.` 开头的隐藏目录，不跟随符号链接。
 pub fn scan_skills(root: &Path) -> Result<Vec<SkillEntry>> {
     if root.join("SKILL.md").exists() {
         return Ok(read_entry(root, PathBuf::from("."))?.into_iter().collect());
     }
 
-    let mut level_one = std::fs::read_dir(root)?.collect::<std::io::Result<Vec<_>>>()?;
-    level_one.sort_by_key(|entry| entry.file_name());
+    /// 深度上限：防病态深层嵌套仓库的兜底；符号链接不跟随，天然免疫链接环。
+    /// 相对路径最多 8 个组件（含技能目录自身），正常技能包远低于此。
+    const MAX_DEPTH: usize = 8;
     let mut out = Vec::new();
-    for entry in level_one {
-        let dir1 = entry.path();
-        if !dir1.is_dir() || dir1.file_name().is_some_and(|name| name == ".git") {
-            continue;
-        }
-        if dir1.join("SKILL.md").exists()
-            && let Some(skill) = read_entry(&dir1, relative_path(root, &dir1))?
-        {
-            out.push(skill);
-        }
-
-        let mut level_two = std::fs::read_dir(&dir1)?.collect::<std::io::Result<Vec<_>>>()?;
-        level_two.sort_by_key(|entry| entry.file_name());
-        for entry in level_two {
-            let dir2 = entry.path();
-            if !dir2.is_dir()
-                || dir2.file_name().is_some_and(|name| name == ".git")
-                || !dir2.join("SKILL.md").exists()
-            {
-                continue;
-            }
-            if let Some(skill) = read_entry(&dir2, relative_path(root, &dir2))? {
-                out.push(skill);
-            }
-        }
-    }
+    scan_dir(root, root, 0, MAX_DEPTH, &mut out)?;
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.rel_path.cmp(&b.rel_path)));
 
     let (plugin_map, has_manifest) = load_plugin_groupings(root);
@@ -186,6 +163,41 @@ pub fn scan_skills(root: &Path) -> Result<Vec<SkillEntry>> {
     }
 
     Ok(out)
+}
+
+/// 递归扫描 `dir`（相对 `root` 深度为 `depth`）：含 SKILL.md 的目录记录后剪枝；
+/// 跳过隐藏目录；`file_type()` 不跟随符号链接。
+fn scan_dir(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<SkillEntry>,
+) -> Result<()> {
+    if depth >= max_depth {
+        return Ok(());
+    }
+    let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        // 跳过隐藏目录（.git、.agents、.claude-plugin 等）
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.join("SKILL.md").exists() {
+            // frontmatter 非法时 read_entry 警告跳过，但目录仍按技能目录剪枝
+            if let Some(skill) = read_entry(&path, relative_path(root, &path))? {
+                out.push(skill);
+            }
+            continue;
+        }
+        scan_dir(root, &path, depth + 1, max_depth, out)?;
+    }
+    Ok(())
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -696,5 +708,111 @@ mod tests {
 
         let other = skills.iter().find(|s| s.name == "slideshow").unwrap();
         assert_eq!(other.group.as_deref(), Some("Other"));
+    }
+
+    #[test]
+    fn scan_finds_skills_at_depth_three() {
+        let root = tempfile::tempdir().unwrap();
+        for rel in ["skills/engineering/tdd", "skills/productivity/grill-me"] {
+            let dir = root.path().join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            let name = dir.file_name().unwrap().to_str().unwrap().to_string();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} 技能\n---\n"),
+            )
+            .unwrap();
+        }
+
+        let skills = scan_skills(root.path()).unwrap();
+
+        assert_eq!(skills.len(), 2);
+        // 结果按 name 排序：grill-me 在 tdd 前
+        assert_eq!(skills[0].name, "grill-me");
+        assert_eq!(
+            skills[0].rel_path,
+            std::path::PathBuf::from("skills/productivity/grill-me")
+        );
+        assert_eq!(skills[1].name, "tdd");
+        assert_eq!(
+            skills[1].rel_path,
+            std::path::PathBuf::from("skills/engineering/tdd")
+        );
+        // 三层结构 skills/<分类>/<名> 的分组：取第二级做分类
+        assert_eq!(skills[0].group.as_deref(), Some("Productivity"));
+        assert_eq!(skills[1].group.as_deref(), Some("Engineering"));
+    }
+
+    #[test]
+    fn scan_prunes_nested_skill_md_inside_skill_directory() {
+        // 技能目录内部的 SKILL.md 是素材/示例，发现技能目录即剪枝，不得重复计数
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("skills/alpha/examples/inner")).unwrap();
+        std::fs::write(
+            root.path().join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: A 技能\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("skills/alpha/examples/inner/SKILL.md"),
+            "---\nname: inner\ndescription: 技能目录内的素材\n---\n",
+        )
+        .unwrap();
+
+        let skills = scan_skills(root.path()).unwrap();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "alpha");
+    }
+
+    #[test]
+    fn scan_skips_hidden_directories_at_any_depth() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".hidden/evil")).unwrap();
+        std::fs::create_dir_all(root.path().join("group/.cache/inner")).unwrap();
+        std::fs::create_dir_all(root.path().join("visible")).unwrap();
+        for (rel, name) in [
+            (".hidden/evil", "evil"),
+            ("group/.cache/inner", "inner"),
+            ("visible", "visible"),
+        ] {
+            std::fs::write(
+                root.path().join(rel).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name}\n---\n"),
+            )
+            .unwrap();
+        }
+
+        let skills = scan_skills(root.path()).unwrap();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "visible");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_does_not_follow_directory_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("SKILL.md"),
+            "---\nname: outside\ndescription: 仓库外技能\n---\n",
+        )
+        .unwrap();
+        // 指向仓库外的符号链接：不跟随则其中技能不会被发现
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
+        // 自引用链接环：跟随符号链接的实现会无限递归或重复计数
+        std::os::unix::fs::symlink(".", root.path().join("loop")).unwrap();
+        std::fs::create_dir_all(root.path().join("real")).unwrap();
+        std::fs::write(
+            root.path().join("real/SKILL.md"),
+            "---\nname: real\ndescription: real\n---\n",
+        )
+        .unwrap();
+
+        let skills = scan_skills(root.path()).unwrap();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "real");
     }
 }
