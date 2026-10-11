@@ -711,3 +711,59 @@ fn legacy_registry_v2_is_rejected() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("备份后删除"), "报错需含处置指引: {stderr}");
 }
+
+#[test]
+fn add_discovers_skills_at_depth_three() {
+    // 回归：mattpocock/skills 式三层结构 skills/<分类>/<技能>/SKILL.md 必须能被发现
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let bare = tmp.path().join("bare.git");
+    for s in ["skills/engineering/tdd", "skills/productivity/grill-me"] {
+        std::fs::create_dir_all(work.join(s)).unwrap();
+        let name = s.rsplit('/').next().unwrap();
+        std::fs::write(
+            work.join(s).join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: 技能 {name}\n---\n# {name}\n"),
+        )
+        .unwrap();
+    }
+    git(&work, &["init", "-b", "main"]);
+    git(&work, &["add", "."]);
+    git(
+        &work,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "c1",
+        ],
+    );
+    git(&work, &["clone", "--bare", ".", bare.to_str().unwrap()]);
+    let agents_dir = redirect_agents_target(&home);
+
+    skills(&home)
+        .args([
+            "add",
+            &format!("file://{}", bare.display()),
+            "-s",
+            "tdd",
+            "-t",
+            "global:agents",
+            "--method",
+            "copy",
+            "-y",
+        ])
+        .assert()
+        .success();
+    assert!(agents_dir.join("tdd/SKILL.md").exists());
+
+    let out = skills(&home).args(["list"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // list 只列已安装技能：装了 tdd，未装的 grill-me 不应出现
+    assert!(stdout.contains("tdd"));
+    assert!(!stdout.contains("grill-me"));
+}
