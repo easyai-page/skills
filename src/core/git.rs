@@ -27,7 +27,9 @@ fn open_cache_repo(path: &Path) -> Result<gix::Repository> {
 /// 全克隆 url 到 dest（完整历史，含工作区 checkout），返回 HEAD commit 全 hash。
 pub fn clone_repo(url: &str, dest: &Path) -> Result<String> {
     let url = gix::url::parse(url.into()).map_err(gerr)?;
-    let mut prep = gix::prepare_clone(url, dest).map_err(gerr)?;
+    let mut prep = gix::prepare_clone(url, dest)
+        .map_err(gerr)?
+        .with_in_memory_config_overrides(["core.autocrlf=false"]);
     let (mut checkout, _) = prep
         .fetch_then_checkout(gix::progress::Discard, &AtomicBool::new(false))
         .map_err(gerr)?;
@@ -527,6 +529,15 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
+    fn file_url(path: &Path) -> String {
+        let s = path.display().to_string().replace('\\', "/");
+        if s.starts_with('/') {
+            format!("file://{s}")
+        } else {
+            format!("file:///{s}")
+        }
+    }
+
     /// 造一个含真实文件的 bare 仓库，返回 (临时目录, work clone, bare repo)。
     /// c1: skills/alpha/SKILL.md = "v1\n"，另有 stale.txt。
     fn make_bare_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -537,6 +548,8 @@ mod tests {
         std::fs::write(work.join("skills/alpha/SKILL.md"), "v1\n").unwrap();
         std::fs::write(work.join("stale.txt"), "stale\n").unwrap();
         git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "core.autocrlf", "false"]);
+        std::fs::write(work.join(".gitattributes"), "* text eol=lf\n").unwrap();
         git(&work, &["add", "."]);
         git(
             &work,
@@ -687,9 +700,11 @@ mod tests {
             tmp.path(),
             &[
                 "clone",
+                "--config",
+                "core.autocrlf=false",
                 "--depth",
                 "1",
-                &format!("file://{}", bare.display()),
+                &file_url(&bare),
                 dest.to_str().unwrap(),
             ],
         );

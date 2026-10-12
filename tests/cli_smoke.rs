@@ -43,7 +43,16 @@ fn fail(home: &std::path::Path, args: &[&str]) -> String {
 
 /// 写入 registry fixture：local/src 包下 alpha（带技能级 tag t1）与 beta 两个 copy 副本 @ global:agents。
 fn write_registry_fixture(home: &std::path::Path) {
+    let agents_dir = home.join("agents-skills");
     std::fs::create_dir_all(home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "[targets]\nagents = \"{}\"\n",
+            agents_dir.display().to_string().replace('\\', "\\\\")
+        ),
+    )
+    .unwrap();
     std::fs::write(
         home.join("registry.json"),
         r#"{

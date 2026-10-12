@@ -40,10 +40,15 @@ pub fn parse_source(input: &str) -> Result<SourceSpec> {
         return Err(Error::Msg(format!("无法解析 source: {input}")));
     } // file:// URL（本地 bare 仓库，测试与离线场景）
     if let Some(rest) = input.strip_prefix("file://") {
-        let trimmed = rest.trim_end_matches('/').trim_end_matches(".git");
+        let normalized = rest.replace('\\', "/");
+        let trimmed = normalized.trim_matches('/').trim_end_matches(".git");
         let parts: Vec<&str> = trimmed.rsplitn(3, '/').collect();
-        let name = parts[0];
-        let parent = parts.get(1).copied().unwrap_or("root");
+        let sanitize = |s: &str| s.replace(':', "");
+        let name = sanitize(parts[0]);
+        let parent = parts
+            .get(1)
+            .map(|p| sanitize(p))
+            .unwrap_or_else(|| "root".into());
         if name.is_empty() {
             return Err(Error::Msg(format!("无法解析 source: {input}")));
         }

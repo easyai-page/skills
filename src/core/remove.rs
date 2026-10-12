@@ -34,6 +34,17 @@ pub fn remove_install(
     let meta = match std::fs::symlink_metadata(&dest) {
         Ok(meta) => meta,
         Err(err) if err.kind() == ErrorKind::NotFound => {
+            // Windows 下父路径是普通文件时也返回 ERROR_PATH_NOT_FOUND（映射为 NotFound），
+            // 需校验父路径若存在则必须为目录，否则属于路径结构异常（ENOTDIR 语义）而非正常缺失。
+            if let Some(parent) = dest.parent()
+                && let Ok(pmeta) = std::fs::symlink_metadata(parent)
+                && !pmeta.is_dir()
+            {
+                return Err(Error::Io(std::io::Error::new(
+                    ErrorKind::NotADirectory,
+                    "目标父路径不是目录",
+                )));
+            }
             // 仅 NotFound 视为“磁盘已不存在”→ 只清记录
             reg.remove(&rec.skill, &rec.target);
             prune_skill_tags(reg, &rec);

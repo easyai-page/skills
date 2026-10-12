@@ -4,6 +4,7 @@ pub mod ui;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
+use std::io::IsTerminal;
 
 use crate::cli::ui as cli_ui;
 use crate::core::{
@@ -169,6 +170,10 @@ fn confirm_delete_installed(layout: &Layout, cfg: &Config, app: &mut AppState) -
     };
     let skill = row.skill.clone();
     let target = row.target.clone();
+    // 单元测试或非 TTY 管道环境不弹交互确认，直接视为未确认取消，防止 Windows 控制台读取死锁
+    if cfg!(test) || !std::io::stdin().is_terminal() {
+        return Ok(());
+    }
     let prompt_text = format!("确认删除 {} @ {}？", skill, target.to_target());
     if !inquire::Confirm::new(&prompt_text)
         .with_default(false)
@@ -199,6 +204,9 @@ fn installed_action_menu(layout: &Layout, cfg: &Config, app: &mut AppState) -> R
     let Some(row) = visible.get(app.selected) else {
         return Ok(());
     };
+    if cfg!(test) || !std::io::stdin().is_terminal() {
+        return Ok(());
+    }
     let skill = row.skill.clone();
     let target = row.target.clone();
     let method = row.method;
@@ -805,7 +813,7 @@ mod tests {
             installed_at: "t".into(),
         });
         let mut app = AppState::new(reg);
-        // 非交互环境下 inquire prompt 返回错误，unwrap_or(false) 判定为未确认，不删除
+        // 单元测试/非交互环境下直接返回，判定为未确认，不删除
         assert!(confirm_delete_installed(&layout, &cfg, &mut app).is_ok());
         assert_eq!(app.registry.installs.len(), 1);
     }
