@@ -534,13 +534,13 @@ fn add_with_agent_installs_to_agent_project_dir() {
         .success();
     assert!(proj.join(".claude/skills/alpha/SKILL.md").exists());
     // registry v3 target：{"scope":"project","agent":"claude-code","root":<cwd>}
-    // 子进程 cwd 经 getcwd 取物理路径，与 canonicalize 后的 proj 一致（Windows 剥离 \\?\ 前缀）
+    // 子进程 cwd 与 proj 指向同一物理目录（通过 canonicalize 抹平符号链接与 Windows 8.3 短路径差异）
     let reg = read_registry(&home);
-    let expected_raw = proj.canonicalize().unwrap().display().to_string();
-    let expected_root = expected_raw.strip_prefix(r"\\?\").unwrap_or(&expected_raw);
     let actual_raw = reg["installs"][0]["target"]["root"].as_str().unwrap();
-    let actual_root = actual_raw.strip_prefix(r"\\?\").unwrap_or(actual_raw);
-    assert_eq!(actual_root, expected_root);
+    assert_eq!(
+        std::fs::canonicalize(actual_raw).unwrap(),
+        proj.canonicalize().unwrap()
+    );
     assert_eq!(reg["installs"][0]["target"]["scope"], "project");
     assert_eq!(reg["installs"][0]["target"]["agent"], "claude-code");
 }
