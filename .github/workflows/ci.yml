@@ -102,7 +102,7 @@ jobs:
           ls -la   # 日志留证：6 个归档齐全
           sha256sum -- *.tar.gz *.zip > SHA256SUMS
           # 中文安装说明 + 自动生成的变更记录拼成 release notes
-          cat > notes.md <<'EOF'
+          cat > ../notes.md <<'EOF'
           ## 安装说明
 
           每个归档内含二进制和中文安装脚本，解压后运行对应脚本即可：
@@ -120,7 +120,7 @@ jobs:
 
           EOF
           gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
-            -f tag_name="$GITHUB_REF_NAME" --jq .body >> notes.md || true
-          gh release create "$GITHUB_REF_NAME" --notes-file notes.md ./*
+            -f tag_name="$GITHUB_REF_NAME" --jq .body >> ../notes.md || true
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file ../notes.md ./*
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
